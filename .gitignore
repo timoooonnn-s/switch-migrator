@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tool output
+output/
+*.xlsx
+*.log
+
+# Local configs with real device data
+config.yaml
+switches.yaml
+inventory*.yaml
+!config.example.yaml
+!switches.example.yaml
+
+# IDE
+.idea/
+.vscode/

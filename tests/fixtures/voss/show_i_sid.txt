@@ -1,0 +1,13 @@
+==========================================================================================
+                                        Isid Info
+==========================================================================================
+ISID                PORT               MLT
+ID       TYPE       INTERFACES         INTERFACES         ORIGIN     ISID NAME
+------------------------------------------------------------------------------------------
+10100    ELAN       c100:1/10,c100:1/11 c100:2            CONFIG     Server-100
+10200    ELAN       -                  c200:2             CONFIG     Server-200
+20300    ELAN       c300:1/12          -                  CONFIG     Special-300
+
+c: customer vid   u: untagged-traffic
+
+All 3 out of 3 Total Num of i-sids displayed

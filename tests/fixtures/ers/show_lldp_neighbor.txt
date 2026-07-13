@@ -1,0 +1,15 @@
+-------------------------------------------------------------------------------
+Port: 49       Index: 3        Time: 45 days, 12:00:01
+        ChassisId: MAC address    b0:ad:aa:41:b4:df
+        PortId:    MAC address    b0:ad:aa:41:b4:2e
+        SysName:   bcb-01
+        SysCap:    rB / rB
+-------------------------------------------------------------------------------
+Port: 50       Index: 4        Time: 45 days, 11:59:47
+        ChassisId: MAC address    b0:ad:aa:41:c2:aa
+        PortId:    MAC address    b0:ad:aa:41:c2:2e
+        SysName:   bcb-02
+        SysCap:    rB / rB
+-------------------------------------------------------------------------------
+Sys capability: O-Other; R-Repeater; B-Bridge; W-WLAN accesspoint; r-Router;
+T-Telephone; D-DOCSIS cable device; S-Station only.

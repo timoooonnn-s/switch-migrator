@@ -1,0 +1,71 @@
+# =============================================================================
+# switch-migrator configuration
+#
+# Copy to config.yaml and adjust. config.yaml is gitignored on purpose -
+# never commit real device data.
+#
+# Credentials are NEVER stored here. They come from environment variables or
+# an interactive prompt (see README, section "Credentials").
+# =============================================================================
+
+# --- SPB fabric source of truth -----------------------------------------------
+# The BCB controllers to read the fabric state from. All must be VOSS /
+# Fabric Engine. The tool merges the view of all listed BCBs; I-SIDs and
+# VLAN attachments found on ANY of them count as "exists in fabric".
+bcb_controllers:
+  - name: bcb-01
+    host: 10.0.0.1
+  - name: bcb-02
+    host: 10.0.0.2
+
+# --- Uplink / core identification ----------------------------------------------
+# LLDP SysName patterns (shell-style globs, case-insensitive) that identify a
+# neighbor as a core/uplink switch. Ports (and MLTs containing such ports) whose
+# LLDP neighbor matches one of these patterns are counted as uplinks in the
+# report.
+core_switch_patterns:
+  - "bcb-*"
+  - "core-*"
+  - "agg-*"
+
+# --- VLAN <-> I-SID convention ---------------------------------------------------
+# Used to derive the EXPECTED I-SID for a VLAN. Because your I-SIDs use
+# different possible prefixes, list every offset in use; the tool checks all
+# candidates against the fabric AND additionally matches by the actual
+# VLAN(c-vid) attachment seen on the BCBs. Disagreements are flagged.
+#
+# candidate I-SID = offset + VLAN-ID   (e.g. offset 10000, VLAN 100 -> 10100)
+isid_conventions:
+  offsets:
+    - 10000
+    - 20000
+  # Per-VLAN overrides win over the offsets (VLAN-ID: I-SID):
+  explicit: {}
+  #  150: 90150
+
+# --- VLANs to ignore in the comparison -------------------------------------------
+# Default VLAN and the VOSS/Fabric Engine reserved range (4048-4059, incl. the
+# usual B-VLANs 4051/4052) plus anything site-specific like a dedicated
+# IST/vIST VLAN.
+excluded_vlans:
+  - 1
+  - 4000        # example: vIST VLAN
+  - 4048
+  - 4049
+  - 4050
+  - 4051
+  - 4052
+  - 4053
+  - 4054
+  - 4055
+  - 4056
+  - 4057
+  - 4058
+  - 4059
+
+# --- SSH settings -----------------------------------------------------------------
+ssh:
+  conn_timeout: 20        # seconds to establish the SSH connection
+  read_timeout: 60        # seconds to wait for a command to finish
+  workers: 4              # parallel device connections
+  retries: 1              # reconnect attempts after a connection failure

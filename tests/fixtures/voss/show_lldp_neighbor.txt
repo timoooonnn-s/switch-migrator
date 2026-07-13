@@ -1,0 +1,17 @@
+================================================================================
+                                LLDP Neighbor
+================================================================================
+Port: 1/1     Index: 1  Time: 10 days, 02:33:19
+        Protocol: LLDP
+        ChassisId: MAC Address    a4:25:1b:52:70:00
+        PortId:    MAC Address    a4:25:1b:52:70:31
+        SysName:   core-01
+        SysCap:    Br / Br
+Port: 1/47    Index: 2  Time: 12 days, 07:01:44
+        Protocol: LLDP
+        ChassisId: MAC Address    a4:25:1b:52:71:00
+        PortId:    MAC Address    a4:25:1b:52:71:2f
+        SysName:   old-agg-02
+        SysCap:    Br / Br
+--------------------------------------------------------------------------------
+Total Neighbors: 2

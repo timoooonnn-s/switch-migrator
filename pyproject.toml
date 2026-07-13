@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "switch-migrator"
+version = "1.0.0"
+description = "Pre-migration audit & compare tool for Extreme VOSS/Fabric Engine and ERS switches against SPB fabric (BCB) state"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "netmiko>=4.3,<5",
+    "PyYAML>=6.0",
+    "rich>=13.0",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+switch-migrator = "switch_migrator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["switch_migrator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

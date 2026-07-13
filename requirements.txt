@@ -1,0 +1,4 @@
+netmiko>=4.3,<5
+PyYAML>=6.0
+rich>=13.0
+openpyxl>=3.1
