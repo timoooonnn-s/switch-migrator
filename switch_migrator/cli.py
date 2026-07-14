@@ -12,11 +12,11 @@ from pathlib import Path
 from rich.console import Console
 
 from switch_migrator import __version__
-from switch_migrator.collectors.bcb import collect_bcb
+from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.compare import compare_switch
 from switch_migrator.config import (
-    BcbTarget,
+    DvrTarget,
     Config,
     ConfigError,
     Credentials,
@@ -45,7 +45,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="switch-migrator",
         description="Pre-migration audit: collects port/MLT/IST state from "
                     "legacy Extreme VOSS/ERS switches and compares their VLANs "
-                    "against the I-SID state on the BCB controllers. "
+                    "against the I-SID state on the DvR controllers. "
                     "Read-only: only 'show' commands are ever sent.",
     )
     parser.add_argument("-c", "--config", type=Path, default=Path("config.yaml"),
@@ -121,19 +121,19 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         runner.close()
 
 
-def collect_fabric(bcbs: list[BcbTarget], creds: Credentials, cfg: Config,
+def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
                    args: argparse.Namespace) -> FabricState:
     fabric = FabricState()
-    for bcb in bcbs:
+    for dvr in dvrs:
         try:
-            runner = make_runner(bcb.name, bcb.host, Platform.VOSS,
+            runner = make_runner(dvr.name, dvr.host, Platform.VOSS,
                                  creds, cfg, args)
         except ConnectionFailed as exc:
-            fabric.bcb_errors.append(str(exc))
+            fabric.dvr_errors.append(str(exc))
             log.error("%s", exc)
             continue
         try:
-            collect_bcb(bcb.name, runner, fabric)
+            collect_dvr(dvr.name, runner, fabric)
         finally:
             runner.close()
     return fabric
@@ -159,10 +159,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError(f"duplicate switch names: {', '.join(sorted(dupes))}")
 
         if args.offline:
-            creds = bcb_creds = Credentials("offline", "offline")
+            creds = dvr_creds = Credentials("offline", "offline")
         else:
             creds = get_credentials("switches", "SM")
-            bcb_creds = get_credentials("BCB controllers", "SM_BCB", fallback=creds)
+            dvr_creds = get_credentials("DvR controllers", "SM_DVR", fallback=creds)
     except ConfigError as exc:
         console.print(f"[bold red]Config error:[/bold red] {exc}")
         return 2
@@ -170,21 +170,21 @@ def main(argv: list[str] | None = None) -> int:
     started = datetime.now()
     console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only audit "
                   f"of {len(targets)} switch(es) against "
-                  f"{len(cfg.bcb_controllers)} BCB(s)")
+                  f"{len(cfg.dvr_controllers)} DvR controller(s)")
 
-    # 1) Fabric state from the BCBs (sequential merge, small device count)
-    with console.status("Collecting fabric state from BCB controllers..."):
-        fabric = collect_fabric(cfg.bcb_controllers, bcb_creds, cfg, args)
-    if not fabric.bcbs_ok:
-        console.print("[bold red]No BCB controller could be read - aborting, "
+    # 1) Fabric state from the DvR controllers (sequential merge, small device count)
+    with console.status("Collecting fabric state from DvR controllers..."):
+        fabric = collect_fabric(cfg.dvr_controllers, dvr_creds, cfg, args)
+    if not fabric.dvrs_ok:
+        console.print("[bold red]No DvR controller could be read - aborting, "
                       "there is no fabric state to compare against.[/bold red]")
-        for err in fabric.bcb_errors:
+        for err in fabric.dvr_errors:
             console.print(f"  [red]{err}[/red]")
         return 1
     console.print(f"Fabric state: {len(fabric.isids)} I-SIDs from "
-                  f"{', '.join(fabric.bcbs_ok)}"
-                  + (f" [yellow]({len(fabric.bcb_errors)} BCB error(s))[/yellow]"
-                     if fabric.bcb_errors else ""))
+                  f"{', '.join(fabric.dvrs_ok)}"
+                  + (f" [yellow]({len(fabric.dvr_errors)} DvR error(s))[/yellow]"
+                     if fabric.dvr_errors else ""))
 
     # 2) Legacy switches in parallel
     audits: list[SwitchAudit] = []
@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     # Exit code mirrors the worst finding so the tool is scriptable
     severities = [t for table in tables for t in table.severities]
     unreachable = [a for a in audits if not a.reachable]
-    if "error" in severities or unreachable or fabric.bcb_errors:
+    if "error" in severities or unreachable or fabric.dvr_errors:
         return 1
     return 0
 

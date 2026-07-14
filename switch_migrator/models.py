@@ -83,21 +83,21 @@ class SwitchAudit:
 
 @dataclass
 class FabricIsid:
-    """Merged fabric view of one I-SID across all BCBs."""
+    """Merged fabric view of one I-SID across all DvR controllers."""
     isid: int
     names: set[str] = field(default_factory=set)
     cvids: set[int] = field(default_factory=set)      # customer VLANs seen attached
     hosts: set[str] = field(default_factory=set)      # BEB host names announcing it
     sources: set[str] = field(default_factory=set)    # config / discover / local
-    seen_on: set[str] = field(default_factory=set)    # which BCB reported it
+    seen_on: set[str] = field(default_factory=set)    # which DvR reported it
 
 
 @dataclass
 class FabricState:
-    """The merged, authoritative state read from all BCB controllers."""
+    """The merged, authoritative state read from all DvR controllers."""
     isids: dict[int, FabricIsid] = field(default_factory=dict)
-    bcb_errors: list[str] = field(default_factory=list)
-    bcbs_ok: list[str] = field(default_factory=list)
+    dvr_errors: list[str] = field(default_factory=list)
+    dvrs_ok: list[str] = field(default_factory=list)
 
     def get_or_create(self, isid: int) -> FabricIsid:
         if isid not in self.isids:
@@ -109,11 +109,11 @@ class FabricState:
 
 
 class CompStatus(str, Enum):
-    OK = "OK"                                    # convention & BCB attachment agree
-    OK_NONSTANDARD = "OK_NONSTANDARD"            # found via BCB attachment, but no convention match
-    IN_FABRIC_NOT_ATTACHED = "IN_FABRIC_NOT_ATTACHED"  # convention I-SID exists, no c-vid seen on BCBs
+    OK = "OK"                                    # convention & DvR attachment agree
+    OK_NONSTANDARD = "OK_NONSTANDARD"            # found via DvR attachment, but no convention match
+    IN_FABRIC_NOT_ATTACHED = "IN_FABRIC_NOT_ATTACHED"  # convention I-SID exists, no c-vid seen on DvR controllers
     AMBIGUOUS = "AMBIGUOUS"                      # multiple candidate I-SIDs match
-    MISSING_ON_BCB = "MISSING_ON_BCB"            # nothing found in fabric
+    MISSING_ON_DVR = "MISSING_ON_DVR"            # nothing found in fabric
     LOCAL_ISID_NOT_IN_FABRIC = "LOCAL_ISID_NOT_IN_FABRIC"
     EXCLUDED = "EXCLUDED"
 
@@ -123,7 +123,7 @@ SEVERITY = {
     CompStatus.OK_NONSTANDARD: "warn",
     CompStatus.IN_FABRIC_NOT_ATTACHED: "warn",
     CompStatus.AMBIGUOUS: "error",
-    CompStatus.MISSING_ON_BCB: "error",
+    CompStatus.MISSING_ON_DVR: "error",
     CompStatus.LOCAL_ISID_NOT_IN_FABRIC: "error",
     CompStatus.EXCLUDED: "ok",
 }
@@ -136,7 +136,7 @@ class VlanComparison:
     vlan_name: str
     local_isid: int | None            # only for VOSS switches
     expected_isids: list[int]         # from the offset convention / explicit map
-    bcb_isids: list[int]              # I-SIDs the BCBs show this VLAN attached to
+    dvr_isids: list[int]              # I-SIDs the DvR controllers show this VLAN attached to
     matched_isid: int | None
     status: CompStatus
     detail: str = ""

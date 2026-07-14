@@ -11,10 +11,12 @@ stackables), the tool:
    * MLT/SMLT state incl. per-member link state,
    * **IST / vIST** state (peer, VLAN, session status),
    * all VLANs, and on VOSS the local VLAN ↔ I-SID bindings.
-2. **Reads the authoritative fabric state from the BCB controllers**:
-   which I-SIDs exist fabric-wide (`show isis spbm i-sid all`), which
-   customer VLANs (c-vids) are attached to them (`show i-sid`,
-   `show vlan i-sid`), and on which BEBs they terminate.
+2. **Reads the authoritative fabric state from the DvR controllers**:
+   the domain-wide DvR interfaces with their L2 I-SID ↔ VLAN pairs
+   (`show dvr interfaces`), which I-SIDs exist fabric-wide
+   (`show isis spbm i-sid all`), plus the controllers' local c-vid
+   attachments (`show i-sid`, `show vlan i-sid`) and the BEBs services
+   terminate on.
 3. **Compares** every VLAN on every to-be-migrated switch against the fabric
    state and flags anything that would break during migration.
 
@@ -28,18 +30,18 @@ Your I-SIDs follow an offset convention with several possible prefixes
 
 * the **convention**: every configured offset produces a candidate I-SID
   (per-VLAN explicit overrides win), and
-* the **actual BCB state**: which I-SID(s) the BCBs show that VLAN attached to.
+* the **actual DvR state**: which I-SID(s) the DvR controllers show that VLAN attached to.
 
-The BCB state is authoritative. Match results per VLAN:
+The DvR state is authoritative. Match results per VLAN:
 
 | Status | Meaning | Severity |
 |---|---|---|
-| `OK` | Convention I-SID exists in the fabric **and** the BCBs confirm the VLAN attachment (or the VOSS local binding matches). | ok |
-| `OK_NONSTANDARD` | The BCBs attach the VLAN to an I-SID that does **not** match any configured offset. Service exists, but document the exception. | warn |
-| `IN_FABRIC_NOT_ATTACHED` | A convention I-SID exists in the fabric, but no BCB shows this VLAN attached. Usually means the c-vid terminates on other BEBs — verify before migrating. | warn |
+| `OK` | Convention I-SID exists in the fabric **and** the DvR controllers confirm the VLAN attachment (or the VOSS local binding matches). | ok |
+| `OK_NONSTANDARD` | The DvR controllers attach the VLAN to an I-SID that does **not** match any configured offset. Service exists, but document the exception. | warn |
+| `IN_FABRIC_NOT_ATTACHED` | A convention I-SID exists in the fabric, but no DvR controller shows this VLAN attached. Usually means the c-vid terminates on other BEBs — verify before migrating. | warn |
 | `AMBIGUOUS` | Multiple candidate I-SIDs match. Resolve with an `isid_conventions.explicit` entry. | error |
-| `MISSING_ON_BCB` | No candidate I-SID exists anywhere in the fabric. The L2VSN must be created before this switch can be migrated. | error |
-| `LOCAL_ISID_NOT_IN_FABRIC` | A VOSS switch binds the VLAN to an I-SID that no BCB knows. Broken/orphaned service. | error |
+| `MISSING_ON_DVR` | No candidate I-SID exists anywhere in the fabric. The L2VSN must be created before this switch can be migrated. | error |
+| `LOCAL_ISID_NOT_IN_FABRIC` | A VOSS switch binds the VLAN to an I-SID that no DvR controller knows. Broken/orphaned service. | error |
 | `EXCLUDED` | VLAN is on the `excluded_vlans` list (default VLAN, B-VLANs, IST VLAN, …). | – |
 
 ## Requirements
@@ -47,7 +49,7 @@ The BCB state is authoritative. Match results per VLAN:
 * Python **3.10+** on a Linux host with direct SSH reachability to all devices
 * Legacy switches: Extreme **VOSS / Fabric Engine** (tested formats 8.x–9.4.x)
   and **ERS / BOSS** stackables
-* BCB controllers: VOSS / Fabric Engine
+* DvR controllers: VOSS / Fabric Engine
 * An account with permission to run `show` commands (read-only account is
   sufficient and recommended)
 
@@ -64,7 +66,7 @@ switch-migrator --version
 ## Configuration
 
 ```bash
-cp config.example.yaml config.yaml       # BCBs, conventions, patterns
+cp config.example.yaml config.yaml       # DvR controllers, conventions, patterns
 cp switches.example.yaml switches.yaml   # the switches to migrate
 ```
 
@@ -74,7 +76,7 @@ Key settings in `config.yaml` (see the example file for full comments):
 
 | Key | Purpose |
 |---|---|
-| `bcb_controllers` | The BCBs to read the fabric state from. Views of all BCBs are merged. |
+| `dvr_controllers` | The DvR controllers to read the fabric state from. Views of all DvR controllers are merged. |
 | `core_switch_patterns` | Case-insensitive globs matched against LLDP `SysName`; matching neighbors mark a port/MLT as **uplink**. |
 | `isid_conventions.offsets` | All offsets in use (`I-SID = offset + VLAN`). |
 | `isid_conventions.explicit` | Per-VLAN overrides, e.g. `150: 90150`. |
@@ -86,7 +88,7 @@ Key settings in `config.yaml` (see the example file for full comments):
 Credentials are **never** stored in config files. Resolution order:
 
 1. Environment variables `SM_USERNAME` / `SM_PASSWORD`
-   (and optionally `SM_BCB_USERNAME` / `SM_BCB_PASSWORD` if the BCBs use a
+   (and optionally `SM_DVR_USERNAME` / `SM_DVR_PASSWORD` if the DvR controllers use a
    different account — otherwise the switch credentials are reused),
 2. interactive prompt.
 
@@ -123,7 +125,7 @@ Output goes to `./output/` by default:
 * `switch-migrator.log`.
 
 **Exit codes** (scriptable): `0` = clean, `1` = errors found (unreachable
-device, BCB read failure, or any red comparison result), `2` = config error.
+device, DvR read failure, or any red comparison result), `2` = config error.
 
 ### Reading the report
 
@@ -131,7 +133,7 @@ device, BCB read failure, or any red comparison result), `2` = config error.
   MLT count and MLTs with down members, IST/vIST session state, VLAN
   comparison counters (ok/warn/error).
 * **VLAN vs Fabric** — the core sheet: per VLAN the expected convention
-  I-SID(s), what the BCBs actually attach, the matched I-SID and the status
+  I-SID(s), what the DvR controllers actually attach, the matched I-SID and the status
   from the table above. This is your migration checklist.
 * **Issues** — flat, filterable list of everything that needs a human:
   unreachable devices, down IST sessions, MLTs with down members, VLAN
@@ -141,9 +143,18 @@ device, BCB read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `show interfaces gigabitEthernet interface`, `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show lldp neighbor` |
+| VOSS (migrate) | `show interfaces gigabitEthernet`, `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show lldp neighbor` |
 | ERS (migrate) | `show interfaces`, `show mlt`, `show ist`, `show vlan`, `show lldp neighbor` |
-| BCB (VOSS) | `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
+| DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
+
+Notes on syntax (checked against the Extreme VOSS/Fabric Engine command
+references):
+
+* `show interfaces gigabitEthernet` is used without a subcommand; the parser
+  reads the leading **Port Interface** section of its output.
+* `show dvr interfaces` needs no extra keyword — `l3isid <0-16777215>` exists
+  only as an optional filter, and the unfiltered form lists every DvR
+  interface with its `L2ISID`/`VLAN`/`GW IPv4` columns.
 
 Commands that a given platform/release doesn't support (e.g. `show ist` on a
 non-SMLT ERS, `show virtual-ist` on a non-vIST VOSS) are reported as warnings,
@@ -156,12 +167,16 @@ not failures.
   integer IDs, `up`/`down`, `c<vid>:` markers) and are covered by unit tests
   against fixture outputs. If one of your devices produces output the parser
   misreads, capture it with `--save-raw` and add it as a test fixture.
-* **c-vid visibility**: VLAN↔I-SID attachments are only visible on the
-  devices that terminate them. The tool reads them from the BCBs (plus
-  fabric-wide I-SID existence via IS-IS). If a service terminates only on
-  BEBs that are not in your `bcb_controllers` list, it shows up as
-  `IN_FABRIC_NOT_ATTACHED` — that's the "verify by hand" bucket by design.
-  You can add important BEBs to `bcb_controllers`; any VOSS node works.
+* **c-vid visibility**: for **DvR-enabled** L2VSNs the controllers see the
+  whole domain via `show dvr interfaces`, so VLAN↔I-SID attachments are
+  reliable there. For L2VSNs **without** a DvR interface (pure L2, no
+  gateway IP) attachments are only visible on the devices that terminate
+  them; the tool additionally reads the controllers' local `show i-sid` /
+  `show vlan i-sid` plus fabric-wide I-SID existence via IS-IS. A service
+  that terminates only on BEBs outside your `dvr_controllers` list shows up
+  as `IN_FABRIC_NOT_ATTACHED` — that's the "verify by hand" bucket by
+  design. You can add important BEBs to `dvr_controllers`; any VOSS node
+  works as an additional state source.
 * **ERS LACP-only trunks** (without MLT) are not listed as MLTs; their ports
   still appear in the Ports sheet with link state.
 * **MLT member-up counts** are computed by cross-referencing member ports
@@ -192,7 +207,7 @@ switch_migrator/
 ├── compare.py          # VLAN↔I-SID comparison engine
 ├── collectors/
 │   ├── switch.py       # legacy switch collection (VOSS + ERS)
-│   └── bcb.py          # BCB fabric-state collection + merge
+│   └── dvr.py          # DvR fabric-state collection + merge
 ├── parsers/
 │   ├── voss_parsers.py # VOSS/Fabric Engine CLI parsers
 │   ├── ers_parsers.py  # ERS/BOSS CLI parsers

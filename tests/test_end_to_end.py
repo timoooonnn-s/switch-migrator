@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from switch_migrator.collectors.bcb import collect_bcb
+from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.compare import compare_switch
 from switch_migrator.config import Config, SshSettings, SwitchTarget
@@ -22,15 +22,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def raw_root(tmp_path: Path) -> Path:
     shutil.copytree(FIXTURES / "voss", tmp_path / "old-agg-01")
     shutil.copytree(FIXTURES / "ers", tmp_path / "old-access-01")
-    shutil.copytree(FIXTURES / "voss", tmp_path / "bcb-01")
+    shutil.copytree(FIXTURES / "voss", tmp_path / "dvr-01")
     return tmp_path
 
 
 @pytest.fixture
 def cfg() -> Config:
     return Config(
-        bcb_controllers=[],
-        core_switch_patterns=["bcb-*", "core-*"],
+        dvr_controllers=[],
+        core_switch_patterns=["dvr-*", "core-*"],
         isid_offsets=[10000, 20000],
         isid_explicit={},
         excluded_vlans={1, 4000},
@@ -40,12 +40,15 @@ def cfg() -> Config:
 
 def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     fabric = FabricState()
-    collect_bcb("bcb-01", OfflineRunner("bcb-01", raw_root), fabric)
-    assert fabric.bcbs_ok == ["bcb-01"]
-    # from show isis spbm i-sid all + show i-sid + show vlan i-sid
-    assert {10100, 10200, 20300, 20400, 77777} <= set(fabric.isids)
+    collect_dvr("dvr-01", OfflineRunner("dvr-01", raw_root), fabric)
+    assert fabric.dvrs_ok == ["dvr-01"]
+    # from show dvr interfaces + show isis spbm i-sid all + show i-sid + show vlan i-sid
+    assert {10100, 10200, 20300, 20400, 77777, 1501050} <= set(fabric.isids)
     assert 100 in fabric.isids[10100].cvids
     assert 300 in fabric.isids[20300].cvids
+    # DvR interface data: L2ISID 1501050 carries VLAN 1050 domain-wide
+    assert fabric.isids[1501050].cvids == {1050}
+    assert "dvr" in fabric.isids[10100].sources
 
     voss_target = SwitchTarget("old-agg-01", "old-agg-01", Platform.VOSS)
     ers_target = SwitchTarget("old-access-01", "old-access-01", Platform.ERS)
@@ -60,7 +63,7 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     assert ist_mlt.members_up == 1  # 1/47 up, 1/48 down
     assert any("MLT 1" in w for w in voss.warnings)
 
-    # ERS switch: uplink detection via LLDP against bcb-* pattern
+    # ERS switch: uplink detection via LLDP against dvr-* pattern
     uplinks = [p for p in ers.ports if p.is_uplink]
     assert [p.port for p in uplinks] == ["49", "50"]
     uplink_mlt = next(m for m in ers.mlts if m.mlt_id == 1)
@@ -74,7 +77,7 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     assert ers_res[100].status is CompStatus.OK          # 10100 attached c-vid 100
     assert ers_res[200].status is CompStatus.OK          # 10200 attached c-vid 200
     assert ers_res[300].status is CompStatus.OK          # 20300 attached c-vid 300
-    assert ers_res[666].status is CompStatus.MISSING_ON_BCB
+    assert ers_res[666].status is CompStatus.MISSING_ON_DVR
     assert ers_res[1].status is CompStatus.EXCLUDED
 
     voss_res = {c.vlan_id: c for c in comparisons["old-agg-01"]}

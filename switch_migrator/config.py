@@ -1,7 +1,7 @@
 """Configuration & inventory loading with validation.
 
 Credentials never live in config files. They come from environment variables
-(SM_USERNAME / SM_PASSWORD, optionally SM_BCB_USERNAME / SM_BCB_PASSWORD) or
+(SM_USERNAME / SM_PASSWORD, optionally SM_DVR_USERNAME / SM_DVR_PASSWORD) or
 from an interactive prompt.
 """
 
@@ -23,7 +23,7 @@ class ConfigError(Exception):
 
 
 @dataclass
-class BcbTarget:
+class DvrTarget:
     name: str
     host: str
 
@@ -51,7 +51,7 @@ class Credentials:
 
 @dataclass
 class Config:
-    bcb_controllers: list[BcbTarget]
+    dvr_controllers: list[DvrTarget]
     core_switch_patterns: list[str]
     isid_offsets: list[int]
     isid_explicit: dict[int, int]
@@ -75,11 +75,11 @@ def load_config(path: Path) -> Config:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: top level must be a mapping")
 
-    bcbs = []
-    for i, entry in enumerate(_require(data, "bcb_controllers", path)):
+    dvrs = []
+    for i, entry in enumerate(_require(data, "dvr_controllers", path)):
         if not isinstance(entry, dict) or "host" not in entry:
-            raise ConfigError(f"{path}: bcb_controllers[{i}] needs at least 'host'")
-        bcbs.append(BcbTarget(name=str(entry.get("name", entry["host"])), host=str(entry["host"])))
+            raise ConfigError(f"{path}: dvr_controllers[{i}] needs at least 'host'")
+        dvrs.append(DvrTarget(name=str(entry.get("name", entry["host"])), host=str(entry["host"])))
 
     conventions = data.get("isid_conventions") or {}
     offsets = [int(o) for o in (conventions.get("offsets") or [])]
@@ -98,7 +98,7 @@ def load_config(path: Path) -> Config:
     )
 
     return Config(
-        bcb_controllers=bcbs,
+        dvr_controllers=dvrs,
         core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
         isid_offsets=offsets,
         isid_explicit=explicit,
@@ -148,9 +148,9 @@ def _make_target(name: str, host: str, platform: str, where: str) -> SwitchTarge
 
 def get_credentials(role: str, env_prefix: str, fallback: Credentials | None = None,
                     interactive: bool = True) -> Credentials:
-    """Resolve credentials for `role` ('switches' or 'BCB controllers').
+    """Resolve credentials for `role` ('switches' or 'DvR controllers').
 
-    Order: environment variables -> fallback (reuse switch creds for BCBs) ->
+    Order: environment variables -> fallback (reuse switch creds for DvR controllers) ->
     interactive prompt.
     """
     user = os.environ.get(f"{env_prefix}_USERNAME")

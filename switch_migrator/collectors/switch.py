@@ -41,7 +41,7 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
 
 
 def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
-    out = _run(audit, runner, "show interfaces gigabitEthernet interface", required=True)
+    out = _run(audit, runner, "show interfaces gigabitEthernet", required=True)
     if out:
         audit.ports = voss_parsers.parse_ports(out)
     out = _run(audit, runner, "show mlt", required=True)

@@ -51,7 +51,7 @@ def test_parse_ist_absent():
 
 def test_parse_lldp_neighbors_ers(fixture):
     neighbors = parse_lldp_neighbors(fixture("ers", "show_lldp_neighbor.txt"))
-    assert neighbors == {"49": "bcb-01", "50": "bcb-02"}
+    assert neighbors == {"49": "dvr-01", "50": "dvr-02"}
 
 
 def test_expand_port_list():

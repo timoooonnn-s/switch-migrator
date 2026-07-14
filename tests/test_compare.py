@@ -11,8 +11,8 @@ from switch_migrator.models import (
 
 def make_config(**overrides) -> Config:
     defaults = dict(
-        bcb_controllers=[],
-        core_switch_patterns=["bcb-*"],
+        dvr_controllers=[],
+        core_switch_patterns=["dvr-*"],
         isid_offsets=[10000, 20000],
         isid_explicit={},
         excluded_vlans={1, 4000},
@@ -28,7 +28,7 @@ def make_fabric(entries: dict[int, dict]) -> FabricState:
         rec = fabric.get_or_create(isid)
         rec.cvids.update(info.get("cvids", []))
         rec.hosts.update(info.get("hosts", []))
-    fabric.bcbs_ok = ["bcb-01"]
+    fabric.dvrs_ok = ["dvr-01"]
     return fabric
 
 
@@ -47,7 +47,7 @@ def test_expected_isids_offsets_and_explicit():
     assert expected_isids(300, cfg) == [99300]
 
 
-def test_ers_convention_confirmed_by_bcb():
+def test_ers_convention_confirmed_by_dvr():
     cfg = make_config()
     fabric = make_fabric({10100: {"cvids": [100]}})
     audit = make_audit(Platform.ERS, [VlanInfo(100, "Users")])
@@ -56,7 +56,7 @@ def test_ers_convention_confirmed_by_bcb():
     assert res[100].matched_isid == 10100
 
 
-def test_ers_bcb_only_nonstandard():
+def test_ers_dvr_only_nonstandard():
     cfg = make_config()
     fabric = make_fabric({77777: {"cvids": [100]}})
     audit = make_audit(Platform.ERS, [VlanInfo(100)])
@@ -87,7 +87,7 @@ def test_ers_missing():
     fabric = make_fabric({})
     audit = make_audit(Platform.ERS, [VlanInfo(666, "Orphan")])
     res = by_vlan(compare_switch(audit, fabric, cfg))
-    assert res[666].status is CompStatus.MISSING_ON_BCB
+    assert res[666].status is CompStatus.MISSING_ON_DVR
 
 
 def test_excluded_vlan():

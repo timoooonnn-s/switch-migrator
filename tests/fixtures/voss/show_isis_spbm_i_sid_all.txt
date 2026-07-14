@@ -3,9 +3,9 @@
 ================================================================================
 ISID      SOURCE NAME             VLAN  SYSID           TYPE      HOST_NAME
 --------------------------------------------------------------------------------
-10100     0.00.42                 4051  b0ad.aa41.b4df  config    bcb-01
+10100     0.00.42                 4051  b0ad.aa41.b4df  config    dvr-01
 10100     0.00.43                 4052  b0ad.aa41.c2aa  discover  beb-07
-10200     0.00.42                 4051  b0ad.aa41.b4df  config    bcb-01
+10200     0.00.42                 4051  b0ad.aa41.b4df  config    dvr-01
 20300     0.00.44                 4051  b0ad.aa41.d3bb  discover  beb-08
 20400     0.00.44                 4052  b0ad.aa41.d3bb  discover  beb-08
 

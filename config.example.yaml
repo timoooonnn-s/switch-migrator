@@ -9,13 +9,15 @@
 # =============================================================================
 
 # --- SPB fabric source of truth -----------------------------------------------
-# The BCB controllers to read the fabric state from. All must be VOSS /
-# Fabric Engine. The tool merges the view of all listed BCBs; I-SIDs and
-# VLAN attachments found on ANY of them count as "exists in fabric".
-bcb_controllers:
-  - name: bcb-01
+# The DvR controllers to read the fabric state from. All must be VOSS /
+# Fabric Engine. Controllers see the domain-wide DvR interfaces (L2 I-SID <->
+# VLAN pairs via `show dvr interfaces`) plus fabric-wide I-SIDs via IS-IS.
+# The tool merges the view of all listed controllers; I-SIDs and VLAN
+# attachments found on ANY of them count as "exists in fabric".
+dvr_controllers:
+  - name: dvr-01
     host: 10.0.0.1
-  - name: bcb-02
+  - name: dvr-02
     host: 10.0.0.2
 
 # --- Uplink / core identification ----------------------------------------------
@@ -24,7 +26,7 @@ bcb_controllers:
 # LLDP neighbor matches one of these patterns are counted as uplinks in the
 # report.
 core_switch_patterns:
-  - "bcb-*"
+  - "dvr-*"
   - "core-*"
   - "agg-*"
 
@@ -32,7 +34,7 @@ core_switch_patterns:
 # Used to derive the EXPECTED I-SID for a VLAN. Because your I-SIDs use
 # different possible prefixes, list every offset in use; the tool checks all
 # candidates against the fabric AND additionally matches by the actual
-# VLAN(c-vid) attachment seen on the BCBs. Disagreements are flagged.
+# VLAN(c-vid) attachment seen on the DvR controllers. Disagreements are flagged.
 #
 # candidate I-SID = offset + VLAN-ID   (e.g. offset 10000, VLAN 100 -> 10100)
 isid_conventions:

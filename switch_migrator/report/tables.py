@@ -94,7 +94,7 @@ def build_mlts(audits: list[SwitchAudit]) -> Table:
 
 def build_vlan_comparison(comparisons: dict[str, list[VlanComparison]]) -> Table:
     t = Table("VLAN vs Fabric", ["Switch", "VLAN", "Name", "Local I-SID",
-                                 "Expected I-SID(s)", "BCB attached I-SID(s)",
+                                 "Expected I-SID(s)", "DvR attached I-SID(s)",
                                  "Matched I-SID", "Status", "Detail"])
     for comps in comparisons.values():
         for c in comps:
@@ -103,7 +103,7 @@ def build_vlan_comparison(comparisons: dict[str, list[VlanComparison]]) -> Table
             t.add([c.switch, c.vlan_id, c.vlan_name,
                    c.local_isid if c.local_isid is not None else "",
                    ",".join(map(str, c.expected_isids)),
-                   ",".join(map(str, c.bcb_isids)) or "-",
+                   ",".join(map(str, c.dvr_isids)) or "-",
                    c.matched_isid if c.matched_isid is not None else "-",
                    c.status.value, c.detail], c.severity)
     return t
@@ -111,7 +111,7 @@ def build_vlan_comparison(comparisons: dict[str, list[VlanComparison]]) -> Table
 
 def build_fabric(fabric: FabricState) -> Table:
     t = Table("Fabric I-SIDs", ["I-SID", "Name(s)", "Attached VLAN(s)",
-                                "BEB host(s)", "Source(s)", "Seen on BCB(s)"])
+                                "BEB host(s)", "Source(s)", "Seen on"])
     for isid in sorted(fabric.isids):
         rec = fabric.isids[isid]
         t.add([rec.isid, ",".join(sorted(rec.names)),
@@ -125,8 +125,8 @@ def build_fabric(fabric: FabricState) -> Table:
 def build_issues(audits: list[SwitchAudit], fabric: FabricState,
                  comparisons: dict[str, list[VlanComparison]]) -> Table:
     t = Table("Issues", ["Source", "Severity", "Issue"])
-    for err in fabric.bcb_errors:
-        t.add(["BCB", "error", err], "error")
+    for err in fabric.dvr_errors:
+        t.add(["DvR", "error", err], "error")
     for a in audits:
         for e in a.errors:
             t.add([a.name, "error", e], "error")

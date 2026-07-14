@@ -3,14 +3,27 @@ from switch_migrator.parsers.common import parse_lldp_neighbors
 
 
 def test_parse_ports(fixture):
+    # full `show interfaces gigabitEthernet` output with Port Interface,
+    # Port Name and Port Config sections - only the first may be parsed
     ports = voss_parsers.parse_ports(
-        fixture("voss", "show_interfaces_gigabitethernet_interface.txt"))
+        fixture("voss", "show_interfaces_gigabitethernet.txt"))
     assert len(ports) == 5
     by_port = {p.port: p for p in ports}
     assert by_port["1/1"].admin_up is True and by_port["1/1"].oper_up is True
     assert by_port["1/2"].admin_up is True and by_port["1/2"].oper_up is False
     assert by_port["1/48"].admin_up is False
     assert by_port["2/1/1"].oper_up is True  # channelized port
+    # descriptions come from the Port Interface section, not Port Name
+    assert by_port["1/1"].description == "1000BaseTX"
+
+
+def test_parse_ports_without_section_banner(fixture):
+    # partial capture: just the data lines, no banners -> still parses
+    full = fixture("voss", "show_interfaces_gigabitethernet.txt")
+    section = full.split("Port Name")[0]
+    data_only = "\n".join(l for l in section.splitlines() if l[:1].isdigit())
+    ports = voss_parsers.parse_ports(data_only)
+    assert len(ports) == 5
 
 
 def test_parse_mlt(fixture):
@@ -65,8 +78,18 @@ def test_parse_isis_spbm_isid(fixture):
         fixture("voss", "show_isis_spbm_i_sid_all.txt"))
     assert len(rows) == 5
     assert {r["isid"] for r in rows} == {10100, 10200, 20300, 20400}
-    assert rows[0] == {"isid": 10100, "type": "config", "host": "bcb-01"}
+    assert rows[0] == {"isid": 10100, "type": "config", "host": "dvr-01"}
     assert rows[1] == {"isid": 10100, "type": "discover", "host": "beb-07"}
+
+
+def test_parse_dvr_interfaces(fixture):
+    rows = voss_parsers.parse_dvr_interfaces(
+        fixture("voss", "show_dvr_interfaces.txt"))
+    assert rows == [
+        {"l2isid": 10100, "vlan": 100},
+        {"l2isid": 10200, "vlan": 200},
+        {"l2isid": 1501050, "vlan": 1050},  # L3VSN row: L3ISID 55501, VRF 5
+    ]
 
 
 def test_parse_lldp_neighbors_voss(fixture):

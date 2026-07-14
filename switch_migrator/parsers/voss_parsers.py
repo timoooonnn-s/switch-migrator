@@ -20,19 +20,37 @@ _UPDOWN_TOKEN = re.compile(r"^(up|down|testing)$", re.IGNORECASE)
 
 
 def parse_ports(output: str) -> list[PortState]:
-    """`show interfaces gigabitEthernet interface`
+    """`show interfaces gigabitEthernet`
 
-    Data lines start with a port id; the last two up/down/testing tokens on
-    the line are ADMIN and OPERATE.
+    The command prints several sections (Port Interface, Port Name,
+    Port Config, ...); only the leading "Port Interface" section is parsed.
+    Its data lines start with a port id and carry ADMIN and OPERATE as the
+    last two up/down/testing tokens. If the section banner is missing (older
+    releases / partial capture) the whole output is scanned instead, keeping
+    the first occurrence of each port.
     """
+    lines = output.splitlines()
+    start, end = 0, len(lines)
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "port interface":
+            start = i + 1
+            for j in range(start, len(lines)):
+                title = lines[j].strip()
+                if re.fullmatch(r"Port [A-Za-z][A-Za-z -]*", title) \
+                        and title.lower() != "port interface":
+                    end = j
+                    break
+            break
     ports: list[PortState] = []
-    for line in output.splitlines():
+    seen: set[str] = set()
+    for line in lines[start:end]:
         tokens = line.split()
-        if not tokens or not PORT_RE.match(tokens[0]):
+        if not tokens or not PORT_RE.match(tokens[0]) or tokens[0] in seen:
             continue
         updown = [t for t in tokens if _UPDOWN_TOKEN.match(t)]
         if len(updown) < 2:
             continue
+        seen.add(tokens[0])
         ports.append(PortState(
             port=tokens[0],
             description=tokens[2] if len(tokens) > 2 else "",
@@ -133,7 +151,7 @@ def parse_vlan_basic(output: str) -> dict[int, str]:
 
 
 def parse_isid_local(output: str) -> dict[int, dict]:
-    """`show i-sid` on a BCB/BEB.
+    """`show i-sid` on a DvR controller/BEB.
 
     Returns {isid: {"cvids": set[int], "name": str}}. C-VIDs appear in the
     PORT/MLT INTERFACES columns as 'c<vid>:<port-or-mlt>' tokens.
@@ -156,6 +174,30 @@ def parse_isid_local(output: str) -> dict[int, dict]:
         for m in re.finditer(r"\bc(\d{1,4}):", line):
             result[current]["cvids"].add(int(m.group(1)))
     return result
+
+
+def parse_dvr_interfaces(output: str) -> list[dict]:
+    """`show dvr interfaces` on a DvR controller.
+
+    Data lines: <ip> <mask> <l3isid> <vrfid> <l2isid> <vlan> <gw-ipv4> ...
+    Column spacing varies, so rows are matched by shape: an IPv4 first token,
+    then somewhere the triple (integer, VLAN-sized integer, IPv4) which is
+    (L2ISID, VLAN, GW). Returns [{"l2isid": int, "vlan": int}, ...].
+    """
+    ipv4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+    rows: list[dict] = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if len(tokens) < 5 or not ipv4.match(tokens[0]):
+            continue
+        for i in range(1, len(tokens) - 2):
+            if tokens[i].isdigit() and tokens[i + 1].isdigit() \
+                    and ipv4.match(tokens[i + 2]):
+                l2isid, vlan = int(tokens[i]), int(tokens[i + 1])
+                if l2isid > 0 and 1 <= vlan <= 4094:
+                    rows.append({"l2isid": l2isid, "vlan": vlan})
+                    break
+    return rows
 
 
 def parse_isis_spbm_isid(output: str) -> list[dict]:

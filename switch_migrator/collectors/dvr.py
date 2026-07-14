@@ -1,6 +1,10 @@
-"""Collect and merge the SPB fabric state from the BCB controllers.
+"""Collect and merge the SPB fabric state from the DvR controllers.
 
-Per BCB we read:
+Per DvR controller we read:
+  * show dvr interfaces        - every DvR interface in the domain with its
+                                 L2 I-SID <-> VLAN pair (domain-wide view; no
+                                 keyword needed - `l3isid <id>` is only an
+                                 optional filter)
   * show isis spbm i-sid all   - every I-SID known fabric-wide (config+discover)
   * show i-sid                 - local I-SIDs incl. c-vid endpoint attachments
   * show vlan i-sid            - local platform-VLAN <-> I-SID bindings
@@ -20,10 +24,22 @@ from switch_migrator.parsers import voss_parsers
 log = logging.getLogger(__name__)
 
 
-def collect_bcb(name: str, runner: BaseRunner, fabric: FabricState) -> None:
-    """Merge one BCB's view into `fabric`. Thread-unsafe by design: call it
+def collect_dvr(name: str, runner: BaseRunner, fabric: FabricState) -> None:
+    """Merge one DvR controller's view into `fabric`. Thread-unsafe by design: call it
     from a single thread or lock around it (the CLI merges sequentially)."""
     ok = False
+
+    try:
+        out = runner.run("show dvr interfaces")
+        for row in voss_parsers.parse_dvr_interfaces(out):
+            rec = fabric.get_or_create(row["l2isid"])
+            rec.seen_on.add(name)
+            rec.sources.add("dvr")
+            rec.cvids.add(row["vlan"])
+        ok = True
+    except CommandError as exc:
+        fabric.dvr_errors.append(f"{name}: {exc}")
+        log.error("[%s] %s", name, exc)
 
     try:
         out = runner.run("show isis spbm i-sid all")
@@ -35,7 +51,7 @@ def collect_bcb(name: str, runner: BaseRunner, fabric: FabricState) -> None:
                 rec.hosts.add(row["host"])
         ok = True
     except CommandError as exc:
-        fabric.bcb_errors.append(f"{name}: {exc}")
+        fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
 
     try:
@@ -49,7 +65,7 @@ def collect_bcb(name: str, runner: BaseRunner, fabric: FabricState) -> None:
                 rec.names.add(info["name"])
         ok = True
     except CommandError as exc:
-        fabric.bcb_errors.append(f"{name}: {exc}")
+        fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
 
     try:
@@ -64,8 +80,8 @@ def collect_bcb(name: str, runner: BaseRunner, fabric: FabricState) -> None:
                 rec.names.add(vlan.name)
         ok = True
     except CommandError as exc:
-        fabric.bcb_errors.append(f"{name}: {exc}")
+        fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
 
     if ok:
-        fabric.bcbs_ok.append(name)
+        fabric.dvrs_ok.append(name)
