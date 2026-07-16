@@ -150,14 +150,21 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 Notes on syntax (checked against the Extreme VOSS/Fabric Engine command
 references and real device output):
 
-* Port state comes from `show interfaces gigabitEthernet state` — the table is
-  narrow, never wraps, and includes the down `REASON` column (shown in the
-  Ports sheet). On releases without the `state` subcommand the tool falls back
-  to plain `show interfaces gigabitEthernet` and parses its leading
-  **Port Interface** section.
-* Every VOSS session sets `terminal width 512` right after login (session
-  scoped, nothing persisted): at the default 80 columns the wide tables
-  (Port Interface, Mlt Info) wrap mid-row and become unparseable.
+* Port state comes from `show interfaces gigabitEthernet state` — a compact
+  table that includes the down `REASON` column (shown in the Ports sheet). On
+  releases without the `state` subcommand the tool falls back to plain
+  `show interfaces gigabitEthernet` and parses its leading **Port Interface**
+  section.
+* Plain `show mlt` prints **four** tables (Mlt Info, LACP, local/remote port
+  members, ENCAP) plus `All N out of M ...` footers, and the trailing VLAN IDS
+  column wraps onto continuation lines for long VLAN lists. The parser accepts
+  only genuine Mlt Info rows (they carry a type/state token) and keeps one
+  entry per MLT id, so the extra tables, footers and continuation lines can't
+  produce phantom or duplicate MLTs.
+* Beyond netmiko's own `terminal more disable`, **no** session-tuning commands
+  are sent: VOSS has no `terminal width` command, and sending an unknown
+  command desyncs the CLI channel so the *following* commands read leftover
+  error output.
 * `show interfaces gigabitEthernet i-sid` supplements `show vlan i-sid` with
   port-level bindings, catching CVLAN/switched-UNI services; conflicting
   bindings between the two sources are flagged as warnings.

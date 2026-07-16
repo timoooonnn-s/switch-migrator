@@ -34,7 +34,11 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
     try:
         return runner.run(command)
     except CommandError as exc:
-        msg = f"'{command}' failed: {str(exc.output).strip().splitlines()[0][:120] if exc.output else exc}"
+        # condense the device's answer so the report shows WHY it failed
+        detail = " | ".join(
+            line.strip() for line in str(exc.output or exc).splitlines()
+            if line.strip())[:200]
+        msg = f"'{command}' failed: {detail}"
         (audit.errors if required else audit.warnings).append(msg)
         log.log(logging.ERROR if required else logging.INFO, "[%s] %s", audit.name, msg)
         return None

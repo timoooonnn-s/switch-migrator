@@ -27,17 +27,32 @@ def test_parse_ports_without_section_banner(fixture):
 
 
 def test_parse_mlt(fixture):
+    # full real-world output: 4 tables, footers, wrapped VLAN IDS column
     mlts = voss_parsers.parse_mlt(fixture("voss", "show_mlt.txt"))
-    # footer line '3 out of 8 Total Num of mlt displayed' must not become MLT 3
+    # exactly one entry per MLT: the LACP / port-members / ENCAP tables and
+    # the 'All N out of M' footers must not create extra or duplicate rows
     assert [m.mlt_id for m in mlts] == [1, 2, 10]
     ist = mlts[0]
     assert ist.is_ist
     assert ist.members == ["1/47", "1/48"]
-    assert mlts[1].name == "MLT-CORE.s.124"
+    assert mlts[1].name == "MLT002.s.1/1/2"  # names may contain slashes
     assert mlts[1].members == ["1/1", "1/2"]  # trailing VLAN IDS column ignored
     assert mlts[1].admin == "smlt"
     assert mlts[2].mlt_type == "access"
     assert mlts[2].members == ["2/1/1"]
+
+
+def test_parse_mlt_wrapped_vlan_ids_continuation():
+    # a wrapped VLAN IDS continuation line must never become an MLT,
+    # regardless of how many VLAN ids it carries
+    output = (
+        "38  6181  s129         trunk   smlt   smlt     1/29              174 695 735\n"
+        "2246 2901 2952\n"
+        "2600\n"
+    )
+    mlts = voss_parsers.parse_mlt(output)
+    assert [m.mlt_id for m in mlts] == [38]
+    assert mlts[0].members == ["1/29"]
 
 
 def test_parse_port_state(fixture):

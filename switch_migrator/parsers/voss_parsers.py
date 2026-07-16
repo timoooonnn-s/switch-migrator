@@ -63,13 +63,17 @@ def parse_ports(output: str) -> list[PortState]:
 def parse_mlt(output: str) -> list[MltState]:
     """`show mlt`
 
-    Anchors: first token is the integer MLT id; the member column is the first
-    token that looks like a port list and contains '/' (VOSS ports always have
-    slots); type is 'access'/'trunk'; admin/current are the norm/smlt tokens.
-    The trailing VLAN IDS column and footer lines like
-    '3 out of 8 Total Num of mlt displayed' are ignored.
+    The plain command prints FOUR tables (Mlt Info, LACP, local/remote port
+    members, ENCAP) plus 'All N out of M ...' footers, and the trailing VLAN
+    IDS column wraps onto continuation lines for long VLAN lists. Only the
+    first table carries what we need, so rows are accepted only when they
+    show a TYPE (access/trunk) or ADMIN/CURRENT state (norm/smlt) token -
+    which the other tables, footers and wrapped continuation lines never do -
+    and each MLT id is kept once (first occurrence wins, Mlt Info comes
+    first). Member ports are the first port-list token containing '/'.
     """
     mlts: list[MltState] = []
+    seen: set[int] = set()
     for line in output.splitlines():
         tokens = line.split()
         if len(tokens) < 3 or not tokens[0].isdigit():
@@ -89,10 +93,9 @@ def parse_mlt(output: str) -> list[MltState]:
                 break
         mlt_type = next((t for t in rest if t.lower() in ("access", "trunk")), "")
         states = [t for t in rest if t.lower() in ("norm", "smlt", "ist")]
-        # footer guard: a real MLT row shows at least a type, a state or members
-        # ('N out of M Total Num of mlt displayed' shows none of them)
-        if not mlt_type and not states and not members:
+        if (not mlt_type and not states) or mlt_id in seen:
             continue
+        seen.add(mlt_id)
         mlts.append(MltState(
             mlt_id=mlt_id,
             name=name,
