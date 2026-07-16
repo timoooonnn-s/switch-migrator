@@ -28,15 +28,39 @@ def test_parse_ports_without_section_banner(fixture):
 
 def test_parse_mlt(fixture):
     mlts = voss_parsers.parse_mlt(fixture("voss", "show_mlt.txt"))
-    assert len(mlts) == 3
+    # footer line '3 out of 8 Total Num of mlt displayed' must not become MLT 3
+    assert [m.mlt_id for m in mlts] == [1, 2, 10]
     ist = mlts[0]
-    assert ist.mlt_id == 1
     assert ist.is_ist
     assert ist.members == ["1/47", "1/48"]
-    assert mlts[1].members == ["1/1", "1/2"]
+    assert mlts[1].name == "MLT-CORE.s.124"
+    assert mlts[1].members == ["1/1", "1/2"]  # trailing VLAN IDS column ignored
     assert mlts[1].admin == "smlt"
     assert mlts[2].mlt_type == "access"
     assert mlts[2].members == ["2/1/1"]
+
+
+def test_parse_port_state(fixture):
+    ports = voss_parsers.parse_port_state(
+        fixture("voss", "show_interfaces_gigabitethernet_state.txt"))
+    assert len(ports) == 5
+    by_port = {p.port: p for p in ports}
+    assert by_port["1/1"].admin_up is True and by_port["1/1"].oper_up is True
+    assert by_port["1/2"].admin_up is True and by_port["1/2"].oper_up is False
+    assert by_port["1/48"].admin_up is False
+    assert by_port["1/48"].state_reason == "SSH"
+    assert by_port["1/47"].state_reason == ""
+    assert by_port["2/1/1"].oper_up is True
+
+
+def test_parse_port_isid(fixture):
+    rows = voss_parsers.parse_port_isid(
+        fixture("voss", "show_interfaces_gigabitethernet_i_sid.txt"))
+    assert rows == [
+        {"port": "1/1", "isid": 10100, "vlan": 100},
+        {"port": "1/2", "isid": 10200, "vlan": 200},
+        {"port": "2/1/1", "isid": 77777, "vlan": 300},  # CVLAN row
+    ]
 
 
 def test_parse_virtual_ist(fixture):

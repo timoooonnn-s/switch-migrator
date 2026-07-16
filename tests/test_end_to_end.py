@@ -55,13 +55,16 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     voss = collect_switch(voss_target, OfflineRunner("old-agg-01", raw_root), cfg)
     ers = collect_switch(ers_target, OfflineRunner("old-access-01", raw_root), cfg)
 
-    # VOSS switch state
+    # VOSS switch state (ports from `show int gig state`, incl. down reason)
     assert voss.ports_up == 3
+    assert {p.port: p.state_reason for p in voss.ports}["1/48"] == "SSH"
     assert voss.ist and voss.ist.session_up is True
-    assert len(voss.mlts) == 3
+    assert [m.mlt_id for m in voss.mlts] == [1, 2, 10]  # no phantom footer MLT
     ist_mlt = voss.mlts[0]
     assert ist_mlt.members_up == 1  # 1/47 up, 1/48 down
     assert any("MLT 1" in w for w in voss.warnings)
+    # `show int gig i-sid` merge agrees with `show vlan i-sid` -> no conflicts
+    assert not any("binds I-SID" in w for w in voss.warnings)
 
     # ERS switch: uplink detection via LLDP against dvr-* pattern
     uplinks = [p for p in ers.ports if p.is_uplink]

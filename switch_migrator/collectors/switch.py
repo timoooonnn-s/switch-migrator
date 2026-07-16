@@ -7,7 +7,7 @@ import logging
 
 from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
-from switch_migrator.models import Platform, SwitchAudit
+from switch_migrator.models import Platform, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
 from switch_migrator.parsers.common import parse_lldp_neighbors
 
@@ -41,9 +41,15 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
 
 
 def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
-    out = _run(audit, runner, "show interfaces gigabitEthernet", required=True)
+    # primary port-state source: narrow table, immune to line wrapping
+    out = _run(audit, runner, "show interfaces gigabitEthernet state", required=False)
     if out:
-        audit.ports = voss_parsers.parse_ports(out)
+        audit.ports = voss_parsers.parse_port_state(out)
+    if not audit.ports:
+        # fallback for releases without the `state` subcommand
+        out = _run(audit, runner, "show interfaces gigabitEthernet", required=True)
+        if out:
+            audit.ports = voss_parsers.parse_ports(out)
     out = _run(audit, runner, "show mlt", required=True)
     if out:
         audit.mlts = voss_parsers.parse_mlt(out)
@@ -58,6 +64,25 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
         names = voss_parsers.parse_vlan_basic(out)
         for vlan in audit.vlans:
             vlan.name = vlan.name or names.get(vlan.vlan_id, "")
+    # port-level I-SID bindings catch services (e.g. CVLAN/switched-UNI) that
+    # `show vlan i-sid` may not list
+    out = _run(audit, runner, "show interfaces gigabitEthernet i-sid", required=False)
+    if out:
+        by_vlan = {v.vlan_id: v for v in audit.vlans}
+        for row in voss_parsers.parse_port_isid(out):
+            if row["vlan"] is None:
+                continue
+            existing = by_vlan.get(row["vlan"])
+            if existing is None:
+                new = VlanInfo(vlan_id=row["vlan"], isid=row["isid"])
+                audit.vlans.append(new)
+                by_vlan[row["vlan"]] = new
+            elif existing.isid is None:
+                existing.isid = row["isid"]
+            elif existing.isid != row["isid"]:
+                audit.warnings.append(
+                    f"VLAN {row['vlan']}: port {row['port']} binds I-SID "
+                    f"{row['isid']} but the VLAN-level binding is {existing.isid}")
 
 
 def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:

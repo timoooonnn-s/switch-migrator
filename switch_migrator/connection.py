@@ -76,6 +76,14 @@ class SshRunner(BaseRunner):
         self.ssh = ssh
         self.raw_dir = raw_dir
         self._conn = self._connect(creds)
+        if platform is Platform.VOSS:
+            # VOSS defaults to 80 columns; wide tables (Port Interface, Mlt
+            # Info) wrap mid-row at that width and become unparseable.
+            # Session-scoped setting, nothing is persisted on the device.
+            try:
+                self._conn.send_command("terminal width 512")
+            except Exception as exc:  # noqa: BLE001 - purely best effort
+                log.debug("[%s] could not set terminal width: %s", name, exc)
 
     def _connect(self, creds: Credentials):
         # Imported lazily so parsers/tests work without netmiko installed.

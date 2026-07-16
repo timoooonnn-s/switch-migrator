@@ -143,15 +143,24 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `show interfaces gigabitEthernet`, `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show lldp neighbor` |
+| VOSS (migrate) | `show interfaces gigabitEthernet state` (fallback: `show interfaces gigabitEthernet`), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor` |
 | ERS (migrate) | `show interfaces`, `show mlt`, `show ist`, `show vlan`, `show lldp neighbor` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
 
 Notes on syntax (checked against the Extreme VOSS/Fabric Engine command
-references):
+references and real device output):
 
-* `show interfaces gigabitEthernet` is used without a subcommand; the parser
-  reads the leading **Port Interface** section of its output.
+* Port state comes from `show interfaces gigabitEthernet state` — the table is
+  narrow, never wraps, and includes the down `REASON` column (shown in the
+  Ports sheet). On releases without the `state` subcommand the tool falls back
+  to plain `show interfaces gigabitEthernet` and parses its leading
+  **Port Interface** section.
+* Every VOSS session sets `terminal width 512` right after login (session
+  scoped, nothing persisted): at the default 80 columns the wide tables
+  (Port Interface, Mlt Info) wrap mid-row and become unparseable.
+* `show interfaces gigabitEthernet i-sid` supplements `show vlan i-sid` with
+  port-level bindings, catching CVLAN/switched-UNI services; conflicting
+  bindings between the two sources are flagged as warnings.
 * `show dvr interfaces` needs no extra keyword — `l3isid <0-16777215>` exists
   only as an optional filter, and the unfiltered form lists every DvR
   interface with its `L2ISID`/`VLAN`/`GW IPv4` columns.

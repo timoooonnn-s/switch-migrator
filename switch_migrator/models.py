@@ -17,6 +17,7 @@ class PortState:
     description: str = ""
     admin_up: bool | None = None
     oper_up: bool | None = None
+    state_reason: str = ""        # VOSS `show int gig state` REASON column (e.g. SSH)
     lldp_neighbor: str = ""
     is_uplink: bool = False
 

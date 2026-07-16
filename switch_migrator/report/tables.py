@@ -62,12 +62,12 @@ def build_summary(audits: list[SwitchAudit],
 
 def build_ports(audits: list[SwitchAudit]) -> Table:
     t = Table("Ports", ["Switch", "Port", "Description", "Admin", "Oper",
-                        "LLDP neighbor", "Uplink"])
+                        "Reason", "LLDP neighbor", "Uplink"])
     for a in audits:
         for p in a.ports:
             t.add([a.name, p.port, p.description,
                    _fmt_bool(p.admin_up, "enable", "disable"),
-                   _fmt_bool(p.oper_up), p.lldp_neighbor,
+                   _fmt_bool(p.oper_up), p.state_reason, p.lldp_neighbor,
                    "yes" if p.is_uplink else ""],
                   "warn" if p.is_uplink and not p.oper_up else None)
     return t

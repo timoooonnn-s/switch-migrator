@@ -66,13 +66,14 @@ def parse_mlt(output: str) -> list[MltState]:
     Anchors: first token is the integer MLT id; the member column is the first
     token that looks like a port list and contains '/' (VOSS ports always have
     slots); type is 'access'/'trunk'; admin/current are the norm/smlt tokens.
+    The trailing VLAN IDS column and footer lines like
+    '3 out of 8 Total Num of mlt displayed' are ignored.
     """
     mlts: list[MltState] = []
     for line in output.splitlines():
         tokens = line.split()
         if len(tokens) < 3 or not tokens[0].isdigit():
             continue
-        # skip separator/header junk: require a name-ish or member-ish token
         mlt_id = int(tokens[0])
         rest = tokens[1:]
         # optional IFINDEX column directly after the id
@@ -88,6 +89,10 @@ def parse_mlt(output: str) -> list[MltState]:
                 break
         mlt_type = next((t for t in rest if t.lower() in ("access", "trunk")), "")
         states = [t for t in rest if t.lower() in ("norm", "smlt", "ist")]
+        # footer guard: a real MLT row shows at least a type, a state or members
+        # ('N out of M Total Num of mlt displayed' shows none of them)
+        if not mlt_type and not states and not members:
+            continue
         mlts.append(MltState(
             mlt_id=mlt_id,
             name=name,
@@ -98,6 +103,48 @@ def parse_mlt(output: str) -> list[MltState]:
             is_ist="ist" in name.lower() or "ist" in [s.lower() for s in states],
         ))
     return mlts
+
+
+def parse_port_state(output: str) -> list[PortState]:
+    """`show interfaces gigabitEthernet state`
+
+    Preferred port-state source: the table is narrow enough to never wrap.
+    Data lines: <port> <up|down> <up|down> <reason|--> <date> <time>
+    """
+    ports: list[PortState] = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if len(tokens) < 3 or not PORT_RE.match(tokens[0]):
+            continue
+        admin, oper = parse_updown(tokens[1]), parse_updown(tokens[2])
+        if admin is None or oper is None:
+            continue
+        reason = tokens[3] if len(tokens) > 3 and tokens[3] != "--" else ""
+        ports.append(PortState(port=tokens[0], admin_up=admin, oper_up=oper,
+                               state_reason=reason))
+    return ports
+
+
+def parse_port_isid(output: str) -> list[dict]:
+    """`show interfaces gigabitEthernet i-sid`
+
+    Data lines: <port> <ifindex> <isid> <vlanid|N/A> <c-vid|N/A> <type> ...
+    Returns [{"port": str, "isid": int, "vlan": int|None}, ...]; the VLAN is
+    taken from VLANID, falling back to C-VID for switched-UNI rows.
+    """
+    rows: list[dict] = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if len(tokens) < 5 or not PORT_RE.match(tokens[0]) \
+                or not tokens[1].isdigit() or not tokens[2].isdigit():
+            continue
+        vlan = None
+        for candidate in (tokens[3], tokens[4]):
+            if candidate.isdigit() and 1 <= int(candidate) <= 4094:
+                vlan = int(candidate)
+                break
+        rows.append({"port": tokens[0], "isid": int(tokens[2]), "vlan": vlan})
+    return rows
 
 
 def parse_virtual_ist(output: str) -> IstState | None:
