@@ -42,6 +42,59 @@ class ConnectionFailed(Exception):
     pass
 
 
+_LEGACY_KEX = (
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+    "diffie-hellman-group1-sha1",
+)
+_LEGACY_CIPHERS = ("aes256-cbc", "aes192-cbc", "aes128-cbc", "3des-cbc")
+_LEGACY_KEYS = ("ssh-rsa", "ssh-dss")
+
+_legacy_enabled = False
+
+
+def enable_legacy_ssh_algorithms() -> list[str]:
+    """Append the legacy SSH algorithms old ERS/BOSS gear needs (SHA-1 kex,
+    CBC ciphers, ssh-rsa/ssh-dss host keys) to paramiko's client preference
+    lists, when this paramiko build implements them.
+
+    Appending to the END keeps modern algorithms first, so connections to
+    current devices (VOSS, DvR controllers) are completely unaffected - only
+    servers that offer nothing better fall back to these. Purely client-side
+    and process-wide; no device or OS configuration is touched. Idempotent.
+    Returns the algorithms that were newly enabled.
+    """
+    global _legacy_enabled
+    from paramiko.transport import Transport
+
+    added: list[str] = []
+    if _legacy_enabled:
+        return added
+
+    def extend(attr: str, wanted: tuple[str, ...], implemented) -> None:
+        current = list(getattr(Transport, attr))
+        for algo in wanted:
+            if algo not in current and algo in implemented:
+                current.append(algo)
+                added.append(algo)
+        setattr(Transport, attr, tuple(current))
+
+    extend("_preferred_kex", _LEGACY_KEX, Transport._kex_info)
+    extend("_preferred_ciphers", _LEGACY_CIPHERS, Transport._cipher_info)
+    extend("_preferred_keys", _LEGACY_KEYS, Transport._key_info)
+    _legacy_enabled = True
+    if added:
+        log.info("legacy SSH algorithms enabled: %s", ", ".join(added))
+    missing = [a for a in _LEGACY_KEYS + _LEGACY_KEX + _LEGACY_CIPHERS
+               if a not in {**Transport._kex_info, **Transport._cipher_info,
+                            **Transport._key_info}]
+    if missing:
+        log.warning("this paramiko build does not implement %s - very old "
+                    "ERS gear may still refuse to connect (install "
+                    "'paramiko>=3.4,<4')", ", ".join(missing))
+    return added
+
+
 class CommandError(Exception):
     def __init__(self, command: str, output: str):
         super().__init__(f"device rejected command '{command}'")
@@ -75,6 +128,8 @@ class SshRunner(BaseRunner):
         self.platform = platform
         self.ssh = ssh
         self.raw_dir = raw_dir
+        if ssh.legacy_algorithms:
+            enable_legacy_ssh_algorithms()
         self._conn = self._connect(creds)
         # No session tuning beyond netmiko's own 'terminal more disable':
         # VOSS has no 'terminal width' command, and sending unknown commands
@@ -91,6 +146,8 @@ class SshRunner(BaseRunner):
             "username": creds.username,
             "password": creds.password,
             "conn_timeout": self.ssh.conn_timeout,
+            "banner_timeout": max(15, self.ssh.conn_timeout),
+            "auth_timeout": max(15, self.ssh.conn_timeout),
             "read_timeout_override": self.ssh.read_timeout,
             "fast_cli": False,  # old ERS gear chokes on fast_cli
         }
@@ -107,6 +164,11 @@ class SshRunner(BaseRunner):
                 last_exc = exc
                 if attempt < self.ssh.retries:
                     time.sleep(2 * (attempt + 1))
+            except Exception as exc:
+                # e.g. paramiko SSHException 'Incompatible ssh peer (no
+                # acceptable kex/host key algorithm)' - retrying won't help
+                raise ConnectionFailed(
+                    f"{self.name}: {exc.__class__.__name__}: {exc}") from exc
         raise ConnectionFailed(f"{self.name}: {last_exc}") from last_exc
 
     def run(self, command: str) -> str:

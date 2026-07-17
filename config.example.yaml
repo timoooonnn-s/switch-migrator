@@ -71,3 +71,8 @@ ssh:
   read_timeout: 60        # seconds to wait for a command to finish
   workers: 4              # parallel device connections
   retries: 1              # reconnect attempts after a connection failure
+  # Old ERS/BOSS gear only speaks SHA-1 kex, CBC ciphers and ssh-rsa/ssh-dss
+  # host keys. true appends those to the client's algorithm lists (modern
+  # algorithms keep priority, current devices are unaffected). Client-side
+  # only - no device or OS configuration is touched.
+  legacy_algorithms: true

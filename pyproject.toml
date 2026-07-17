@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "netmiko>=4.3,<5",
+    # paramiko 4.x removed ssh-dss host keys still used by old ERS/BOSS gear
+    "paramiko>=3.4,<4",
     "PyYAML>=6.0",
     "rich>=13.0",
     "openpyxl>=3.1",

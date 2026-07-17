@@ -41,6 +41,7 @@ class SshSettings:
     read_timeout: int = 60
     workers: int = 4
     retries: int = 1
+    legacy_algorithms: bool = True  # old ERS/BOSS kex/ciphers/host keys
 
 
 @dataclass
@@ -95,6 +96,7 @@ def load_config(path: Path) -> Config:
         read_timeout=int(ssh_data.get("read_timeout", 60)),
         workers=max(1, int(ssh_data.get("workers", 4))),
         retries=max(0, int(ssh_data.get("retries", 1))),
+        legacy_algorithms=bool(ssh_data.get("legacy_algorithms", True)),
     )
 
     return Config(

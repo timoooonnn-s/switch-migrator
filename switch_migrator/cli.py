@@ -106,17 +106,25 @@ def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
 
 def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
                      args: argparse.Namespace) -> SwitchAudit:
+    failed = SwitchAudit(name=target.name, host=target.host,
+                         platform=target.platform, reachable=False)
     try:
         runner = make_runner(target.name, target.host, target.platform,
                              creds, cfg, args)
     except ConnectionFailed as exc:
-        audit = SwitchAudit(name=target.name, host=target.host,
-                            platform=target.platform, reachable=False)
-        audit.errors.append(str(exc))
+        failed.errors.append(str(exc))
         log.error("%s", exc)
-        return audit
+        return failed
+    except Exception as exc:  # noqa: BLE001 - one bad device must not kill the run
+        failed.errors.append(f"unexpected connect error: {exc.__class__.__name__}: {exc}")
+        log.exception("[%s] unexpected connect error", target.name)
+        return failed
     try:
         return collect_switch(target, runner, cfg)
+    except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
+        failed.errors.append(f"collection crashed: {exc.__class__.__name__}: {exc}")
+        log.exception("[%s] collection crashed", target.name)
+        return failed
     finally:
         runner.close()
 
@@ -128,12 +136,15 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
         try:
             runner = make_runner(dvr.name, dvr.host, Platform.VOSS,
                                  creds, cfg, args)
-        except ConnectionFailed as exc:
-            fabric.dvr_errors.append(str(exc))
-            log.error("%s", exc)
+        except Exception as exc:  # noqa: BLE001 - keep reading the other DvRs
+            fabric.dvr_errors.append(f"{dvr.name}: {exc}")
+            log.error("%s: %s", dvr.name, exc)
             continue
         try:
             collect_dvr(dvr.name, runner, fabric)
+        except Exception as exc:  # noqa: BLE001 - keep reading the other DvRs
+            fabric.dvr_errors.append(f"{dvr.name}: collection crashed: {exc}")
+            log.exception("[%s] collection crashed", dvr.name)
         finally:
             runner.close()
     return fabric
@@ -195,6 +206,13 @@ def main(argv: list[str] | None = None) -> int:
             for future in cf.as_completed(futures):
                 audits.append(future.result())
     audits.sort(key=lambda a: a.name)
+
+    # unreachable devices go to the report too, but say it loudly right away
+    for audit in audits:
+        if not audit.reachable:
+            reason = audit.errors[-1] if audit.errors else "unknown error"
+            console.print(f"[bold red]UNREACHABLE[/bold red] {audit.name} "
+                          f"({audit.host}): {reason}")
 
     # 3) Compare
     comparisons = {a.name: compare_switch(a, fabric, cfg)

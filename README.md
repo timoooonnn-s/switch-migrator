@@ -99,6 +99,29 @@ read -s SM_PASSWORD && export SM_PASSWORD
 
 Authentication failures are **not retried** to avoid account lockouts.
 
+## Legacy SSH on old ERS gear
+
+Old ERS/BOSS switches only offer SHA-1 key exchange, CBC ciphers and
+`ssh-rsa`/`ssh-dss` host keys. The tool handles this out of the box
+(`ssh.legacy_algorithms: true`, the default):
+
+* the legacy algorithms are **appended** to paramiko's client preference
+  lists at runtime — modern algorithms keep priority, so VOSS switches and
+  DvR controllers negotiate exactly what they would anyway; only servers
+  that offer nothing better fall back to the legacy set,
+* `requirements.txt` pins `paramiko>=3.4,<4` because paramiko 4.x removed
+  `ssh-dss` host-key support, which the oldest ERS boxes still present.
+
+Everything happens inside the tool's own Python environment (your venv's
+paramiko does its own crypto — RHEL system-wide crypto policies and the
+OpenSSH client config don't apply to it). No root access, no OS changes, no
+device changes and no multi-user settings are needed; a plain user account
+on a RHEL 8/9 host is enough.
+
+A device that still can't connect is reported as **UNREACHABLE** (console +
+Summary + Issues) and the audit simply continues with the remaining
+switches — one dead box never aborts the run.
+
 ## Usage
 
 ```bash
