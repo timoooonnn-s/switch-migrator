@@ -42,6 +42,11 @@ class SshSettings:
     workers: int = 4
     retries: int = 1
     legacy_algorithms: bool = True  # old ERS/BOSS kex/ciphers/host keys
+    global_delay_factor: float = 1.0  # slow gear: raise to give reads more time
+    default_enter: str | None = None  # e.g. "\r\n" for ERS/BOSS that ignore "\n"
+    # advanced: paramiko disabled_algorithms, e.g. {"kex": ["curve25519-..."]}
+    # to pin OUT a modern algorithm a device negotiates but implements badly
+    disabled_algorithms: dict | None = None
 
 
 @dataclass
@@ -92,12 +97,21 @@ def load_config(path: Path) -> Config:
         )
 
     ssh_data = data.get("ssh") or {}
+    disabled_algorithms = ssh_data.get("disabled_algorithms")
+    if disabled_algorithms is not None and not isinstance(disabled_algorithms, dict):
+        raise ConfigError(
+            f"{path}: ssh.disabled_algorithms must be a mapping like "
+            f"{{kex: [...], ciphers: [...], keys: [...]}}")
+    default_enter = ssh_data.get("default_enter")
     ssh = SshSettings(
         conn_timeout=int(ssh_data.get("conn_timeout", 20)),
         read_timeout=int(ssh_data.get("read_timeout", 60)),
         workers=max(1, int(ssh_data.get("workers", 4))),
         retries=max(0, int(ssh_data.get("retries", 1))),
         legacy_algorithms=bool(ssh_data.get("legacy_algorithms", True)),
+        global_delay_factor=float(ssh_data.get("global_delay_factor", 1.0)),
+        default_enter=str(default_enter) if default_enter else None,
+        disabled_algorithms=disabled_algorithms,
     )
 
     excluded_vlans: set[int] = set()

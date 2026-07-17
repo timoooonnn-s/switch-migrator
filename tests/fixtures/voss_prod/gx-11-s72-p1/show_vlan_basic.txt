@@ -1,0 +1,51 @@
+************************************************************************************
+                Command Execution Time: Fri Jul 17 20:19:18 2026 CEST
+************************************************************************************
+
+============================================================================================================
+                                            Vlan Basic
+============================================================================================================
+VLAN                                MSTP
+ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR      SUBNETMASK      VRFID ORIGIN
+------------------------------------------------------------------------------------------------------------
+1     Default          byPort       0       none         N/A             N/A             0     CONFIG
+31    E010041008008_30 byPort       0       none         N/A             N/A             0     CONFIG
+99    quarantine       byPort       0       none         N/A             N/A             0     CONFIG
+174   X010041002000_24 byPort       0       none         N/A             N/A             0     CONFIG
+695   E010035016000_21 byPort       0       none         N/A             N/A             0     CONFIG
+696   E010034064000_24 byPort       0       none         N/A             N/A             0     CONFIG
+699   E010035024000_23 byPort       0       none         N/A             N/A             0     CONFIG
+735   E010035008000_21 byPort       0       none         N/A             N/A             0     CONFIG
+839   E010037016000_23 byPort       0       none         N/A             N/A             0     CONFIG
+847   R010035006000_24 byPort       0       none         N/A             N/A             0     CONFIG
+848   R010041001000_24 byPort       0       none         N/A             N/A             0     CONFIG
+849   E010035007000_24 byPort       0       none         N/A             N/A             0     CONFIG
+850   E192168012000_22 byPort       0       none         N/A             N/A             0     CONFIG
+851   E010035032000_21 byPort       0       none         N/A             N/A             0     CONFIG
+852   R010035064000_21 byPort       0       none         N/A             N/A             0     CONFIG
+853   E010035040000_21 byPort       0       none         N/A             N/A             0     CONFIG
+2200  E010030004000_26 byPort       0       none         N/A             N/A             0     CONFIG
+2201  E010030004064_27 byPort       0       none         N/A             N/A             0     CONFIG
+2230  E010030003160_27 byPort       0       none         N/A             N/A             0     CONFIG
+2232  E010030003224_27 byPort       0       none         N/A             N/A             0     CONFIG
+2233  E010054066000_23 byPort       0       none         N/A             N/A             0     CONFIG
+2246  X010054064064_27 byPort       0       none         N/A             N/A             0     CONFIG
+2261  E010030007000_26 byPort       0       none         N/A             N/A             0     CONFIG
+2262  E010030007064_27 byPort       0       none         N/A             N/A             0     CONFIG
+2266  E010030007160_27 byPort       0       none         N/A             N/A             0     CONFIG
+2600  E010054071000_28 byPort       0       none         N/A             N/A             0     CONFIG
+2601  E010054071016_28 byPort       0       none         N/A             N/A             0     CONFIG
+2602  E010054071032_28 byPort       0       none         N/A             N/A             0     CONFIG
+2603  E010054071048_28 byPort       0       none         N/A             N/A             0     CONFIG
+2604  E010054071064_28 byPort       0       none         N/A             N/A             0     CONFIG
+2900  E010030007192_27 byPort       0       none         N/A             N/A             0     CONFIG
+2901  X010030008000_26 byPort       0       none         N/A             N/A             0     CONFIG
+2903  X010030009000_24 byPort       0       none         N/A             N/A             0     CONFIG
+2905  X010030008128_26 byPort       0       none         N/A             N/A             0     CONFIG
+2906  X010030008192_27 byPort       0       none         N/A             N/A             0     CONFIG
+2907  X010030007096_27 byPort       0       none         N/A             N/A             0     CONFIG
+2952  X010054073064_26 byPort       0       none         N/A             N/A             0     CONFIG
+4051  BVLAN-1          spbm-bvlan   62      none         N/A             N/A             0     CONFIG
+4052  BVLAN-2          spbm-bvlan   62      none         N/A             N/A             0     CONFIG
+
+All 39 out of 39 Total Num of Vlans displayed

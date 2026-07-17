@@ -164,3 +164,61 @@ def test_paramiko_supports_ers_host_keys():
     # this guards against an accidental future upgrade breaking old ERS gear
     assert int(paramiko.__version__.split(".")[0]) < 4
     assert "ssh-dss" in Transport._key_info
+
+
+import io
+
+
+def test_patient_ers_class_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
+    cls = connection._patient_ers_class()
+    assert cls is not None
+    inst = object.__new__(cls)
+    calls = {"n": 0}
+
+    def flaky_set_base_prompt():
+        calls["n"] += 1
+        if calls["n"] < 3:            # miss the prompt on the first two tries
+            raise TimeoutError("Pattern not detected: (?:\\#|>)")
+
+    inst.set_base_prompt = flaky_set_base_prompt
+    inst.set_terminal_width = lambda: None
+    inst.disable_paging = lambda: None
+    inst.clear_buffer = lambda: ""
+    inst.write_channel = lambda _d: None
+    inst.RETURN = "\n"
+    inst.session_preparation()        # must not raise
+    assert calls["n"] == 3
+
+
+def test_patient_ers_class_gives_up_and_reraises(monkeypatch):
+    monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
+    cls = connection._patient_ers_class()
+    inst = object.__new__(cls)
+
+    def always_fail():
+        raise TimeoutError("Pattern not detected: (?:\\#|>)")
+
+    inst.set_base_prompt = always_fail
+    inst.clear_buffer = lambda: ""
+    inst.write_channel = lambda _d: None
+    inst.RETURN = "\n"
+    with pytest.raises(TimeoutError):
+        inst.session_preparation()
+
+
+def test_diag_suffix_says_not_a_cipher_problem_when_device_answered():
+    runner = _make_runner(_FakeConn(None))
+    runner._session_log = io.BytesIO(
+        b"\nLogin banner\nEnter Ctrl-Y to begin\n")
+    suffix = runner._diag_suffix()
+    assert "not a cipher problem" in suffix
+    assert "Ctrl-Y" in suffix
+
+
+def test_diag_suffix_empty_when_device_sent_nothing():
+    # a true kex/cipher rejection produces no channel bytes -> no misleading
+    # 'not a cipher problem' hint is appended
+    runner = _make_runner(_FakeConn(None))
+    runner._session_log = io.BytesIO(b"")
+    assert runner._diag_suffix() == ""

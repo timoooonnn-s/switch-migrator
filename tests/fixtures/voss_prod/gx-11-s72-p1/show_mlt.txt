@@ -1,0 +1,63 @@
+************************************************************************************
+                Command Execution Time: Fri Jul 17 20:19:17 2026 CEST
+************************************************************************************
+
+====================================================================================================
+                                    Mlt Info
+====================================================================================================
+                        PORT    MLT   MLT        PORT         VLAN
+MLTID IFINDEX NAME      TYPE   ADMIN CURRENT    MEMBERS       IDS
+-----------------------------------------------------------------------------------------------------------
+1   6144  MLT001.svi.108.116 trunk   norm   norm     1/8,1/16          4051 4052
+35  6178  MLT035.s.1/2/23/24 trunk   smlt   smlt     1/1-1/2,1/23-1/24 174 695 696 699 735 839 847 848 849 850 851 852 853 2200 2201 2230 2232 2233 2246 2261 2262 2266 2600 2601 2602 2603 2604 2900 2901 2903 2905 2906 2907 2952
+38  6181  s129         trunk   smlt   smlt     1/29              174 695 696 699 735 839 847 848 849 850 851 852 853 2200 2246 2901
+196 6339  f110         trunk   smlt   smlt     1/10              735
+197 6340  f143         trunk   smlt   smlt     1/43              695
+198 6341  f115         trunk   smlt   smlt     1/15              695
+199 6342  f145         access  smlt   smlt     1/45              695
+200 6343  f146         access  smlt   smlt     1/46              695
+
+All 8 out of 8 Total Num of mlt displayed
+
+               DESIGNATED   LACP      LACP
+MLTID IFINDEX  PORTS        ADMIN     OPER
+-----------------------------------------------------------------------------------------------------------
+1      6144    1/8           disable   down
+35     6178    1/1           disable   down
+38     6181    1/29          disable   down
+196    6339    1/10          enable      up
+197    6340    1/43          enable      up
+198    6341    1/15          enable      up
+199    6342    1/45          enable      up
+200    6343    1/46          enable      up
+
+All 8 out of 8 Total Num of mlt displayed
+
+                                                            WHICH PORTS
+             WHERE      LOCAL             REMOTE            PROGRAMMED
+MLTID NAME   CREATED    PORT MEMBERS      PORT MEMBERS      IN DATA PATH
+-----------------------------------------------------------------------------------------------------------
+1    MLT001.svi.108.116 LOC & REM  1/8,1/16          1/8,1/16          LOCAL
+35   MLT035.s.1/2/23/24 LOC & REM  1/1-1/2,1/23-1/24 1/1-1/2,1/23-1/24 LOCAL & REMOTE
+38   s129    LOC & REM  1/29              1/29              LOCAL & REMOTE
+196  f110    LOC & REM  1/10              1/10              LOCAL & REMOTE
+197  f143    LOC & REM  1/43              1/43              LOCAL & REMOTE
+198  f115    LOC & REM  1/15              1/15              LOCAL & REMOTE
+199  f145    LOC & REM  1/45              1/45              LOCAL & REMOTE
+200  f146    LOC & REM  1/46              1/46              LOCAL & REMOTE
+
+All 8 out of 8 Total Num of mlt displayed
+
+               ENCAP                          PVLAN        VID
+MLTID IFINDEX  DOT1Q     LOSSLESS   PVLAN     TYPE         TYPE         FLEX-UNI
+-----------------------------------------------------------------------------------------------------------
+1     6144     enable    disable    disable   -            -            disable
+35    6178     enable    disable    disable   -            -            disable
+38    6181     enable    disable    disable   -            -            disable
+196   6339     enable    disable    disable   -            -            disable
+197   6340     enable    disable    disable   -            -            disable
+198   6341     enable    disable    disable   -            -            disable
+199   6342     disable   disable    disable   -            -            disable
+200   6343     disable   disable    disable   -            -            disable
+
+All 8 out of 8 Total Num of mlt displayed

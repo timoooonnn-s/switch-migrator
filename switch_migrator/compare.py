@@ -120,6 +120,18 @@ def _compare_vlan(audit: SwitchAudit, vlan_id: int, vlan_name: str,
                       f"({convention_hits}) and no DvR-controller attachment disambiguates "
                       f"them - resolve via isid_conventions.explicit")
 
+    # Nothing anywhere. On a VOSS switch a VLAN that carries no local I-SID
+    # binding is a local-only L2 VLAN by design (quarantine, default, B-VLANs,
+    # management) - it was never extended over the fabric and is not supposed to
+    # be. Flagging it as a missing fabric service is a false positive; report it
+    # as LOCAL_ONLY instead. ERS VLANs keep MISSING_ON_DVR: they have no I-SID
+    # concept at all, so absence from the fabric IS the actionable finding.
+    if audit.platform is Platform.VOSS and local_isid is None:
+        return result(CompStatus.LOCAL_ONLY, None,
+                      f"VLAN {vlan_id} has no I-SID binding on {audit.name} and is "
+                      f"absent from the fabric - local-only L2 VLAN, recreate it "
+                      f"locally on the new switch (no fabric service required)")
+
     return result(CompStatus.MISSING_ON_DVR, None,
                   f"no candidate I-SID (checked {expected}) exists in the fabric "
                   f"and no DvR controller attaches VLAN {vlan_id} - service must be created "

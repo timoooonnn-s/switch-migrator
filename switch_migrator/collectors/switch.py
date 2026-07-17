@@ -134,6 +134,7 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
         audit.warnings.append(
             "no LLDP neighbor data - uplink detection disabled for this switch")
 
+    have_port_state = bool(audit.ports)
     port_oper = {}
     for port in audit.ports:
         port.lldp_neighbor = neighbors.get(port.port, "")
@@ -142,7 +143,11 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
         port_oper[port.port] = bool(port.oper_up)
 
     for mlt in audit.mlts:
-        mlt.members_up = sum(1 for m in mlt.members if port_oper.get(m, False))
+        # Only a real port-state read gives a real up-count. With none, leave
+        # members_up = None (unknown) instead of counting every member as down.
+        mlt.members_up = (
+            sum(1 for m in mlt.members if port_oper.get(m, False))
+            if have_port_state else None)
         mlt.is_uplink = any(
             p.is_uplink for p in audit.ports if p.port in mlt.members)
 
@@ -150,12 +155,20 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
         audit.warnings.append(
             f"IST/vIST session is DOWN (peer {audit.ist.peer_ip or 'unknown'})")
     for mlt in audit.mlts:
+        label = f"MLT {mlt.mlt_id} ({mlt.name or 'unnamed'})"
         if not mlt.members:
             audit.warnings.append(
-                f"MLT {mlt.mlt_id} ({mlt.name or 'unnamed'}): DEAD MLT - no "
-                f"member ports left; does not need to be recreated on the "
-                f"new switch")
+                f"{label}: DEAD MLT - no member ports left; does not need to be "
+                f"recreated on the new switch")
+        elif mlt.members_up is None:
+            # No usable port state. Fall back to the data-path table: NONE means
+            # the MLT is genuinely down; LOCAL/REMOTE means it is forwarding.
+            # Never emit a bogus '0/N up' here.
+            if mlt.in_datapath is False:
+                audit.warnings.append(
+                    f"{label}: not programmed in the data path - member ports "
+                    f"{','.join(mlt.members)} appear DOWN (per-port state "
+                    f"unavailable; inferred from 'show mlt')")
         elif mlt.members_up < mlt.members_total:
             audit.warnings.append(
-                f"MLT {mlt.mlt_id} ({mlt.name or 'unnamed'}): only "
-                f"{mlt.members_up}/{mlt.members_total} member ports up")
+                f"{label}: only {mlt.members_up}/{mlt.members_total} member ports up")

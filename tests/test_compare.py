@@ -173,3 +173,34 @@ def test_voss_vlan_without_isid_falls_back_to_derivation():
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[200].status is CompStatus.OK
     assert res[200].matched_isid == 10200
+
+
+def test_voss_vlan_without_isid_and_nothing_in_fabric_is_local_only():
+    # quarantine / default / B-VLAN on VOSS: no I-SID binding => local L2 by
+    # design, NOT a missing fabric service (this was the VLAN 99 false error)
+    cfg = make_config()
+    fabric = make_fabric({})
+    audit = make_audit(Platform.VOSS, [VlanInfo(99, "quarantine", isid=None)])
+    res = by_vlan(compare_switch(audit, fabric, cfg))
+    assert res[99].status is CompStatus.LOCAL_ONLY
+    assert res[99].severity == "ok"
+
+
+def test_ers_vlan_without_isid_stays_missing_not_local_only():
+    # contrast: ERS has no I-SID concept, so absence from the fabric IS the
+    # actionable finding and must remain an error
+    cfg = make_config()
+    fabric = make_fabric({})
+    audit = make_audit(Platform.ERS, [VlanInfo(99, "quarantine")])
+    res = by_vlan(compare_switch(audit, fabric, cfg))
+    assert res[99].status is CompStatus.MISSING_ON_DVR
+
+
+def test_voss_no_isid_but_convention_in_fabric_is_not_local_only():
+    # guard: LOCAL_ONLY only when NOTHING exists anywhere; if a convention
+    # I-SID is present in the fabric it must still surface as a real finding
+    cfg = make_config()  # offsets 10000, 20000
+    fabric = make_fabric({10099: {"cvids": []}})
+    audit = make_audit(Platform.VOSS, [VlanInfo(99, isid=None)])
+    res = by_vlan(compare_switch(audit, fabric, cfg))
+    assert res[99].status is CompStatus.IN_FABRIC_NOT_ATTACHED
