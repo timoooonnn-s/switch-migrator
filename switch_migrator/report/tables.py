@@ -78,14 +78,19 @@ def build_mlts(audits: list[SwitchAudit]) -> Table:
                        "Members up", "IST", "Uplink"])
     for a in audits:
         for m in a.mlts:
+            if not m.members:
+                # dead MLT: nothing to recreate on the new switch
+                t.add([a.name, m.mlt_id, m.name, m.mlt_type, m.admin,
+                       "DEAD - no members", "0/0",
+                       "yes" if m.is_ist else "", ""], "warn")
+                continue
             severity = None
-            if m.members:
-                if m.members_up == 0:
-                    severity = "error"
-                elif m.members_up < m.members_total:
-                    severity = "warn"
+            if m.members_up == 0:
+                severity = "error"
+            elif m.members_up < m.members_total:
+                severity = "warn"
             t.add([a.name, m.mlt_id, m.name, m.mlt_type, m.admin,
-                   ",".join(m.members) or "-",
+                   ",".join(m.members),
                    f"{m.members_up}/{m.members_total}",
                    "yes" if m.is_ist else "",
                    "yes" if m.is_uplink else ""], severity)
@@ -98,14 +103,15 @@ def build_vlan_comparison(comparisons: dict[str, list[VlanComparison]]) -> Table
                                  "Matched I-SID", "Status", "Detail"])
     for comps in comparisons.values():
         for c in comps:
-            if c.status is CompStatus.EXCLUDED:
-                continue
+            # EXCLUDED rows stay in the table (uncolored) so it is visible on
+            # WHICH switches an intentionally-unfabriced VLAN exists
             t.add([c.switch, c.vlan_id, c.vlan_name,
                    c.local_isid if c.local_isid is not None else "",
                    ",".join(map(str, c.expected_isids)),
                    ",".join(map(str, c.dvr_isids)) or "-",
                    c.matched_isid if c.matched_isid is not None else "-",
-                   c.status.value, c.detail], c.severity)
+                   c.status.value, c.detail],
+                  None if c.status is CompStatus.EXCLUDED else c.severity)
     return t
 
 

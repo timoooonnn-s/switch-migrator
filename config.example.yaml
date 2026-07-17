@@ -46,9 +46,17 @@ isid_conventions:
   #  150: 90150
 
 # --- VLANs to ignore in the comparison -------------------------------------------
-# Default VLAN and the VOSS/Fabric Engine reserved range (4048-4059, incl. the
-# usual B-VLANs 4051/4052) plus anything site-specific like a dedicated
-# IST/vIST VLAN.
+# Excluded VLANs still appear in the "VLAN vs Fabric" sheet (status EXCLUDED,
+# showing on which switches they exist) but never count as errors.
+#
+# By NAME (case-insensitive shell globs) - for VLANs that intentionally do
+# not exist in the fabric, e.g. a local quarantine VLAN:
+excluded_vlan_names:
+  - "quarant*"
+
+# By VLAN ID: default VLAN and the VOSS/Fabric Engine reserved range
+# (4048-4059, incl. the usual B-VLANs 4051/4052) plus anything site-specific
+# like a dedicated IST/vIST VLAN. IDs only - names go in the list above.
 excluded_vlans:
   - 1
   - 4000        # example: vIST VLAN

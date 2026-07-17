@@ -99,6 +99,21 @@ def test_excluded_vlan():
     assert res[4000].status is CompStatus.EXCLUDED
 
 
+def test_excluded_vlan_by_name_pattern():
+    # quarantine VLAN 99: intentionally absent from the fabric, excluded by
+    # its NAME - the detail must say on which switch it exists
+    cfg = make_config(excluded_vlan_names=["quarant*"])
+    fabric = make_fabric({})
+    audit = make_audit(Platform.ERS, [VlanInfo(99, "Quarantaine"),
+                                      VlanInfo(666, "Orphan")])
+    res = by_vlan(compare_switch(audit, fabric, cfg))
+    assert res[99].status is CompStatus.EXCLUDED
+    assert "Quarantaine" in res[99].detail
+    assert "exists on sw" in res[99].detail
+    # non-matching VLANs still get real verdicts
+    assert res[666].status is CompStatus.MISSING_ON_DVR
+
+
 def test_explicit_mapping_wins():
     cfg = make_config(isid_explicit={100: 55555})
     fabric = make_fabric({55555: {"cvids": [100]}, 10100: {"cvids": [100]}})

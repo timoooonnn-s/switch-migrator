@@ -15,6 +15,8 @@ convention disagreement is only a warning.
 
 from __future__ import annotations
 
+import fnmatch
+
 from switch_migrator.config import Config
 from switch_migrator.models import (
     CompStatus,
@@ -54,8 +56,19 @@ def _compare_vlan(audit: SwitchAudit, vlan_id: int, vlan_name: str,
             status=status, detail=detail,
         )
 
+    excluded_by = None
     if vlan_id in cfg.excluded_vlans:
-        return result(CompStatus.EXCLUDED, None, "VLAN excluded via config")
+        excluded_by = f"VLAN id {vlan_id} is on the excluded_vlans list"
+    elif vlan_name:
+        for pattern in cfg.excluded_vlan_names:
+            if fnmatch.fnmatch(vlan_name.lower(), pattern.lower()):
+                excluded_by = (f"VLAN name '{vlan_name}' matches excluded "
+                               f"pattern '{pattern}'")
+                break
+    if excluded_by:
+        return result(CompStatus.EXCLUDED, None,
+                      f"{excluded_by} - exists on {audit.name}, intentionally "
+                      f"absent from the fabric")
 
     # --- VOSS switch with its own local binding: that binding is the claim to verify
     if audit.platform is Platform.VOSS and local_isid is not None:

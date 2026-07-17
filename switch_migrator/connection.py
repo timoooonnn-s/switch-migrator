@@ -132,11 +132,21 @@ def looks_like_error(output: str) -> bool:
 
 
 class BaseRunner:
+    setup_warnings: list[str]
+
     def run(self, command: str) -> str:
         raise NotImplementedError
 
     def close(self) -> None:
         pass
+
+
+# paging left active stalls long outputs at --More-- and the stuck pager
+# swallows the next command's characters
+_PAGING_DISABLE = {
+    Platform.VOSS: "terminal more disable",
+    Platform.ERS: "terminal length 0",
+}
 
 
 class SshRunner(BaseRunner):
@@ -148,14 +158,39 @@ class SshRunner(BaseRunner):
         self.platform = platform
         self.ssh = ssh
         self.raw_dir = raw_dir
+        self.setup_warnings: list[str] = []
         self._transport_failures = 0
         self._dead = False
         if ssh.legacy_algorithms:
             enable_legacy_ssh_algorithms()
         self._conn = self._connect(creds)
-        # No session tuning beyond netmiko's own 'terminal more disable':
-        # VOSS has no 'terminal width' command, and sending unknown commands
-        # desyncs the channel so the NEXT commands read leftover error text.
+        self._ensure_paging_disabled()
+
+    def _ensure_paging_disabled(self) -> None:
+        """netmiko's session_preparation sends the paging-disable command too,
+        but only verifies the command ECHO - not whether the device accepted
+        it. If the pager stays active, every long output (Port Interface,
+        Port State on 50-port boxes) stalls at --More-- and the stuck pager
+        swallows the next command's characters. So send it again explicitly
+        and check the device's actual answer.
+        """
+        command = _PAGING_DISABLE[self.platform]
+        try:
+            out = self._conn.send_command(command, read_timeout=15)
+        except Exception as exc:  # noqa: BLE001 - never fail the whole device here
+            self.setup_warnings.append(
+                f"could not verify paging disable ('{command}'): "
+                f"{exc.__class__.__name__}: {exc} - long command outputs may "
+                f"stall on this device")
+            log.warning("[%s] %s", self.name, self.setup_warnings[-1])
+            return
+        if looks_like_error(out):
+            detail = " | ".join(
+                line.strip() for line in out.splitlines() if line.strip())[:120]
+            self.setup_warnings.append(
+                f"device rejected '{command}': {detail} - long command "
+                f"outputs may stall on this device")
+            log.warning("[%s] %s", self.name, self.setup_warnings[-1])
 
     def _connect(self, creds: Credentials):
         # Imported lazily so parsers/tests work without netmiko installed.
@@ -202,6 +237,14 @@ class SshRunner(BaseRunner):
             output = self._conn.send_command(command, read_timeout=self.ssh.read_timeout)
         except Exception as exc:  # netmiko ReadTimeout, socket errors, ...
             self._transport_failures += 1
+            # a ReadTimeout is typically a stuck --More-- pager: quit it and
+            # drain the channel so the NEXT command isn't swallowed by it
+            try:
+                self._conn.write_channel("q\n")
+                time.sleep(0.5)
+                self._conn.clear_buffer()
+            except Exception:  # noqa: BLE001 - purely best-effort recovery
+                pass
             if self._transport_failures >= _MAX_TRANSPORT_FAILURES:
                 self._dead = True
                 log.error("[%s] abandoning session after %d consecutive "
@@ -228,6 +271,7 @@ class OfflineRunner(BaseRunner):
 
     def __init__(self, name: str, raw_root: Path):
         self.name = name
+        self.setup_warnings: list[str] = []
         self.device_dir = raw_root / name
         if not self.device_dir.is_dir():
             raise ConnectionFailed(f"{name}: no raw capture directory at {self.device_dir}")

@@ -39,27 +39,63 @@ def test_looks_like_error_negative():
 
 
 class _FakeConn:
-    def __init__(self, exc: Exception | None):
+    def __init__(self, exc: Exception | None, response: str = "ok output"):
         self.exc = exc
+        self.response = response
         self.calls = 0
+        self.channel_writes: list[str] = []
 
     def send_command(self, command, read_timeout=None):
         self.calls += 1
         if self.exc:
             raise self.exc
-        return "ok output"
+        return self.response
+
+    def write_channel(self, data):
+        self.channel_writes.append(data)
+
+    def clear_buffer(self):
+        pass
 
 
 def _make_runner(conn: _FakeConn) -> SshRunner:
     runner = object.__new__(SshRunner)
     runner.name = "test"
     runner.host = "test"
+    runner.platform = connection.Platform.VOSS
     runner.ssh = SshSettings()
     runner.raw_dir = None
+    runner.setup_warnings = []
     runner._transport_failures = 0
     runner._dead = False
     runner._conn = conn
     return runner
+
+
+def test_paging_disable_verified_ok():
+    conn = _FakeConn(None, response="")
+    runner = _make_runner(conn)
+    runner._ensure_paging_disabled()
+    assert runner.setup_warnings == []
+    assert conn.calls == 1
+
+
+def test_paging_disable_rejection_is_surfaced():
+    conn = _FakeConn(None, response="% Invalid input detected at '^' marker.")
+    runner = _make_runner(conn)
+    runner._ensure_paging_disabled()
+    assert len(runner.setup_warnings) == 1
+    assert "terminal more disable" in runner.setup_warnings[0]
+    assert "may stall" in runner.setup_warnings[0]
+
+
+def test_stuck_pager_is_quit_after_transport_failure():
+    conn = _FakeConn(TimeoutError("Pattern not detected"))
+    runner = _make_runner(conn)
+    with pytest.raises(CommandError):
+        runner.run("show interfaces gigabitEthernet state")
+    # recovery: 'q' sent to kill a possible --More-- pager
+    assert conn.channel_writes == ["q\n"]
 
 
 def test_circuit_breaker_abandons_dead_session():

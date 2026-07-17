@@ -72,6 +72,8 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     uplink_mlt = next(m for m in ers.mlts if m.mlt_id == 1)
     assert uplink_mlt.is_uplink
     assert uplink_mlt.members_up == 2
+    # MLT 2 has no members: flagged as dead, nothing to recreate
+    assert any("MLT 2" in w and "DEAD MLT" in w for w in ers.warnings)
 
     comparisons = {
         a.name: compare_switch(a, fabric, cfg) for a in (voss, ers)

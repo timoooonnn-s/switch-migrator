@@ -57,6 +57,7 @@ class Config:
     isid_offsets: list[int]
     isid_explicit: dict[int, int]
     excluded_vlans: set[int]
+    excluded_vlan_names: list[str] = field(default_factory=list)
     ssh: SshSettings = field(default_factory=SshSettings)
 
 
@@ -99,12 +100,23 @@ def load_config(path: Path) -> Config:
         legacy_algorithms=bool(ssh_data.get("legacy_algorithms", True)),
     )
 
+    excluded_vlans: set[int] = set()
+    for v in data.get("excluded_vlans") or []:
+        try:
+            excluded_vlans.add(int(v))
+        except (TypeError, ValueError):
+            raise ConfigError(
+                f"{path}: excluded_vlans entry '{v}' is not a VLAN id - to "
+                f"exclude VLANs by NAME (e.g. 'quarantaine') use the "
+                f"excluded_vlan_names list instead") from None
+
     return Config(
         dvr_controllers=dvrs,
         core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
         isid_offsets=offsets,
         isid_explicit=explicit,
-        excluded_vlans={int(v) for v in (data.get("excluded_vlans") or [])},
+        excluded_vlans=excluded_vlans,
+        excluded_vlan_names=[str(p) for p in (data.get("excluded_vlan_names") or [])],
         ssh=ssh,
     )
 

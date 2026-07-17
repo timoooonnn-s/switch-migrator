@@ -24,6 +24,8 @@ def _is_core_neighbor(sysname: str, patterns: list[str]) -> bool:
 def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config) -> SwitchAudit:
     audit = SwitchAudit(name=target.name, host=target.host,
                         platform=target.platform, reachable=True)
+    # session-setup problems (e.g. paging disable rejected) must be visible
+    audit.warnings.extend(getattr(runner, "setup_warnings", []))
     if target.platform is Platform.VOSS:
         _collect_voss(audit, runner)
     else:
@@ -148,7 +150,12 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
         audit.warnings.append(
             f"IST/vIST session is DOWN (peer {audit.ist.peer_ip or 'unknown'})")
     for mlt in audit.mlts:
-        if mlt.members and mlt.members_up < mlt.members_total:
+        if not mlt.members:
+            audit.warnings.append(
+                f"MLT {mlt.mlt_id} ({mlt.name or 'unnamed'}): DEAD MLT - no "
+                f"member ports left; does not need to be recreated on the "
+                f"new switch")
+        elif mlt.members_up < mlt.members_total:
             audit.warnings.append(
                 f"MLT {mlt.mlt_id} ({mlt.name or 'unnamed'}): only "
                 f"{mlt.members_up}/{mlt.members_total} member ports up")

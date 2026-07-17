@@ -43,7 +43,7 @@ The DvR state is authoritative. Match results per VLAN:
 | `MISSING_ON_DVR` | No candidate I-SID exists anywhere in the fabric. The L2VSN must be created before this switch can be migrated. | error |
 | `LOCAL_ISID_NOT_IN_FABRIC` | A VOSS switch binds the VLAN to an I-SID that no DvR controller knows. Broken/orphaned service. | error |
 | `LOCAL_BINDING_CONFLICT` | A VOSS switch binds the VLAN to one I-SID, but the DvR controllers attach that VLAN to a *different* I-SID. Resolve before migrating. | error |
-| `EXCLUDED` | VLAN is on the `excluded_vlans` list (default VLAN, B-VLANs, IST VLAN, …). | – |
+| `EXCLUDED` | VLAN matches `excluded_vlans` (by id) or `excluded_vlan_names` (by name glob, e.g. a quarantine VLAN). The row stays in the report so you can see on which switches it exists, but it never counts as an error. | – |
 
 ## Requirements
 
@@ -193,10 +193,17 @@ references and real device output):
   only genuine Mlt Info rows (they carry a type/state token) and keeps one
   entry per MLT id, so the extra tables, footers and continuation lines can't
   produce phantom or duplicate MLTs.
-* Beyond netmiko's own `terminal more disable`, **no** session-tuning commands
-  are sent: VOSS has no `terminal width` command, and sending an unknown
-  command desyncs the CLI channel so the *following* commands read leftover
-  error output.
+* **Paging is disabled explicitly and verified** right after login — VOSS:
+  `terminal more disable`, ERS: `terminal length 0`. netmiko sends these too
+  but never checks the device's answer; if the pager stayed active, every
+  long output (Port Interface/State on a 50-port box) would stall at
+  `--More--` and the stuck pager would swallow the *next* command. If the
+  device rejects the paging command, that appears as a per-switch warning,
+  and after any command timeout a `q` is sent to kill a possible stuck pager
+  before the next command. No other session-tuning commands are sent (VOSS
+  has no `terminal width`; unknown commands desync the channel).
+* **Dead MLTs** (no member ports left) are flagged explicitly in the MLTs
+  sheet and as a warning: they don't need to be recreated on the new switch.
 * `show interfaces gigabitEthernet i-sid` supplements `show vlan i-sid` with
   port-level bindings, catching CVLAN/switched-UNI services; conflicting
   bindings between the two sources are flagged as warnings.
