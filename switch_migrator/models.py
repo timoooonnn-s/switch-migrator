@@ -30,13 +30,25 @@ class MltState:
     admin: str = ""               # norm / smlt / Enabled / Disabled ...
     current: str = ""             # norm / smlt / ...
     members: list[str] = field(default_factory=list)
-    members_up: int = 0           # filled in by cross-referencing port state
+    # filled in by cross-referencing port state; None = unknown because the
+    # switch gave us no usable port state (do NOT render this as "0 up")
+    members_up: int | None = None
+    # True/False from the `show mlt` data-path table (LOCAL / LOCAL & REMOTE vs
+    # nothing programmed); None = that table was absent. Lets us tell a live
+    # MLT from a dead one even when per-port state is unavailable.
+    in_datapath: bool | None = None
     is_ist: bool = False
     is_uplink: bool = False
 
     @property
     def members_total(self) -> int:
         return len(self.members)
+
+    @property
+    def members_up_display(self) -> str:
+        if self.members_up is None:
+            return f"?/{self.members_total}"
+        return f"{self.members_up}/{self.members_total}"
 
 
 @dataclass
@@ -127,6 +139,7 @@ class CompStatus(str, Enum):
     IN_FABRIC_NOT_ATTACHED = "IN_FABRIC_NOT_ATTACHED"  # convention I-SID exists, no c-vid seen on DvR controllers
     AMBIGUOUS = "AMBIGUOUS"                      # multiple candidate I-SIDs match
     MISSING_ON_DVR = "MISSING_ON_DVR"            # nothing found in fabric
+    LOCAL_ONLY = "LOCAL_ONLY"                    # VOSS VLAN with no I-SID binding: local L2 by design, not a fabric service
     LOCAL_ISID_NOT_IN_FABRIC = "LOCAL_ISID_NOT_IN_FABRIC"
     LOCAL_BINDING_CONFLICT = "LOCAL_BINDING_CONFLICT"  # switch and DvR disagree
     EXCLUDED = "EXCLUDED"
@@ -138,6 +151,7 @@ SEVERITY = {
     CompStatus.IN_FABRIC_NOT_ATTACHED: "warn",
     CompStatus.AMBIGUOUS: "error",
     CompStatus.MISSING_ON_DVR: "error",
+    CompStatus.LOCAL_ONLY: "ok",
     CompStatus.LOCAL_ISID_NOT_IN_FABRIC: "error",
     CompStatus.LOCAL_BINDING_CONFLICT: "error",
     CompStatus.EXCLUDED: "ok",

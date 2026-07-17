@@ -84,3 +84,24 @@ ssh:
   # algorithms keep priority, current devices are unaffected). Client-side
   # only - no device or OS configuration is touched.
   legacy_algorithms: true
+
+  # --- Stubborn ERS/BOSS reachability -------------------------------------------
+  # If an ERS fails with "ReadTimeout: Pattern not detected: '(?:\#|>)'", the
+  # SSH transport actually connected fine (that is NOT a cipher problem) - the
+  # device just didn't present a '#'/'>' prompt in time. The tool already
+  # retries the prompt read; these two knobs help the most stubborn boxes:
+  #
+  # global_delay_factor: multiply every read wait. Slow ERS CPUs sometimes need
+  # 2-3 here. Only raise it if the default fails; it slows every device down.
+  # global_delay_factor: 2
+  #
+  # default_enter: a few ERS/BOSS boxes only answer a CR+LF, not the default
+  # bare "\n", which leaves prompt detection hanging. Uncomment to force CR+LF:
+  # default_enter: "\r\n"
+  #
+  # disabled_algorithms (advanced, last resort): if the connect log shows the
+  # channel connected but returned garbage, a modern algorithm the device
+  # negotiates but implements badly is to blame. Pin it OUT here. Keys are
+  # paramiko's: kex / ciphers / keys (host keys).
+  # disabled_algorithms:
+  #   kex: ["curve25519-sha256", "curve25519-sha256@libssh.org"]

@@ -157,3 +157,27 @@ def test_parse_dvr_interfaces(fixture):
 def test_parse_lldp_neighbors_voss(fixture):
     neighbors = parse_lldp_neighbors(fixture("voss", "show_lldp_neighbor.txt"))
     assert neighbors == {"1/1": "core-01", "1/47": "old-agg-02"}
+
+
+def test_parse_mlt_in_datapath(fixture):
+    # the data-path table (LOCAL / LOCAL & REMOTE) is parsed onto each MLT so we
+    # have a liveness signal even when no per-port state can be read
+    mlts = {m.mlt_id: m for m in
+            voss_parsers.parse_mlt(fixture("voss", "show_mlt.txt"))}
+    assert mlts[1].in_datapath is True    # LOCAL & REMOTE
+    assert mlts[10].in_datapath is True   # LOCAL
+
+
+def test_parse_mlt_datapath_helper_reads_only_its_own_table():
+    out = (
+        "MLTID NAME   CREATED    PORT MEMBERS   PORT MEMBERS   IN DATA PATH\n"
+        "-------------------------------------------------------------------\n"
+        "1    a  LOC & REM  1/1  1/1  LOCAL\n"
+        "2    b  LOC ONLY   1/2  -    NONE\n"
+        "3    c  LOC & REM  1/3  1/3  LOCAL & REMOTE\n"
+        "\nAll 3 out of 3 Total Num of mlt displayed\n"
+        # a following table whose last column is up/down must NOT be misread
+        "MLTID IFINDEX PORTS ADMIN OPER\n"
+        "1  6144  1/1  enable  up\n"
+    )
+    assert voss_parsers._parse_mlt_datapath(out) == {1: True, 2: False, 3: True}

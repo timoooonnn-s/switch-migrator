@@ -71,7 +71,13 @@ def parse_mlt(output: str) -> list[MltState]:
     which the other tables, footers and wrapped continuation lines never do -
     and each MLT id is kept once (first occurrence wins, Mlt Info comes
     first). Member ports are the first port-list token containing '/'.
+
+    The third table ("WHICH PORTS PROGRAMMED IN DATA PATH") is parsed too and
+    used to set `in_datapath` on each MLT: LOCAL / REMOTE => the MLT has ports
+    forwarding, NONE => it does not. This is the only member-liveness signal we
+    have on boxes that reject every `show interfaces gigabitEthernet` variant.
     """
+    datapath = _parse_mlt_datapath(output)
     mlts: list[MltState] = []
     seen: set[int] = set()
     for line in output.splitlines():
@@ -103,9 +109,44 @@ def parse_mlt(output: str) -> list[MltState]:
             admin=states[0] if states else "",
             current=states[1] if len(states) > 1 else "",
             members=members,
+            in_datapath=datapath.get(mlt_id),
             is_ist="ist" in name.lower() or "ist" in [s.lower() for s in states],
         ))
     return mlts
+
+
+def _parse_mlt_datapath(output: str) -> dict[int, bool]:
+    """Parse the "WHICH PORTS PROGRAMMED IN DATA PATH" table of `show mlt`.
+
+    Returns {mlt_id: is_programmed}. The last field of every data row is the
+    data-path state (LOCAL / REMOTE / 'LOCAL & REMOTE' / NONE); LOCAL or REMOTE
+    means the MLT is forwarding on at least one local/remote member, NONE means
+    it is not. Only rows inside this one table are read - the section is entered
+    on the 'IN DATA PATH' header and left on the next 'out of ... Total' footer
+    or the next table banner - so the LACP (up/down) and ENCAP (enable/disable)
+    tables can never be misread as data-path state.
+    """
+    result: dict[int, bool] = {}
+    in_section = False
+    for line in output.splitlines():
+        upper = line.upper()
+        if "IN DATA PATH" in upper:
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if "OUT OF" in upper and "TOTAL" in upper:
+            in_section = False
+            continue
+        tokens = line.split()
+        if not tokens or not tokens[0].isdigit():
+            continue
+        last = tokens[-1].upper()
+        if last in ("LOCAL", "REMOTE"):        # 'LOCAL & REMOTE' ends in REMOTE
+            result[int(tokens[0])] = True
+        elif last == "NONE":
+            result[int(tokens[0])] = False
+    return result
 
 
 def parse_port_state(output: str) -> list[PortState]:

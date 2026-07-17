@@ -11,6 +11,7 @@ Every runner returns the raw text of a command or raises CommandError.
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 import threading
@@ -149,6 +150,52 @@ _PAGING_DISABLE = {
 }
 
 
+def _patient_ers_class():
+    """netmiko's ExtremeErsSSH with more forgiving prompt detection.
+
+    On these boxes SSH negotiation and the 'Enter Ctrl-Y' login handler
+    succeed, but the stock session_preparation then calls find_prompt(), which
+    writes a single carriage-return and waits netmiko's default (~10s) for a
+    '#'/'>' prompt. Slow ERS/BOSS CPUs, or a login banner that is still
+    draining, make that first read miss - raising exactly the
+
+        ReadTimeout: Pattern not detected: '(?:\\#|>)'
+
+    the field is seeing, even though the device is perfectly reachable. Here we
+    retry set_base_prompt a few times, draining and re-nudging the channel
+    between attempts. ERS-only; the VOSS path is untouched. Returns None if this
+    netmiko build can't be subclassed as expected (we then fall back to stock).
+    """
+    try:
+        from netmiko.extreme.extreme_ers_ssh import ExtremeErsSSH
+    except Exception:  # noqa: BLE001 - unexpected netmiko layout: use stock class
+        return None
+
+    class PatientExtremeErs(ExtremeErsSSH):
+        def session_preparation(self) -> None:
+            last_exc: Exception | None = None
+            for attempt in range(4):
+                try:
+                    self.set_base_prompt()
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001 - ReadTimeout/ValueError
+                    last_exc = exc
+                    try:
+                        self.clear_buffer()
+                        self.write_channel(self.RETURN)
+                        time.sleep(1.0 + attempt)
+                        self.clear_buffer()
+                    except Exception:  # noqa: BLE001 - best-effort re-nudge
+                        pass
+            if last_exc is not None:
+                raise last_exc
+            self.set_terminal_width()
+            self.disable_paging()
+
+    return PatientExtremeErs
+
+
 class SshRunner(BaseRunner):
     def __init__(self, name: str, host: str, platform: Platform,
                  creds: Credentials, ssh: SshSettings,
@@ -161,10 +208,30 @@ class SshRunner(BaseRunner):
         self.setup_warnings: list[str] = []
         self._transport_failures = 0
         self._dead = False
+        # captures the login/banner bytes so a connect failure can show what the
+        # device actually sent instead of an opaque 'pattern not detected'
+        self._session_log = io.BytesIO()
         if ssh.legacy_algorithms:
             enable_legacy_ssh_algorithms()
         self._conn = self._connect(creds)
+        # connected: stop the in-memory session log from growing with every
+        # command's output (per-device output can be large on DvR controllers)
+        try:
+            if getattr(self._conn, "session_log", None) is not None:
+                self._conn.session_log.session_log = None
+        except Exception:  # noqa: BLE001 - purely a memory optimisation
+            pass
         self._ensure_paging_disabled()
+
+    def _captured_tail(self, limit: int = 1000) -> str:
+        """Sanitised tail of what the device sent during connect, for errors."""
+        try:
+            data = self._session_log.getvalue().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return ""
+        # collapse to single spaced-out lines so it fits on one report row
+        data = " | ".join(ln.strip() for ln in data.splitlines() if ln.strip())
+        return data[-limit:].strip()
 
     def _ensure_paging_disabled(self) -> None:
         """netmiko's session_preparation sends the paging-disable command too,
@@ -207,26 +274,64 @@ class SshRunner(BaseRunner):
             "auth_timeout": max(15, self.ssh.conn_timeout),
             "read_timeout_override": self.ssh.read_timeout,
             "fast_cli": False,  # old ERS gear chokes on fast_cli
+            "session_log": self._session_log,
+            "session_log_record_writes": False,
         }
+        if self.ssh.global_delay_factor and self.ssh.global_delay_factor != 1.0:
+            params["global_delay_factor"] = self.ssh.global_delay_factor
+        if self.ssh.default_enter:
+            # some ERS/BOSS boxes only answer a CR+LF ('\r\n'); the netmiko
+            # default is '\n' and leaves find_prompt waiting forever
+            params["default_enter"] = self.ssh.default_enter
+        if self.ssh.disabled_algorithms:
+            # last-resort pinning: exclude a modern kex/cipher/host-key a device
+            # negotiates but implements badly (garbled channel -> prompt timeout)
+            params["disabled_algorithms"] = self.ssh.disabled_algorithms
+
+        # ERS/BOSS: swap in the more patient prompt handling by instantiating a
+        # subclass directly (ConnectHandler only dispatches by string name).
+        connect_cls = None
+        if self.platform is Platform.ERS:
+            connect_cls = _patient_ers_class()
+
         last_exc: Exception | None = None
         for attempt in range(self.ssh.retries + 1):
             try:
                 log.debug("connecting to %s (%s) as %s, attempt %d",
                           self.name, self.host, creds.username, attempt + 1)
+                if connect_cls is not None:
+                    direct = {k: v for k, v in params.items() if k != "device_type"}
+                    return connect_cls(**direct)
                 return ConnectHandler(**params)
             except NetmikoAuthenticationException as exc:
                 # never retry auth failures - avoids account lockouts
-                raise ConnectionFailed(f"{self.name}: authentication failed") from exc
+                raise ConnectionFailed(
+                    f"{self.name}: authentication failed{self._diag_suffix()}") from exc
             except (NetmikoTimeoutException, OSError) as exc:
                 last_exc = exc
                 if attempt < self.ssh.retries:
                     time.sleep(2 * (attempt + 1))
             except Exception as exc:
                 # e.g. paramiko SSHException 'Incompatible ssh peer (no
-                # acceptable kex/host key algorithm)' - retrying won't help
+                # acceptable kex/host key algorithm)' - retrying won't help.
+                # This is the ACTUAL cipher/kex case (fails before any channel
+                # data); the ReadTimeout below is not.
                 raise ConnectionFailed(
-                    f"{self.name}: {exc.__class__.__name__}: {exc}") from exc
-        raise ConnectionFailed(f"{self.name}: {last_exc}") from last_exc
+                    f"{self.name}: {exc.__class__.__name__}: {exc}"
+                    f"{self._diag_suffix()}") from exc
+        raise ConnectionFailed(f"{self.name}: {last_exc}{self._diag_suffix()}") from last_exc
+
+    def _diag_suffix(self) -> str:
+        """Append what the device sent during connect. When there IS captured
+        output, SSH negotiation already succeeded, so the failure is prompt/
+        banner handling (NOT ciphers) - say so, because 'pattern not detected'
+        is otherwise routinely misread as a cipher problem.
+        """
+        tail = self._captured_tail()
+        if not tail:
+            return ""
+        return (f" [SSH negotiated OK, so this is not a cipher problem; the "
+                f"device sent, but no #/> prompt was matched: '{tail}']")
 
     def run(self, command: str) -> str:
         if self._dead:

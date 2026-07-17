@@ -31,6 +31,19 @@ def _fmt_bool(value: bool | None, true: str = "up", false: str = "down") -> str:
     return true if value else false
 
 
+def _mlt_up_severity(m) -> str | None:
+    """Severity for one MLT's member-up state, tolerant of unknown counts."""
+    if not m.members:
+        return None                       # dead MLT: handled/labelled separately
+    if m.members_up is None:              # no port state - lean on the data-path table
+        return "warn" if m.in_datapath is False else None
+    if m.members_up == 0:
+        return "error"
+    if m.members_up < m.members_total:
+        return "warn"
+    return None
+
+
 def build_summary(audits: list[SwitchAudit],
                   comparisons: dict[str, list[VlanComparison]]) -> Table:
     t = Table("Summary", ["Switch", "Platform", "Reachable", "Ports up/total",
@@ -42,7 +55,7 @@ def build_summary(audits: list[SwitchAudit],
         ok = sum(1 for c in comps if c.severity == "ok")
         warn = sum(1 for c in comps if c.severity == "warn")
         err = sum(1 for c in comps if c.severity == "error")
-        mlt_issues = sum(1 for m in a.mlts if m.members and m.members_up < m.members_total)
+        mlt_issues = sum(1 for m in a.mlts if _mlt_up_severity(m) in ("warn", "error"))
         if not a.reachable:
             t.add([a.name, a.platform.value, "NO", "-", "-", "-", "-", "-",
                    "-", "-", "-", "-"], "error")
@@ -84,16 +97,16 @@ def build_mlts(audits: list[SwitchAudit]) -> Table:
                        "DEAD - no members", "0/0",
                        "yes" if m.is_ist else "", ""], "warn")
                 continue
-            severity = None
-            if m.members_up == 0:
-                severity = "error"
-            elif m.members_up < m.members_total:
-                severity = "warn"
+            up_display = m.members_up_display
+            if m.members_up is None and m.in_datapath is False:
+                up_display += " (datapath: NONE)"
+            elif m.members_up is None and m.in_datapath is True:
+                up_display += " (datapath: fwd)"
             t.add([a.name, m.mlt_id, m.name, m.mlt_type, m.admin,
                    ",".join(m.members),
-                   f"{m.members_up}/{m.members_total}",
+                   up_display,
                    "yes" if m.is_ist else "",
-                   "yes" if m.is_uplink else ""], severity)
+                   "yes" if m.is_uplink else ""], _mlt_up_severity(m))
     return t
 
 
