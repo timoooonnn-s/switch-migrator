@@ -25,9 +25,16 @@ log = logging.getLogger(__name__)
 
 
 def collect_dvr(name: str, runner: BaseRunner, fabric: FabricState) -> None:
-    """Merge one DvR controller's view into `fabric`. Thread-unsafe by design: call it
-    from a single thread or lock around it (the CLI merges sequentially)."""
-    ok = False
+    """Merge one DvR controller's view into `fabric`. Thread-unsafe by design:
+    give each thread its own FabricState and combine via FabricState.merge().
+
+    A controller only counts as an authoritative source (dvrs_ok) when the
+    fabric-wide I-SID list was obtained - comparisons check I-SID *existence*
+    against it, and a controller that only delivered its local attachments
+    would produce false MISSING_ON_DVR verdicts.
+    """
+    fabric_wide_ok = False
+    partial_ok = False
 
     try:
         out = runner.run("show dvr interfaces")
@@ -36,7 +43,7 @@ def collect_dvr(name: str, runner: BaseRunner, fabric: FabricState) -> None:
             rec.seen_on.add(name)
             rec.sources.add("dvr")
             rec.cvids.add(row["vlan"])
-        ok = True
+        partial_ok = True
     except CommandError as exc:
         fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
@@ -49,7 +56,7 @@ def collect_dvr(name: str, runner: BaseRunner, fabric: FabricState) -> None:
             rec.seen_on.add(name)
             if row["host"]:
                 rec.hosts.add(row["host"])
-        ok = True
+        fabric_wide_ok = True
     except CommandError as exc:
         fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
@@ -63,7 +70,7 @@ def collect_dvr(name: str, runner: BaseRunner, fabric: FabricState) -> None:
             rec.cvids.update(info["cvids"])
             if info["name"]:
                 rec.names.add(info["name"])
-        ok = True
+        partial_ok = True
     except CommandError as exc:
         fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
@@ -78,10 +85,15 @@ def collect_dvr(name: str, runner: BaseRunner, fabric: FabricState) -> None:
             rec.cvids.add(vlan.vlan_id)
             if vlan.name:
                 rec.names.add(vlan.name)
-        ok = True
+        partial_ok = True
     except CommandError as exc:
         fabric.dvr_errors.append(f"{name}: {exc}")
         log.error("[%s] %s", name, exc)
 
-    if ok:
+    if fabric_wide_ok:
         fabric.dvrs_ok.append(name)
+    elif partial_ok:
+        fabric.dvr_errors.append(
+            f"{name}: fabric-wide I-SID list unavailable ('show isis spbm "
+            f"i-sid all' failed) - this controller's data is partial and not "
+            f"counted as an authoritative fabric source")

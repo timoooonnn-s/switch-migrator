@@ -175,7 +175,9 @@ def parse_vlan_isid(output: str) -> list[VlanInfo]:
     """
     vlans: list[VlanInfo] = []
     for line in output.splitlines():
-        m = re.match(r"^\s*(\d{1,4})\s*(?:(\d{2,9})\s*(.*))?$", line)
+        # anchored with \s+ separators so numeric footer lines
+        # ('3 out of 3 Total Num of Vlans displayed') can never match
+        m = re.match(r"^\s*(\d{1,4})(?:\s+(\d{1,9})(?:\s+(\S.*?))?)?\s*$", line)
         if not m:
             continue
         vlan_id = int(m.group(1))
@@ -203,21 +205,36 @@ def parse_vlan_basic(output: str) -> dict[int, str]:
 def parse_isid_local(output: str) -> dict[int, dict]:
     """`show i-sid` on a DvR controller/BEB.
 
-    Returns {isid: {"cvids": set[int], "name": str}}. C-VIDs appear in the
-    PORT/MLT INTERFACES columns as 'c<vid>:<port-or-mlt>' tokens.
+    Returns {isid: {"cvids": set[int], "name": str}}. Rows are anchored on a
+    numeric first token (the I-SID id) followed by a non-numeric TYPE column,
+    so any TYPE value works (ELAN, ELAN_TR, CVLAN, future ones) - an unknown
+    type can never cause endpoints to be attributed to the previous I-SID.
+    C-VIDs come from 'c<vid>:<endpoint>' markers (incl. wrapped continuation
+    lines) and from the VLANID column newer releases insert after TYPE.
+    Footer lines ('N out of M Total Num ...') are ignored. I-SID names may be
+    arbitrary words ('quarantaine', 'cvlan-x') - only structural tokens
+    (CONFIG/DISCOVER/-/N/A, ports, numbers, c<vid>: markers) are excluded.
     """
     result: dict[int, dict] = {}
     current: int | None = None
     for line in output.splitlines():
         tokens = line.split()
-        if tokens and re.match(r"^\d{1,9}$", tokens[0]) and len(tokens) >= 2 \
-                and tokens[1].upper() in ("ELAN", "ELAN_TR", "E-TREE", "ETREE", "CFM", "IPVPN", "IP-SHORTCUT"):
+        if not tokens:
+            continue
+        if re.fullmatch(r"\d{1,9}", tokens[0]) and len(tokens) >= 2 \
+                and not tokens[1].isdigit():
+            if "out of" in line.lower():
+                current = None  # 'N out of M Total Num ...' footer
+                continue
             current = int(tokens[0])
             entry = result.setdefault(current, {"cvids": set(), "name": ""})
-            # last token can be the I-SID name (not a c-vid/port/origin token)
+            if len(tokens) >= 3 and tokens[2].isdigit() \
+                    and 1 <= int(tokens[2]) <= 4094:
+                entry["cvids"].add(int(tokens[2]))  # VLANID column
             tail = tokens[-1]
-            if tail.upper() not in ("CONFIG", "DISCOVER", "-") and not tail.startswith("c") \
-                    and not PORT_RE.match(tail):
+            if len(tokens) > 2 and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
+                    and not re.match(r"^c\d{1,4}:", tail) \
+                    and not PORT_RE.match(tail) and not tail.isdigit():
                 entry["name"] = tail
         if current is None:
             continue

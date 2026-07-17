@@ -63,6 +63,11 @@ def _compare_vlan(audit: SwitchAudit, vlan_id: int, vlan_name: str,
             return result(CompStatus.LOCAL_ISID_NOT_IN_FABRIC, None,
                           f"switch binds VLAN {vlan_id} to I-SID {local_isid}, "
                           f"but no DvR controller knows that I-SID")
+        if dvr_attached and local_isid not in dvr_attached:
+            return result(CompStatus.LOCAL_BINDING_CONFLICT, None,
+                          f"switch binds VLAN {vlan_id} to I-SID {local_isid}, "
+                          f"but the DvR controllers attach that VLAN to "
+                          f"{dvr_attached} - resolve before migrating")
         if local_isid in expected:
             return result(CompStatus.OK, local_isid,
                           "local binding matches convention and exists in fabric")

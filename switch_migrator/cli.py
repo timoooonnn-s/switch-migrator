@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures as cf
 import logging
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from switch_migrator.connection import (
     ConnectionFailed,
     OfflineRunner,
     SshRunner,
+    enable_legacy_ssh_algorithms,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator.report import console as console_report
@@ -131,22 +133,33 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
 
 def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
                    args: argparse.Namespace) -> FabricState:
-    fabric = FabricState()
-    for dvr in dvrs:
+    # fabric-wide listings (isis spbm i-sid) can be large - give the DvR
+    # sessions extra read-timeout headroom
+    dvr_cfg = replace(cfg, ssh=replace(cfg.ssh,
+                                       read_timeout=max(cfg.ssh.read_timeout, 120)))
+
+    def collect_one(dvr: DvrTarget) -> FabricState:
+        fragment = FabricState()
         try:
             runner = make_runner(dvr.name, dvr.host, Platform.VOSS,
-                                 creds, cfg, args)
+                                 creds, dvr_cfg, args)
         except Exception as exc:  # noqa: BLE001 - keep reading the other DvRs
-            fabric.dvr_errors.append(f"{dvr.name}: {exc}")
+            fragment.dvr_errors.append(f"{dvr.name}: {exc}")
             log.error("%s: %s", dvr.name, exc)
-            continue
+            return fragment
         try:
-            collect_dvr(dvr.name, runner, fabric)
+            collect_dvr(dvr.name, runner, fragment)
         except Exception as exc:  # noqa: BLE001 - keep reading the other DvRs
-            fabric.dvr_errors.append(f"{dvr.name}: collection crashed: {exc}")
+            fragment.dvr_errors.append(f"{dvr.name}: collection crashed: {exc}")
             log.exception("[%s] collection crashed", dvr.name)
         finally:
             runner.close()
+        return fragment
+
+    fabric = FabricState()
+    with cf.ThreadPoolExecutor(max_workers=min(len(dvrs), cfg.ssh.workers)) as pool:
+        for fragment in pool.map(collect_one, dvrs):
+            fabric.merge(fragment)
     return fabric
 
 
@@ -174,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             creds = get_credentials("switches", "SM")
             dvr_creds = get_credentials("DvR controllers", "SM_DVR", fallback=creds)
+            if cfg.ssh.legacy_algorithms:
+                # initialize once on the main thread before any worker connects
+                enable_legacy_ssh_algorithms()
     except ConfigError as exc:
         console.print(f"[bold red]Config error:[/bold red] {exc}")
         return 2

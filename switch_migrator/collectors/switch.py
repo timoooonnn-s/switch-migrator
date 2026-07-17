@@ -9,7 +9,10 @@ from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
 from switch_migrator.models import Platform, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
-from switch_migrator.parsers.common import parse_lldp_neighbors
+from switch_migrator.parsers.common import (
+    parse_lldp_neighbors,
+    parse_lldp_neighbors_summary,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,15 +48,24 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
 
 
 def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
-    # primary port-state source: narrow table, immune to line wrapping
-    out = _run(audit, runner, "show interfaces gigabitEthernet state", required=False)
-    if out:
-        audit.ports = voss_parsers.parse_port_state(out)
-    if not audit.ports:
-        # fallback for releases without the `state` subcommand
-        out = _run(audit, runner, "show interfaces gigabitEthernet", required=True)
+    # Port-state fallback chain: which variants exist differs across 8.x
+    # releases (real captures show boxes that reject the plain form while
+    # accepting `state`, and vice versa). First command that yields ports wins.
+    port_sources = (
+        ("show interfaces gigabitEthernet state", voss_parsers.parse_port_state),
+        ("show interfaces gigabitEthernet", voss_parsers.parse_ports),
+        ("show interfaces gigabitEthernet interface", voss_parsers.parse_ports),
+    )
+    for command, parser in port_sources:
+        out = _run(audit, runner, command, required=False)
         if out:
-            audit.ports = voss_parsers.parse_ports(out)
+            audit.ports = parser(out)
+            if audit.ports:
+                break
+    if not audit.ports:
+        audit.errors.append(
+            "no port state obtained: all 'show interfaces gigabitEthernet' "
+            "variants failed or returned nothing")
     out = _run(audit, runner, "show mlt", required=True)
     if out:
         audit.mlts = voss_parsers.parse_mlt(out)
@@ -110,6 +122,15 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
     out = _run(audit, runner, "show lldp neighbor", required=False)
     if out:
         neighbors = parse_lldp_neighbors(out)
+    if not neighbors:
+        # some releases reject the block form; the summary table is a
+        # separate command tree and often still available
+        out = _run(audit, runner, "show lldp neighbor summary", required=False)
+        if out:
+            neighbors = parse_lldp_neighbors_summary(out)
+    if not neighbors:
+        audit.warnings.append(
+            "no LLDP neighbor data - uplink detection disabled for this switch")
 
     port_oper = {}
     for port in audit.ports:

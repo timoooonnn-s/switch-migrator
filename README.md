@@ -42,6 +42,7 @@ The DvR state is authoritative. Match results per VLAN:
 | `AMBIGUOUS` | Multiple candidate I-SIDs match. Resolve with an `isid_conventions.explicit` entry. | error |
 | `MISSING_ON_DVR` | No candidate I-SID exists anywhere in the fabric. The L2VSN must be created before this switch can be migrated. | error |
 | `LOCAL_ISID_NOT_IN_FABRIC` | A VOSS switch binds the VLAN to an I-SID that no DvR controller knows. Broken/orphaned service. | error |
+| `LOCAL_BINDING_CONFLICT` | A VOSS switch binds the VLAN to one I-SID, but the DvR controllers attach that VLAN to a *different* I-SID. Resolve before migrating. | error |
 | `EXCLUDED` | VLAN is on the `excluded_vlans` list (default VLAN, B-VLANs, IST VLAN, …). | – |
 
 ## Requirements
@@ -166,9 +167,17 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `show interfaces gigabitEthernet state` (fallback: `show interfaces gigabitEthernet`), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor` |
+| VOSS (migrate) | `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor` → `show lldp neighbor summary` |
 | ERS (migrate) | `show interfaces`, `show mlt`, `show ist`, `show vlan`, `show lldp neighbor` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
+
+Which command variants a given 8.x release accepts varies (real captures show
+boxes rejecting the plain interfaces form or the block-style LLDP command
+while accepting the alternatives) — hence the fallback chains. A DvR
+controller only counts as an **authoritative** fabric source when the
+fabric-wide `show isis spbm i-sid all` succeeded; a controller that only
+delivered its local attachments is merged but flagged as partial, so it can
+never cause false `MISSING_ON_DVR` verdicts on its own.
 
 Notes on syntax (checked against the Extreme VOSS/Fabric Engine command
 references and real device output):
@@ -222,7 +231,16 @@ not failures.
   with the live port table rather than trusting the MLT status column —
   more reliable across firmware versions.
 * Uplink detection needs LLDP enabled on the legacy switch (default on both
-  platforms). Without LLDP data the audit still runs; uplink columns stay 0.
+  platforms). Without LLDP data the audit still runs (with a per-switch
+  warning); uplink columns stay 0.
+* **ERS with menu-based console**: units configured with the menu instead of
+  the CLI as default interface (`cmd-interface menu`) fail at login and are
+  reported UNREACHABLE. Set `cmd-interface cli` on the unit (or audit it by
+  hand) — the tool intentionally does not try to navigate the menu.
+* A device whose SSH session dies mid-audit is abandoned after 2 consecutive
+  transport failures instead of burning the full read-timeout on every
+  remaining command; collected partial data is kept and the failures appear
+  in Issues.
 
 ## Development
 

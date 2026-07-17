@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -51,6 +52,12 @@ _LEGACY_CIPHERS = ("aes256-cbc", "aes192-cbc", "aes128-cbc", "3des-cbc")
 _LEGACY_KEYS = ("ssh-rsa", "ssh-dss")
 
 _legacy_enabled = False
+_legacy_lock = threading.Lock()
+
+# consecutive transport failures (timeouts, socket errors) after which a
+# device session is abandoned instead of burning read_timeout on every
+# remaining command
+_MAX_TRANSPORT_FAILURES = 2
 
 
 def enable_legacy_ssh_algorithms() -> list[str]:
@@ -68,21 +75,22 @@ def enable_legacy_ssh_algorithms() -> list[str]:
     from paramiko.transport import Transport
 
     added: list[str] = []
-    if _legacy_enabled:
-        return added
+    with _legacy_lock:
+        if _legacy_enabled:
+            return added
 
-    def extend(attr: str, wanted: tuple[str, ...], implemented) -> None:
-        current = list(getattr(Transport, attr))
-        for algo in wanted:
-            if algo not in current and algo in implemented:
-                current.append(algo)
-                added.append(algo)
-        setattr(Transport, attr, tuple(current))
+        def extend(attr: str, wanted: tuple[str, ...], implemented) -> None:
+            current = list(getattr(Transport, attr))
+            for algo in wanted:
+                if algo not in current and algo in implemented:
+                    current.append(algo)
+                    added.append(algo)
+            setattr(Transport, attr, tuple(current))
 
-    extend("_preferred_kex", _LEGACY_KEX, Transport._kex_info)
-    extend("_preferred_ciphers", _LEGACY_CIPHERS, Transport._cipher_info)
-    extend("_preferred_keys", _LEGACY_KEYS, Transport._key_info)
-    _legacy_enabled = True
+        extend("_preferred_kex", _LEGACY_KEX, Transport._kex_info)
+        extend("_preferred_ciphers", _LEGACY_CIPHERS, Transport._cipher_info)
+        extend("_preferred_keys", _LEGACY_KEYS, Transport._key_info)
+        _legacy_enabled = True
     if added:
         log.info("legacy SSH algorithms enabled: %s", ", ".join(added))
     missing = [a for a in _LEGACY_KEYS + _LEGACY_KEX + _LEGACY_CIPHERS
@@ -106,9 +114,21 @@ def command_slug(command: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_")
 
 
+_ERROR_LINE_KEYWORDS = ("invalid", "incomplete", "unrecognized", "ambiguous",
+                        "not allowed", "cannot modify")
+
+
 def looks_like_error(output: str) -> bool:
     head = output.strip().lower()[:200]
-    return any(marker in head for marker in _ERROR_MARKERS)
+    if any(marker in head for marker in _ERROR_MARKERS):
+        return True
+    # VOSS can print a 'Command Execution Time' banner (>200 chars) before an
+    # error, so also scan every line for %-prefixed CLI error messages
+    for line in output.splitlines():
+        stripped = line.strip().lower()
+        if stripped.startswith("%") and any(k in stripped for k in _ERROR_LINE_KEYWORDS):
+            return True
+    return False
 
 
 class BaseRunner:
@@ -128,6 +148,8 @@ class SshRunner(BaseRunner):
         self.platform = platform
         self.ssh = ssh
         self.raw_dir = raw_dir
+        self._transport_failures = 0
+        self._dead = False
         if ssh.legacy_algorithms:
             enable_legacy_ssh_algorithms()
         self._conn = self._connect(creds)
@@ -172,12 +194,21 @@ class SshRunner(BaseRunner):
         raise ConnectionFailed(f"{self.name}: {last_exc}") from last_exc
 
     def run(self, command: str) -> str:
+        if self._dead:
+            raise CommandError(
+                command, "(skipped: session abandoned after repeated transport failures)")
         log.debug("[%s] %s", self.name, command)
         try:
             output = self._conn.send_command(command, read_timeout=self.ssh.read_timeout)
         except Exception as exc:  # netmiko ReadTimeout, socket errors, ...
+            self._transport_failures += 1
+            if self._transport_failures >= _MAX_TRANSPORT_FAILURES:
+                self._dead = True
+                log.error("[%s] abandoning session after %d consecutive "
+                          "transport failures", self.name, self._transport_failures)
             raise CommandError(
                 command, f"(transport {exc.__class__.__name__}) {exc}") from exc
+        self._transport_failures = 0
         if self.raw_dir is not None:
             self.raw_dir.mkdir(parents=True, exist_ok=True)
             (self.raw_dir / f"{command_slug(command)}.txt").write_text(output)

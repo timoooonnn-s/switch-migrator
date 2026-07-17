@@ -94,22 +94,45 @@ def test_parse_virtual_ist_absent():
 def test_parse_vlan_isid(fixture):
     vlans = voss_parsers.parse_vlan_isid(fixture("voss", "show_vlan_i_sid.txt"))
     by_id = {v.vlan_id: v for v in vlans}
+    # footer '5 out of 5 Total ...' (real format, no leading 'All') must not
+    # become VLAN 5
     assert set(by_id) == {1, 100, 200, 300, 4000}
     assert by_id[100].isid == 10100
     assert by_id[100].name == "Server-VLAN-100"
     assert by_id[200].isid == 10200
     assert by_id[300].isid == 77777
+    assert by_id[300].name == "quarantaine"
     assert by_id[1].isid is None
     assert by_id[4000].isid is None
 
 
 def test_parse_isid_local(fixture):
     isids = voss_parsers.parse_isid_local(fixture("voss", "show_i_sid.txt"))
-    assert set(isids) == {10100, 10200, 20300}
+    # footer '4 out of 4 Total ...' must not become I-SID 4
+    assert set(isids) == {10100, 10200, 20300, 2502201}
     assert isids[10100]["cvids"] == {100}
     assert isids[10200]["cvids"] == {200}
     assert isids[20300]["cvids"] == {300}
     assert isids[10100]["name"] == "Server-100"
+    # CVLAN type rows and lowercase names must work
+    assert isids[2502201]["cvids"] == {2201}
+    assert isids[2502201]["name"] == "quarantaine"
+
+
+def test_parse_isid_local_unknown_type_and_vlanid_column():
+    # future/unknown TYPE values must still anchor a new I-SID (never leak
+    # endpoints into the previous one), and the VLANID column of newer
+    # releases must be harvested; names starting with 'c' are real names
+    output = (
+        "10100    ELAN       100    c100:1/10           CONFIG   Server-100\n"
+        "99999    FANCYNEW   555    -                   CONFIG   cvlan-names-ok\n"
+        "3 out of 3 Total Num of i-sids displayed\n"
+    )
+    isids = voss_parsers.parse_isid_local(output)
+    assert set(isids) == {10100, 99999}
+    assert isids[10100]["cvids"] == {100}
+    assert isids[99999]["cvids"] == {555}
+    assert isids[99999]["name"] == "cvlan-names-ok"
 
 
 def test_parse_isis_spbm_isid(fixture):

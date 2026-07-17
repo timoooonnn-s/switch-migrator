@@ -43,6 +43,29 @@ def expand_port_list(raw: str) -> list[str]:
     return ports
 
 
+def parse_lldp_neighbors_summary(output: str) -> dict[str, str]:
+    """`show lldp neighbor summary` - one-line-per-neighbor table with a
+    SysName column. The column's character offset is taken from the header
+    line, so shifting column widths across releases don't matter.
+    Returns {local_port: remote_sysname}.
+    """
+    neighbors: dict[str, str] = {}
+    offset: int | None = None
+    for line in output.splitlines():
+        if offset is None:
+            idx = line.find("SysName")
+            if idx >= 0:
+                offset = idx
+            continue
+        tokens = line.split()
+        if not tokens or not PORT_RE.match(tokens[0]):
+            continue
+        chunk = line[offset:].strip()
+        if chunk:
+            neighbors.setdefault(tokens[0], chunk.split()[0])
+    return neighbors
+
+
 def parse_lldp_neighbors(output: str) -> dict[str, str]:
     """Parse the block-style `show lldp neighbor` output used by both VOSS and
     ERS/BOSS into {local_port: remote_sysname}.

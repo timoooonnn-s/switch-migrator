@@ -124,6 +124,25 @@ def test_voss_local_binding_nonstandard():
     assert res[300].status is CompStatus.OK_NONSTANDARD
 
 
+def test_voss_local_binding_conflicts_with_dvr():
+    # the switch says VLAN 100 -> 10100, the DvR controllers attach VLAN 100
+    # to a different I-SID: that disagreement must be flagged, not passed as OK
+    cfg = make_config()
+    fabric = make_fabric({10100: {}, 20100: {"cvids": [100]}})
+    audit = make_audit(Platform.VOSS, [VlanInfo(100, isid=10100)])
+    res = by_vlan(compare_switch(audit, fabric, cfg))
+    assert res[100].status is CompStatus.LOCAL_BINDING_CONFLICT
+    assert res[100].severity == "error"
+
+
+def test_voss_local_binding_agrees_with_dvr():
+    cfg = make_config()
+    fabric = make_fabric({10100: {"cvids": [100]}})
+    audit = make_audit(Platform.VOSS, [VlanInfo(100, isid=10100)])
+    res = by_vlan(compare_switch(audit, fabric, cfg))
+    assert res[100].status is CompStatus.OK
+
+
 def test_voss_local_binding_not_in_fabric():
     cfg = make_config()
     fabric = make_fabric({})

@@ -108,6 +108,18 @@ class FabricState:
     def isids_for_cvid(self, vlan_id: int) -> list[int]:
         return sorted(i.isid for i in self.isids.values() if vlan_id in i.cvids)
 
+    def merge(self, other: FabricState) -> None:
+        """Fold another (per-controller) fabric view into this one."""
+        for rec in other.isids.values():
+            mine = self.get_or_create(rec.isid)
+            mine.names |= rec.names
+            mine.cvids |= rec.cvids
+            mine.hosts |= rec.hosts
+            mine.sources |= rec.sources
+            mine.seen_on |= rec.seen_on
+        self.dvr_errors.extend(other.dvr_errors)
+        self.dvrs_ok.extend(other.dvrs_ok)
+
 
 class CompStatus(str, Enum):
     OK = "OK"                                    # convention & DvR attachment agree
@@ -116,6 +128,7 @@ class CompStatus(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"                      # multiple candidate I-SIDs match
     MISSING_ON_DVR = "MISSING_ON_DVR"            # nothing found in fabric
     LOCAL_ISID_NOT_IN_FABRIC = "LOCAL_ISID_NOT_IN_FABRIC"
+    LOCAL_BINDING_CONFLICT = "LOCAL_BINDING_CONFLICT"  # switch and DvR disagree
     EXCLUDED = "EXCLUDED"
 
 
@@ -126,6 +139,7 @@ SEVERITY = {
     CompStatus.AMBIGUOUS: "error",
     CompStatus.MISSING_ON_DVR: "error",
     CompStatus.LOCAL_ISID_NOT_IN_FABRIC: "error",
+    CompStatus.LOCAL_BINDING_CONFLICT: "error",
     CompStatus.EXCLUDED: "ok",
 }
 
