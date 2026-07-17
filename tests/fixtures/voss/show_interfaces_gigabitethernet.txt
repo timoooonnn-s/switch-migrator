@@ -1,0 +1,32 @@
+================================================================================
+                                Port Interface
+================================================================================
+PORT                          LINK  PORT           PHYSICAL          STATUS
+NUM      INDEX DESCRIPTION    TRAP  LOCK  MTU      ADDRESS           ADMIN  OPERATE
+--------------------------------------------------------------------------------
+1/1      192   1000BaseTX     true  false 1950     b0:ad:aa:41:b4:00 up     up
+1/2      193   1000BaseTX     true  false 1950     b0:ad:aa:41:b4:01 up     down
+1/47     238   10GbNone       true  false 1950     b0:ad:aa:41:b4:2e up     up
+1/48     239   10GbNone       true  false 1950     b0:ad:aa:41:b4:2f down   down
+2/1/1    400   10GbSR         true  false 1950     b0:ad:aa:41:b5:00 up     up
+
+================================================================================
+                                  Port Name
+================================================================================
+PORT                                              OPERATE
+NUM      NAME                 DESCRIPTION         LINKTRAP  STATUS  DUPLEX SPEED
+--------------------------------------------------------------------------------
+1/1      to-core-01           1000BaseTX          true      up      full   1000
+1/2      free-port            1000BaseTX          true      down    down   0
+1/47     vIST-a               10GbNone            true      up      full   10000
+1/48     vIST-b               10GbNone            true      down    down   0
+2/1/1    to-server            10GbSR              true      up      full   10000
+
+================================================================================
+                                 Port Config
+================================================================================
+PORT                    DIFF-SERV   QOS  MLT VENDOR
+NUM      TYPE           EN    TYPE  LVL  ID  NAME
+--------------------------------------------------------------------------------
+1/1      1000BaseTX     true  core  1    0
+1/2      1000BaseTX     true  core  1    0

@@ -1,0 +1,8 @@
+                                                              Flow
+Port  Trunk  Admin   Oper   Link   LinkTrap  Negotiation  Speed  Duplex  Control
+----  -----  ------  -----  -----  --------  -----------  -----  ------  -------
+1            Enable  Up     Up     Enabled   Custom       1000   Full    Asymm
+2            Enable  Down   Down   Enabled   Enabled
+3            Disable Down   Down   Enabled   Enabled
+49    1      Enable  Up     Up     Enabled   Custom       10000  Full    Asymm
+50    1      Enable  Up     Up     Enabled   Custom       10000  Full    Asymm

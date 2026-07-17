@@ -1,0 +1,45 @@
+************************************************************************************
+                Command Execution Time: Thu Jul 16 14:46:50 2026 CEST
+************************************************************************************
+
+====================================================================================================
+                                    Mlt Info
+====================================================================================================
+                        PORT    MLT   MLT        PORT         VLAN
+MLTID IFINDEX NAME      TYPE   ADMIN CURRENT    MEMBERS       IDS
+-----------------------------------------------------------------------------------------------------------
+1   6144  vIST-MLT trunk   norm   norm     1/47-1/48         4000
+2   6145  MLT002.s.1/1/2 trunk   smlt   smlt     1/1,1/2      100 200 300 2200 2201 2230 2232 2233 2246 2261 2262 2266
+2600 2601
+10  6153  MLT-SRV      access  norm   norm     2/1/1             100
+
+All 3 out of 3 Total Num of mlt displayed
+
+               DESIGNATED   LACP      LACP
+MLTID IFINDEX  PORTS        ADMIN     OPER
+-----------------------------------------------------------------------------------------------------------
+1      6144    1/47          disable   down
+2      6145    1/1           enable      up
+10     6153    2/1/1         disable   down
+
+All 3 out of 3 Total Num of mlt displayed
+
+
+                                                            WHICH PORTS
+             WHERE      LOCAL             REMOTE            PROGRAMMED
+MLTID NAME   CREATED    PORT MEMBERS      PORT MEMBERS      IN DATA PATH
+-----------------------------------------------------------------------------------------------------------
+1    vIST-MLT LOC & REM  1/47-1/48         1/47-1/48         LOCAL & REMOTE
+2    MLT002.s.1/1/2 LOC & REM  1/1,1/2    1/1,1/2           LOCAL & REMOTE
+10   MLT-SRV LOC & REM  2/1/1             2/1/1             LOCAL
+
+All 3 out of 3 Total Num of mlt displayed
+
+               ENCAP                          PVLAN        VID
+MLTID IFINDEX  DOT1Q     LOSSLESS   PVLAN     TYPE         TYPE         FLEX-UNI
+-----------------------------------------------------------------------------------------------------------
+1     6144     enable    disable    disable   -            -            disable
+2     6145     enable    disable    disable   -            -            disable
+10    6153     disable   disable    disable   -            -            disable
+
+All 3 out of 3 Total Num of mlt displayed

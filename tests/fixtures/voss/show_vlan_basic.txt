@@ -1,0 +1,17 @@
+************************************************************************************
+		Command Execution Time: Thu Jul 16 13:42:33 2026 CEST
+************************************************************************************
+
+============================================================================================================
+                                            Vlan Basic
+============================================================================================================
+VLAN                                MSTP
+ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR      SUBNETMASK      VRFID ORIGIN
+------------------------------------------------------------------------------------------------------------
+1     Default          byPort       0       none         N/A             N/A             0     CONFIG
+100   Users            byPort       0       none         N/A             N/A             0     CONFIG
+200   Printers         byPort       0       none         N/A             N/A             0     CONFIG
+300   Quarantaine      byPort       0       none         N/A             N/A             0     CONFIG
+4000  vIST             byPort       0       none         N/A             N/A             0     CONFIG
+
+All 5 out of 5 Total Num of Vlans displayed

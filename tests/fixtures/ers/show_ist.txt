@@ -1,0 +1,4 @@
+IST enabled: TRUE
+IST VLAN: 4000
+IST Peer-IP: 192.168.255.1
+Session Status: Up
