@@ -51,11 +51,14 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
 
 def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     # Port-state fallback chain: which variants exist differs across 8.x
-    # releases (real captures show boxes that reject the plain form while
-    # accepting `state`, and vice versa). First command that yields ports wins.
+    # releases. First command that yields ports wins. The plain
+    # `show interfaces gigabitEthernet` is deliberately NOT used: it prints
+    # several full-width sections (Port Interface, Port Name, Port Config, ...)
+    # per port - 2000+ lines on large stacks - which is slow and can desync the
+    # session. Both variants below are one narrow row per port and carry the
+    # ADMIN/OPER state we actually need.
     port_sources = (
         ("show interfaces gigabitEthernet state", voss_parsers.parse_port_state),
-        ("show interfaces gigabitEthernet", voss_parsers.parse_ports),
         ("show interfaces gigabitEthernet interface", voss_parsers.parse_ports),
     )
     for command, parser in port_sources:
