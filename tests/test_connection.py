@@ -207,18 +207,57 @@ def test_patient_ers_class_gives_up_and_reraises(monkeypatch):
         inst.session_preparation()
 
 
-def test_diag_suffix_says_not_a_cipher_problem_when_device_answered():
+def test_fail_keeps_banner_out_of_report_but_logs_it(caplog):
+    # the noisy login banner must NOT appear in the error shown in the report;
+    # it goes to the log instead, with a short prompt/Ctrl-Y hint on the error
     runner = _make_runner(_FakeConn(None))
     runner._session_log = io.BytesIO(
-        b"\nLogin banner\nEnter Ctrl-Y to begin\n")
-    suffix = runner._diag_suffix()
-    assert "not a cipher problem" in suffix
-    assert "Ctrl-Y" in suffix
+        b"\n=== MOTD ===\nWelcome\nEnter Ctrl-Y to begin\n")
+    with caplog.at_level("WARNING"):
+        err = runner._fail(TimeoutError("Pattern not detected: (?:\\#|>)\n\n"
+                                        "Things you might try...\n1. ...\n2. ..."))
+    msg = str(err)
+    assert "MOTD" not in msg and "Welcome" not in msg   # banner not in report
+    assert "Things you might try" not in msg            # netmiko blob trimmed
+    assert "Ctrl-Y" in msg                              # concise actionable hint
+    assert "MOTD" in caplog.text                        # banner IS in the log
 
 
-def test_diag_suffix_empty_when_device_sent_nothing():
-    # a true kex/cipher rejection produces no channel bytes -> no misleading
-    # 'not a cipher problem' hint is appended
+def test_fail_no_hint_and_no_banner_when_device_silent():
+    # a true kex/cipher rejection produces no channel bytes -> no prompt hint
     runner = _make_runner(_FakeConn(None))
     runner._session_log = io.BytesIO(b"")
-    assert runner._diag_suffix() == ""
+    err = runner._fail(Exception("Incompatible ssh peer (no acceptable kex)"))
+    assert "Ctrl-Y" not in str(err)
+    assert "Incompatible ssh peer" in str(err)
+
+
+def test_clean_reason_takes_only_the_first_line():
+    reason = SshRunner._clean_reason(
+        ValueError("boom\nsecond line\nthird line"))
+    assert reason == "ValueError: boom"
+
+
+def test_patient_ers_special_login_presses_ctrl_y(monkeypatch):
+    monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
+    cls = connection._patient_ers_class()
+    inst = object.__new__(cls)
+    inst.prompt_pattern = r"(?m:[>#]\s*$)"
+    inst.RETURN = "\n"
+    inst.username, inst.password = "admin", "secret"
+    writes: list[str] = []
+    inst.write_channel = lambda d: writes.append(d)
+    # device: silent, then the Ctrl-Y banner, then finally a prompt
+    reads = iter([TimeoutError("silent"),
+                  "\nEnter Ctrl-Y to begin\n",
+                  "switch-01#"])
+
+    def fake_read(pattern="", read_timeout=0.0):
+        nxt = next(reads)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    inst.read_until_pattern = fake_read
+    inst.special_login_handler()                 # must return, not hang/raise
+    assert connection._CTRL_Y in writes          # Ctrl-Y was actually sent

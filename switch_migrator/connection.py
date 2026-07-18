@@ -150,21 +150,21 @@ _PAGING_DISABLE = {
 }
 
 
+_CTRL_Y = "\x19"
+_CTRL_C = "\x03"
+
+
 def _patient_ers_class():
-    """netmiko's ExtremeErsSSH with more forgiving prompt detection.
+    """netmiko's ExtremeErsSSH with a robust 'Enter Ctrl-Y to begin' login.
 
-    On these boxes SSH negotiation and the 'Enter Ctrl-Y' login handler
-    succeed, but the stock session_preparation then calls find_prompt(), which
-    writes a single carriage-return and waits netmiko's default (~10s) for a
-    '#'/'>' prompt. Slow ERS/BOSS CPUs, or a login banner that is still
-    draining, make that first read miss - raising exactly the
-
-        ReadTimeout: Pattern not detected: '(?:\\#|>)'
-
-    the field is seeing, even though the device is perfectly reachable. Here we
-    retry set_base_prompt a few times, draining and re-nudging the channel
-    between attempts. ERS-only; the VOSS path is untouched. Returns None if this
-    netmiko build can't be subclassed as expected (we then fall back to stock).
+    ERS/BOSS gate the CLI behind 'Enter Ctrl-Y to begin', and many boxes stay
+    SILENT after SSH auth until they receive a keystroke first. netmiko's stock
+    special_login_handler reads BEFORE sending anything, so it times out and the
+    session never really enters the OS - the exact symptom from the field. Here
+    we proactively drive Ctrl-Y (and the ENTER / username / password / Menu
+    gates) until a '#'/'>' prompt appears, then detect the prompt with a couple
+    of patient retries for slow CPUs. ERS-only; the VOSS path is untouched.
+    Returns None if this netmiko build can't be subclassed (fall back to stock).
     """
     try:
         from netmiko.extreme.extreme_ers_ssh import ExtremeErsSSH
@@ -172,9 +172,41 @@ def _patient_ers_class():
         return None
 
     class PatientExtremeErs(ExtremeErsSSH):
+        def special_login_handler(self, delay_factor: float = 1.0) -> None:
+            prompt = self.prompt_pattern  # r"(?m:[>#]\s*$)"
+            pattern = (r"(?:sername|ssword|[Cc]trl-?[Yy]|Press [Ee][Nn][Tt][Ee][Rr]"
+                       rf"|Menu|{prompt})")
+            self.write_channel(self.RETURN)  # wake boxes that wait for a keystroke
+            for _ in range(6):
+                try:
+                    chunk = self.read_until_pattern(pattern=pattern, read_timeout=6.0)
+                except Exception:  # noqa: BLE001 - silent so far: nudge with Ctrl-Y
+                    self.write_channel(_CTRL_Y)
+                    time.sleep(0.3 * delay_factor)
+                    self.write_channel(self.RETURN)
+                    continue
+                if re.search(prompt, chunk):
+                    return
+                if re.search(r"[Cc]trl-?[Yy]", chunk):
+                    self.write_channel(_CTRL_Y)
+                    time.sleep(0.3 * delay_factor)
+                    self.write_channel(self.RETURN)
+                elif re.search(r"Press [Ee][Nn][Tt][Ee][Rr]", chunk):
+                    self.write_channel(self.RETURN)
+                elif "Menu" in chunk:
+                    self.write_channel(_CTRL_C)
+                elif "sername" in chunk:
+                    self.write_channel((self.username or "") + self.RETURN)
+                elif "ssword" in chunk:
+                    self.write_channel((self.password or "") + self.RETURN)
+                else:
+                    self.write_channel(self.RETURN)
+            # Don't hard-fail: session_preparation() retries prompt detection and
+            # raises the friendlier connect error if the box truly won't enter.
+
         def session_preparation(self) -> None:
             last_exc: Exception | None = None
-            for attempt in range(4):
+            for attempt in range(3):
                 try:
                     self.set_base_prompt()
                     last_exc = None
@@ -183,8 +215,10 @@ def _patient_ers_class():
                     last_exc = exc
                     try:
                         self.clear_buffer()
+                        self.write_channel(_CTRL_Y)
+                        time.sleep(0.3)
                         self.write_channel(self.RETURN)
-                        time.sleep(1.0 + attempt)
+                        time.sleep(0.5 + attempt * 0.5)
                         self.clear_buffer()
                     except Exception:  # noqa: BLE001 - best-effort re-nudge
                         pass
@@ -305,8 +339,7 @@ class SshRunner(BaseRunner):
                 return ConnectHandler(**params)
             except NetmikoAuthenticationException as exc:
                 # never retry auth failures - avoids account lockouts
-                raise ConnectionFailed(
-                    f"{self.name}: authentication failed{self._diag_suffix()}") from exc
+                raise self._fail(exc, "authentication failed") from exc
             except (NetmikoTimeoutException, OSError) as exc:
                 last_exc = exc
                 if attempt < self.ssh.retries:
@@ -314,24 +347,34 @@ class SshRunner(BaseRunner):
             except Exception as exc:
                 # e.g. paramiko SSHException 'Incompatible ssh peer (no
                 # acceptable kex/host key algorithm)' - retrying won't help.
-                # This is the ACTUAL cipher/kex case (fails before any channel
-                # data); the ReadTimeout below is not.
-                raise ConnectionFailed(
-                    f"{self.name}: {exc.__class__.__name__}: {exc}"
-                    f"{self._diag_suffix()}") from exc
-        raise ConnectionFailed(f"{self.name}: {last_exc}{self._diag_suffix()}") from last_exc
+                # ReadTimeout (prompt not found) also lands here.
+                raise self._fail(exc) from exc
+        raise self._fail(last_exc) from last_exc
 
-    def _diag_suffix(self) -> str:
-        """Append what the device sent during connect. When there IS captured
-        output, SSH negotiation already succeeded, so the failure is prompt/
-        banner handling (NOT ciphers) - say so, because 'pattern not detected'
-        is otherwise routinely misread as a cipher problem.
+    def _fail(self, exc: Exception, note: str = "") -> "ConnectionFailed":
+        """Build a CONCISE, one-line connect failure. The device's login banner
+        (which is verbose and noisy for a wall of dead switches) is sent to the
+        log file, never into the report. When we captured device bytes the SSH
+        transport already succeeded, so it is a prompt/login issue, not ciphers.
         """
         tail = self._captured_tail()
-        if not tail:
-            return ""
-        return (f" [SSH negotiated OK, so this is not a cipher problem; the "
-                f"device sent, but no #/> prompt was matched: '{tail}']")
+        if tail:
+            log.warning("[%s] device output during failed connect (SSH "
+                        "negotiated OK; no #/> prompt seen): %s", self.name, tail)
+        reason = note or self._clean_reason(exc)
+        hint = (" [reached the device but got no CLI prompt - on ERS this is the "
+                "'Ctrl-Y to begin' login gate or a slow box; raw output in the "
+                "log]") if tail else ""
+        return ConnectionFailed(f"{self.name}: {reason}{hint}")
+
+    @staticmethod
+    def _clean_reason(exc: Exception) -> str:
+        """First non-empty line of the exception - netmiko's ReadTimeout is a
+        multi-paragraph blob we do not want spilling into the report."""
+        for line in str(exc).splitlines():
+            if line.strip():
+                return f"{exc.__class__.__name__}: {line.strip()}"
+        return exc.__class__.__name__
 
     def run(self, command: str) -> str:
         if self._dead:
