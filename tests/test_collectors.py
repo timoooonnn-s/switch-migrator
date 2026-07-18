@@ -56,6 +56,7 @@ def test_voss_port_fallback_chain_and_lldp_warning(tmp_path: Path, cfg: Config):
     (device / "show_interfaces_gigabitethernet.txt").write_text(INVALID)
     (device / "show_interfaces_gigabitethernet_interface.txt").write_text(plain)
     (device / "show_lldp_neighbor.txt").write_text(INVALID)
+    (device / "show_lldp_neighbor_summary.txt").write_text(INVALID)
 
     target = SwitchTarget("old-agg-01", "old-agg-01", Platform.VOSS)
     audit = collect_switch(target, OfflineRunner("old-agg-01", tmp_path), cfg)

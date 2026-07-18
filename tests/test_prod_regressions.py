@@ -124,3 +124,63 @@ def test_prod_bound_vlan_still_verified_against_fabric():
     # VLAN 31 binds I-SID 1531100 which the fabric confirms -> not local-only
     assert res[31].status is not CompStatus.LOCAL_ONLY
     assert res[31].matched_isid == 1531100
+
+
+# --------------------------------------------------------------------------- #
+# Privileged session (post-'enable') - the state the tool reaches now that it
+# sends 'enable' after login. Fixtures are the REAL gx-11-s72-p1 outputs from
+# a privileged interactive session (VSP-7254XSQ, VOSS 8.10.9.0).
+# --------------------------------------------------------------------------- #
+
+PRIV = "gx-11-s72-p1-priv"
+
+
+def _cfg_priv() -> Config:
+    cfg = _cfg()
+    cfg.core_switch_patterns = ["gx-11-s74-*"]   # the new fabric BEBs
+    return cfg
+
+
+def _priv_audit():
+    target = SwitchTarget(PRIV, PRIV, Platform.VOSS)
+    return collect_switch(target, OfflineRunner(PRIV, PROD), _cfg_priv())
+
+
+def test_priv_ports_come_from_interface_variant_fallback():
+    # no `state` capture on purpose: the chain must fall back to
+    # `show interfaces gigabitEthernet interface` and parse the real table
+    audit = _priv_audit()
+    assert len(audit.ports) == 54          # 48 + 6 x 40G
+    assert audit.ports_up == 15
+    assert not audit.errors
+    by_port = {p.port: p for p in audit.ports}
+    assert by_port["1/4"].admin_up is True and by_port["1/4"].oper_up is False
+    assert by_port["2/6"].admin_up is False
+
+
+def test_priv_lldp_summary_all_caps_header_and_server_rows():
+    # real 8.10.9 header is ALL-CAPS 'SYSNAME' on the second header line, and
+    # server neighbors have an EMPTY sysname cell - they must not pollute
+    # neighbor names with 'ProLiant'/'HPE'
+    audit = _priv_audit()
+    neigh = {p.port: p.lldp_neighbor for p in audit.ports if p.lldp_neighbor}
+    assert neigh == {
+        "1/1": "gx-11-s74-wu", "1/2": "gx-11-s74-wu",
+        "1/8": "gx-11-s72-p2", "1/16": "gx-11-s72-p2",
+        "1/23": "gx-11-s74-wv", "1/24": "gx-11-s74-wv",
+        "1/29": "gx-11-s59-p1",
+    }
+    assert not any("no LLDP neighbor data" in w for w in audit.warnings)
+
+
+def test_priv_mlts_fully_up_and_uplink_detected():
+    audit = _priv_audit()
+    by_id = {m.mlt_id: m for m in audit.mlts}
+    # every member port of every MLT is oper up on this box
+    assert all(m.members_up == m.members_total for m in audit.mlts)
+    assert not [w for w in audit.warnings if "member ports up" in w]
+    # MLT 35 (1/1,1/2,1/23,1/24) faces the new gx-11-s74-* BEBs -> uplink
+    assert by_id[35].members_up == 4
+    assert by_id[35].is_uplink
+    # single-port server MLTs are not uplinks
+    assert not by_id[196].is_uplink

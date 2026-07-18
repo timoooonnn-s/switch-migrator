@@ -143,10 +143,11 @@ class BaseRunner:
 
 
 # paging left active stalls long outputs at --More-- and the stuck pager
-# swallows the next command's characters
+# swallows the next command's characters. Per platform: primary command first,
+# then fallback spellings (the abbreviated VOSS form is field-verified).
 _PAGING_DISABLE = {
-    Platform.VOSS: "terminal more disable",
-    Platform.ERS: "terminal length 0",
+    Platform.VOSS: ("terminal more disable", "term more dis"),
+    Platform.ERS: ("terminal length 0",),
 }
 
 
@@ -255,7 +256,44 @@ class SshRunner(BaseRunner):
                 self._conn.session_log.session_log = None
         except Exception:  # noqa: BLE001 - purely a memory optimisation
             pass
+        self._ensure_privileged()
         self._ensure_paging_disabled()
+
+    def _ensure_privileged(self) -> None:
+        """Enter privileged EXEC ('#') - VOSS and ERS logins land in user EXEC
+        ('>'), where whole command trees the tool needs simply do not exist:
+        on VOSS 8.x `show interfaces gigabitEthernet ...` and `show lldp ...`
+        are privileged-only, while `show mlt` / `show vlan` / `show virtual-ist`
+        work in both modes. That mix was the real cause of the
+        '% Invalid input detected' storm on every VOSS access switch - the
+        session was never enabled (netmiko's VSP/ERS drivers do not send
+        'enable', and an operator types 'ena' interactively without thinking
+        about it). 'enable' is a plain mode switch on VOSS/BOSS - no separate
+        enable password for the logged-in account.
+        """
+        try:
+            prompt = self._conn.find_prompt().strip()
+        except Exception as exc:  # noqa: BLE001 - keep going, commands may still work
+            log.warning("[%s] could not read prompt to check privilege level: %s",
+                        self.name, exc)
+            return
+        if prompt.endswith("#"):
+            return
+        detail = ""
+        try:
+            self._conn.enable(cmd="enable")
+            prompt = self._conn.find_prompt().strip()
+        except Exception as exc:  # noqa: BLE001 - e.g. box asks for an enable password
+            detail = f" ({exc.__class__.__name__}: {str(exc).splitlines()[0] if str(exc) else exc})"
+        if prompt.endswith("#"):
+            log.debug("[%s] entered privileged EXEC", self.name)
+            return
+        self.setup_warnings.append(
+            f"could not enter privileged EXEC via 'enable' - prompt stays at "
+            f"'>'{detail}; privileged-only commands (show interfaces "
+            f"gigabitEthernet, show lldp) will fail on this device - check the "
+            f"account's access level")
+        log.warning("[%s] %s", self.name, self.setup_warnings[-1])
 
     def _captured_tail(self, limit: int = 1000) -> str:
         """Sanitised tail of what the device sent during connect, for errors."""
@@ -269,29 +307,35 @@ class SshRunner(BaseRunner):
 
     def _ensure_paging_disabled(self) -> None:
         """netmiko's session_preparation sends the paging-disable command too,
-        but only verifies the command ECHO - not whether the device accepted
-        it. If the pager stays active, every long output (Port Interface,
-        Port State on 50-port boxes) stalls at --More-- and the stuck pager
+        but (a) only verifies the command ECHO - not whether the device
+        accepted it - and (b) runs BEFORE the session is enabled. If the pager
+        stays active, every long output stalls at --More-- and the stuck pager
         swallows the next command's characters. So send it again explicitly
-        and check the device's actual answer.
+        (now in privileged EXEC) and check the device's actual answer; if the
+        primary spelling is rejected, fall back to the abbreviated form that
+        is field-verified on VOSS ('term more dis').
         """
-        command = _PAGING_DISABLE[self.platform]
-        try:
-            out = self._conn.send_command(command, read_timeout=15)
-        except Exception as exc:  # noqa: BLE001 - never fail the whole device here
-            self.setup_warnings.append(
-                f"could not verify paging disable ('{command}'): "
-                f"{exc.__class__.__name__}: {exc} - long command outputs may "
-                f"stall on this device")
-            log.warning("[%s] %s", self.name, self.setup_warnings[-1])
-            return
-        if looks_like_error(out):
+        commands = _PAGING_DISABLE[self.platform]
+        detail = ""
+        for command in commands:
+            try:
+                out = self._conn.send_command(command, read_timeout=15)
+            except Exception as exc:  # noqa: BLE001 - never fail the whole device here
+                self.setup_warnings.append(
+                    f"could not verify paging disable ('{command}'): "
+                    f"{exc.__class__.__name__}: {exc} - long command outputs may "
+                    f"stall on this device")
+                log.warning("[%s] %s", self.name, self.setup_warnings[-1])
+                return
+            if not looks_like_error(out):
+                return  # accepted
             detail = " | ".join(
                 line.strip() for line in out.splitlines() if line.strip())[:120]
-            self.setup_warnings.append(
-                f"device rejected '{command}': {detail} - long command "
-                f"outputs may stall on this device")
-            log.warning("[%s] %s", self.name, self.setup_warnings[-1])
+        self.setup_warnings.append(
+            f"device rejected '{commands[0]}'"
+            + (f" (and fallback '{commands[-1]}')" if len(commands) > 1 else "")
+            + f": {detail} - long command outputs may stall on this device")
+        log.warning("[%s] %s", self.name, self.setup_warnings[-1])
 
     def _connect(self, creds: Credentials):
         # Imported lazily so parsers/tests work without netmiko installed.

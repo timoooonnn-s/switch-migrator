@@ -45,24 +45,34 @@ def expand_port_list(raw: str) -> list[str]:
 
 def parse_lldp_neighbors_summary(output: str) -> dict[str, str]:
     """`show lldp neighbor summary` - one-line-per-neighbor table with a
-    SysName column. The column's character offset is taken from the header
-    line, so shifting column widths across releases don't matter.
-    Returns {local_port: remote_sysname}.
+    SysName column. Returns {local_port: remote_sysname}.
+
+    Header spelling differs per release: real VOSS 8.10 prints an ALL-CAPS
+    two-line header whose second line carries 'SYSNAME', older outputs use
+    'SysName' - matched case-insensitively. The column is cut by character
+    offset from the header (start of SYSNAME to the start of the next header
+    word, e.g. SYSDESCR), because the REMOTE PORT column may contain spaces
+    ('Embedded ALOM, Po~') and the SYSNAME cell is EMPTY for non-LLDP-sysname
+    neighbors (servers) - token counting would misattribute those.
     """
     neighbors: dict[str, str] = {}
-    offset: int | None = None
+    start: int | None = None
+    end: int | None = None
     for line in output.splitlines():
-        if offset is None:
-            idx = line.find("SysName")
-            if idx >= 0:
-                offset = idx
+        if start is None:
+            m = re.search(r"sysname", line, re.IGNORECASE)
+            if m:
+                start = m.start()
+                nxt = re.search(r"\S", line[m.end():])
+                end = m.end() + nxt.start() if nxt else None
             continue
         tokens = line.split()
         if not tokens or not PORT_RE.match(tokens[0]):
             continue
-        chunk = line[offset:].strip()
-        if chunk:
-            neighbors.setdefault(tokens[0], chunk.split()[0])
+        cell = line[start:end] if end is not None else line[start:]
+        name = cell.strip().split()[0] if cell.strip() else ""
+        if name:
+            neighbors.setdefault(tokens[0], name)
     return neighbors
 
 

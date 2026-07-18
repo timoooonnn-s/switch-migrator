@@ -124,15 +124,15 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
     """LLDP neighbor names, uplink flags and MLT member-up counts."""
     neighbors: dict[str, str] = {}
-    out = _run(audit, runner, "show lldp neighbor", required=False)
+    # summary first: one line per neighbor instead of a 10+ line block each,
+    # so it stays small even on fully-cabled 48-port boxes
+    out = _run(audit, runner, "show lldp neighbor summary", required=False)
     if out:
-        neighbors = parse_lldp_neighbors(out)
+        neighbors = parse_lldp_neighbors_summary(out)
     if not neighbors:
-        # some releases reject the block form; the summary table is a
-        # separate command tree and often still available
-        out = _run(audit, runner, "show lldp neighbor summary", required=False)
+        out = _run(audit, runner, "show lldp neighbor", required=False)
         if out:
-            neighbors = parse_lldp_neighbors_summary(out)
+            neighbors = parse_lldp_neighbors(out)
     if not neighbors:
         audit.warnings.append(
             "no LLDP neighbor data - uplink detection disabled for this switch")
