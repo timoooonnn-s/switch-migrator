@@ -75,3 +75,21 @@ def test_parse_lldp_neighbors_summary():
     )
     assert parse_lldp_neighbors_summary(output) == {
         "1/1": "dvr-01", "1/47": "old-agg-02"}
+
+
+def test_ers_unsupported_commands_stay_out_of_the_report(tmp_path: Path, cfg: Config):
+    # real access-ERS behavior: 'show ist' and 'show lldp neighbor summary'
+    # don't exist on the box (Invalid input). The audit must stay quiet about
+    # them - block-form LLDP is the native command and is tried first.
+    device = tmp_path / "old-access-01"
+    shutil.copytree(FIXTURES / "ers", device)
+    (device / "show_ist.txt").write_text(INVALID)
+
+    target = SwitchTarget("old-access-01", "old-access-01", Platform.ERS)
+    audit = collect_switch(target, OfflineRunner("old-access-01", tmp_path), cfg)
+    assert audit.ist is None
+    assert not audit.errors
+    assert not [w for w in audit.warnings if "show ist" in w]
+    assert not [w for w in audit.warnings if "summary" in w]
+    # block-form LLDP delivered neighbors on the first try
+    assert any(p.lldp_neighbor for p in audit.ports)

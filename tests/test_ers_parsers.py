@@ -22,18 +22,42 @@ def test_parse_vlans(fixture):
 
 def test_parse_mlt(fixture):
     mlts = ers_parsers.parse_mlt(fixture("ers", "show_mlt.txt"))
-    assert len(mlts) == 3
+    # MLT 3 ('Trunk #3' Disabled + NONE) is an unconfigured slot: dropped
+    assert [m.mlt_id for m in mlts] == [1, 2, 6]
     uplink = mlts[0]
-    assert uplink.mlt_id == 1
     assert uplink.name == "UPLINK MLT"
     assert uplink.members == ["49", "50"]
     assert uplink.admin == "Enabled"
-    empty = mlts[1]
-    assert empty.members == []
-    assert empty.name == ""
+    dead = mlts[1]     # Enabled but memberless: genuinely dead, kept
+    assert dead.members == []
+    assert dead.name == "old-leftover"
     ist = mlts[2]
     assert ist.is_ist
     assert ist.members == ["47", "48"]
+
+
+def test_parse_mlt_59xx_lacp_key_format():
+    # 59xx BOSS appends a KEY column and leaves TYPE empty on unconfigured
+    # slots. The active LACP trunk row ('... Enabled Trunk NONE') used to be
+    # DROPPED because tokens[-2] was 'Trunk', while all 64 empty 'Trunk #N'
+    # slots parsed and would flood the report as dead MLTs.
+    output = (
+        "                                                                         LACP\n"
+        "Id  Name             Members                Bpdu   Mode  Status   Type   Key\n"
+        "--- ---------------- ---------------------- ------ ----- -------- ------ ----\n"
+        "1   uplink.a         49-50                  All    A     Enabled  Trunk  NONE\n"
+        "2   Trunk #2         NONE                   All    B     Disabled        NONE\n"
+        "3   Trunk #3         NONE                   All    B     Disabled        NONE\n"
+        "64  Trunk #64        NONE                   All    B     Disabled        NONE\n"
+        "MODE Legend:\n"
+        "B=Basic, A=Advance, E=Enhanced, Man=ManLag, Dyn=DynLag\n"
+    )
+    mlts = ers_parsers.parse_mlt(output)
+    assert [m.mlt_id for m in mlts] == [1]
+    assert mlts[0].name == "uplink.a"
+    assert mlts[0].members == ["49", "50"]
+    assert mlts[0].mlt_type == "Trunk"        # the KEY column must not shadow it
+    assert mlts[0].admin == "Enabled"
 
 
 def test_parse_ist(fixture):
