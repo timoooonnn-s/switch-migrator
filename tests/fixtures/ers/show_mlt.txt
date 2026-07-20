@@ -1,5 +1,6 @@
 Id  Name              Members            Bpdu      Mode              Status   Type
 --  ----------------  -----------------  --------  ----------------  -------  ------
 1   UPLINK MLT        49-50              All       Basic             Enabled  Trunk
-2                     NONE               All       Basic             Disabled Normal
+2   old-leftover      NONE               All       Basic             Enabled  Trunk
+3   Trunk #3          NONE               All       Basic             Disabled Normal
 6   IST               47-48              All       Advance           Enabled  Trunk

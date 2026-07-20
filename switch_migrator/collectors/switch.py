@@ -6,7 +6,7 @@ import fnmatch
 import logging
 
 from switch_migrator.config import Config, SwitchTarget
-from switch_migrator.connection import BaseRunner, CommandError
+from switch_migrator.connection import BaseRunner, CommandError, looks_like_error
 from switch_migrator.models import Platform, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
 from switch_migrator.parsers.common import (
@@ -35,7 +35,7 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config) -> Swi
 
 
 def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
-         required: bool) -> str | None:
+         required: bool, absent_ok: bool = False) -> str | None:
     try:
         return runner.run(command)
     except CommandError as exc:
@@ -43,6 +43,14 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
         detail = " | ".join(
             line.strip() for line in str(exc.output or exc).splitlines()
             if line.strip())[:200]
+        # absent_ok: this command legitimately does not exist on every model /
+        # release (e.g. 'show ist' on access ERS without an IST, the lldp
+        # variant of the other platform). An 'Invalid input' answer is then
+        # expected version variance - log it, but keep it out of the report.
+        if absent_ok and not required and looks_like_error(str(exc.output or "")):
+            log.info("[%s] '%s' not supported on this device (%s) - skipped",
+                     audit.name, command, detail)
+            return None
         msg = f"'{command}' failed: {detail}"
         (audit.errors if required else audit.warnings).append(msg)
         log.log(logging.ERROR if required else logging.INFO, "[%s] %s", audit.name, msg)
@@ -113,7 +121,9 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
     out = _run(audit, runner, "show mlt", required=True)
     if out:
         audit.mlts = ers_parsers.parse_mlt(out)
-    out = _run(audit, runner, "show ist", required=False)
+    # access ERS boxes dual-homed to an SMLT core have no IST of their own and
+    # reject the command outright - that is expected, not a finding
+    out = _run(audit, runner, "show ist", required=False, absent_ok=True)
     if out:
         audit.ist = ers_parsers.parse_ist(out)
     out = _run(audit, runner, "show vlan", required=True)
@@ -123,16 +133,28 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
 
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
     """LLDP neighbor names, uplink flags and MLT member-up counts."""
+    # Platform-native command first; the other form only as fallback. VOSS has
+    # the compact one-line-per-neighbor summary (preferred - stays small on
+    # fully-cabled 48-port boxes); BOSS/ERS only knows the block form and
+    # answers 'Invalid input' to 'summary'. absent_ok keeps the fallback dance
+    # out of the report - only the aggregate warning below matters.
+    if audit.platform is Platform.VOSS:
+        lldp_sources = (
+            ("show lldp neighbor summary", parse_lldp_neighbors_summary),
+            ("show lldp neighbor", parse_lldp_neighbors),
+        )
+    else:
+        lldp_sources = (
+            ("show lldp neighbor", parse_lldp_neighbors),
+            ("show lldp neighbor summary", parse_lldp_neighbors_summary),
+        )
     neighbors: dict[str, str] = {}
-    out = _run(audit, runner, "show lldp neighbor", required=False)
-    if out:
-        neighbors = parse_lldp_neighbors(out)
-    if not neighbors:
-        # some releases reject the block form; the summary table is a
-        # separate command tree and often still available
-        out = _run(audit, runner, "show lldp neighbor summary", required=False)
+    for command, parser in lldp_sources:
+        out = _run(audit, runner, command, required=False, absent_ok=True)
         if out:
-            neighbors = parse_lldp_neighbors_summary(out)
+            neighbors = parser(out)
+            if neighbors:
+                break
     if not neighbors:
         audit.warnings.append(
             "no LLDP neighbor data - uplink detection disabled for this switch")

@@ -39,17 +39,34 @@ def test_looks_like_error_negative():
 
 
 class _FakeConn:
-    def __init__(self, exc: Exception | None, response: str = "ok output"):
+    def __init__(self, exc: Exception | None, response: str = "ok output",
+                 responses: list[str] | None = None, prompt: str = "sw:1#",
+                 enable_exc: Exception | None = None):
         self.exc = exc
         self.response = response
+        self.responses = responses      # per-call responses, if given
+        self.prompt = prompt
+        self.enable_exc = enable_exc
         self.calls = 0
+        self.enable_calls = 0
         self.channel_writes: list[str] = []
 
     def send_command(self, command, read_timeout=None):
         self.calls += 1
         if self.exc:
             raise self.exc
+        if self.responses is not None:
+            return self.responses[min(self.calls - 1, len(self.responses) - 1)]
         return self.response
+
+    def find_prompt(self):
+        return self.prompt
+
+    def enable(self, cmd="enable"):
+        self.enable_calls += 1
+        if self.enable_exc:
+            raise self.enable_exc
+        self.prompt = self.prompt.rstrip(">#") + "#"
 
     def write_channel(self, data):
         self.channel_writes.append(data)
@@ -78,6 +95,45 @@ def test_paging_disable_verified_ok():
     runner._ensure_paging_disabled()
     assert runner.setup_warnings == []
     assert conn.calls == 1
+
+
+def test_paging_disable_falls_back_to_abbreviated_form():
+    # full 'terminal more disable' rejected, field-verified 'term more dis' ok
+    conn = _FakeConn(None, responses=[
+        "% Invalid input detected at '^' marker.", ""])
+    runner = _make_runner(conn)
+    runner._ensure_paging_disabled()
+    assert runner.setup_warnings == []
+    assert conn.calls == 2
+
+
+def test_already_privileged_prompt_skips_enable():
+    conn = _FakeConn(None, prompt="gx-11-s72-p1:1#")
+    runner = _make_runner(conn)
+    runner._ensure_privileged()
+    assert conn.enable_calls == 0
+    assert runner.setup_warnings == []
+
+
+def test_unprivileged_prompt_triggers_enable():
+    # SSH login lands in user EXEC ('>') - show interfaces/lldp do not exist
+    # there; the runner must send 'enable' exactly like an operator's 'ena'
+    conn = _FakeConn(None, prompt="gx-11-s72-p1:1>")
+    runner = _make_runner(conn)
+    runner._ensure_privileged()
+    assert conn.enable_calls == 1
+    assert conn.prompt.endswith("#")
+    assert runner.setup_warnings == []
+
+
+def test_enable_failure_is_a_visible_warning():
+    conn = _FakeConn(None, prompt="gx-11-s72-p1:1>",
+                     enable_exc=ValueError("Failed to enter enable mode."))
+    runner = _make_runner(conn)
+    runner._ensure_privileged()
+    assert len(runner.setup_warnings) == 1
+    assert "privileged EXEC" in runner.setup_warnings[0]
+    assert "access level" in runner.setup_warnings[0]
 
 
 def test_paging_disable_rejection_is_surfaced():

@@ -65,29 +65,46 @@ def parse_vlans(output: str) -> list[VlanInfo]:
 def parse_mlt(output: str) -> list[MltState]:
     """`show mlt`
 
-    Lines: <id> <name (16 chars, may be empty/contain spaces)> <members|NONE>
-           <bpdu> <mode> Enabled|Disabled <type>
-    Parsed right-anchored: type, status, mode, bpdu, members are the last five
-    tokens; everything between id and members is the name.
+    Column layouts seen on real gear:
+      classic: <id> <name> <members|NONE> <bpdu> <mode> <status> <type>
+      59xx:    <id> <name> <members|NONE> <bpdu> <mode> <status> [<type>] <key>
+    The 59xx LACP variant appends a KEY column and leaves TYPE empty on
+    unconfigured slots, so nothing is at a fixed position from the right.
+    Rows are anchored instead on the Enabled/Disabled STATUS token (searched
+    from the right) with members exactly three tokens before it.
+
+    Unconfigured trunk slots - Disabled with no members, and the 59xx prints
+    all 64 of them ('Trunk #7   NONE ... Disabled') - are dropped entirely:
+    there is nothing to migrate and they must not be reported as dead MLTs.
+    An ENABLED trunk without members is kept (genuinely dead leftover).
     """
     mlts: list[MltState] = []
     for line in output.splitlines():
         tokens = line.split()
         if len(tokens) < 6 or not tokens[0].isdigit():
             continue
-        status = tokens[-2]
-        if status.lower() not in ("enabled", "disabled"):
+        status_idx = next((i for i in range(len(tokens) - 1, 0, -1)
+                           if tokens[i].lower() in ("enabled", "disabled")), None)
+        # need at least <name> <members> <bpdu> <mode> between the id and STATUS
+        if status_idx is None or status_idx < 4:
             continue
-        members_tok = tokens[-5]
+        members_tok = tokens[status_idx - 3]
         if members_tok.upper() != "NONE" and not re.match(r"^[\d/,\-]+$", members_tok):
             continue
-        name = " ".join(tokens[1:-5])
+        status = tokens[status_idx]
+        members = expand_port_list(members_tok)
+        if not members and status.lower() == "disabled":
+            continue  # unconfigured slot, not a dead MLT
+        name = " ".join(tokens[1:status_idx - 3])
+        after = tokens[status_idx + 1:]
+        mlt_type = after[0] if after and after[0].upper() != "NONE" \
+            and not after[0].isdigit() else ""
         mlts.append(MltState(
             mlt_id=int(tokens[0]),
             name=name,
-            mlt_type=tokens[-1],
+            mlt_type=mlt_type,
             admin=status,
-            members=expand_port_list(members_tok),
+            members=members,
             is_ist="ist" in name.lower(),
         ))
     return mlts
