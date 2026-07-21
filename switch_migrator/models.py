@@ -12,13 +12,29 @@ class Platform(str, Enum):
 
 
 @dataclass
+class LldpNeighbor:
+    """One LLDP neighbor as seen on a local port.
+
+    sysname is what the neighbor advertises as its system name - often a real
+    hostname, but some devices put an adapter model there (Broadcom NICs) or
+    leave it empty (HP iLO). ip / sys_descr give a second and third way to
+    identify the neighbor when the name is unhelpful.
+    """
+    sysname: str = ""
+    ip: str = ""
+    sys_descr: str = ""
+
+
+@dataclass
 class PortState:
     port: str
     description: str = ""
     admin_up: bool | None = None
     oper_up: bool | None = None
     state_reason: str = ""        # VOSS `show int gig state` REASON column (e.g. SSH)
-    lldp_neighbor: str = ""
+    lldp_neighbor: str = ""       # neighbor SysName (may be empty / an adapter model)
+    lldp_neighbor_ip: str = ""    # neighbor management IP, when it advertises one
+    lldp_sys_descr: str = ""      # neighbor SysDescr (e.g. 'HPE ProLiant DL380 Gen10')
     is_uplink: bool = False
 
 

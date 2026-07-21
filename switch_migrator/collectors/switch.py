@@ -157,7 +157,7 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
             ("show lldp neighbor", parse_lldp_neighbors),
             ("show lldp neighbor summary", parse_lldp_neighbors_summary),
         )
-    neighbors: dict[str, str] = {}
+    neighbors: dict = {}
     for command, parser in lldp_sources:
         out = _run(audit, runner, command, required=False, absent_ok=True)
         if out:
@@ -171,7 +171,13 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
     have_port_state = bool(audit.ports)
     port_oper = {}
     for port in audit.ports:
-        port.lldp_neighbor = neighbors.get(port.port, "")
+        n = neighbors.get(port.port)
+        if n is not None:
+            port.lldp_neighbor = n.sysname
+            port.lldp_neighbor_ip = n.ip
+            port.lldp_sys_descr = n.sys_descr
+        # uplink detection keys on the advertised name (a hostname); adapter
+        # models / empty names simply never match the core patterns
         port.is_uplink = bool(port.lldp_neighbor) and _is_core_neighbor(
             port.lldp_neighbor, cfg.core_switch_patterns)
         port_oper[port.port] = bool(port.oper_up)

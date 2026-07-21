@@ -159,7 +159,46 @@ def test_parse_dvr_interfaces(fixture):
 
 def test_parse_lldp_neighbors_voss(fixture):
     neighbors = parse_lldp_neighbors(fixture("voss", "show_lldp_neighbor.txt"))
-    assert neighbors == {"1/1": "core-01", "1/47": "old-agg-02"}
+    assert {p: n.sysname for p, n in neighbors.items()} == {
+        "1/1": "core-01", "1/47": "old-agg-02"}
+
+
+def test_parse_lldp_neighbors_captures_ip_name_and_descr():
+    # real VOSS 8.10.9 block form: NIC advertises an adapter model as SysName
+    # (no IP), a server has an EMPTY SysName but an IP + SysDescr, and a switch
+    # neighbor has all three. Two blocks on one port: the named one wins.
+    from switch_migrator.parsers.common import parse_lldp_neighbors as p
+    out = (
+        "Port: 1/3       Index    : 17\n"
+        "                SysName  : 10/25Gb 2-port SFP28 BCM57414 OCP3 Adapter fw_version:AFW_1\n"
+        "                PortDescr: NIC 1/10/25Gb\n"
+        "                SysDescr : 235.1.164.2 fw_version:AFW_1\n"
+        "                Address  : 0.0.0.0\n"
+        "           IPv6 Address  : 0:0:0:0:0:0:0:0\n"
+        "Port: 1/7       Index    : 6\n"
+        "                SysName  :\n"
+        "                PortDescr: Embedded ALOM, Port 1\n"
+        "                SysDescr : HPE ProLiant DL380 Gen10\n"
+        "                Address  : 10.0.48.192\n"
+        "Port: 1/9       Index    : 2\n"
+        "                SysName  :\n"
+        "                Address  : 0.0.0.0\n"
+        "Port: 1/9       Index    : 18\n"
+        "                SysName  : esx-host-01\n"
+        "                SysDescr : VMware ESXi\n"
+        "                Address  : 0.0.0.0\n"
+        "Port: 2/1       Index    : 14\n"
+        "                SysName  : core-s72-q4\n"
+        "                SysDescr : VSP-7254XSQ (8.10.9.0)\n"
+        "                Address  : 10.0.148.88\n"
+    )
+    n = p(out)
+    assert n["1/3"].sysname.startswith("10/25Gb 2-port SFP28") and n["1/3"].ip == ""
+    assert n["1/7"].sysname == "" and n["1/7"].ip == "10.0.48.192"
+    assert n["1/7"].sys_descr == "HPE ProLiant DL380 Gen10"
+    # port 1/9 has two blocks - the one advertising a name wins, no field mixing
+    assert n["1/9"].sysname == "esx-host-01"
+    assert n["2/1"].sysname == "core-s72-q4" and n["2/1"].ip == "10.0.148.88"
 
 
 def test_parse_mlt_in_datapath(fixture):

@@ -73,8 +73,26 @@ def test_parse_lldp_neighbors_summary():
         "1/1      b0:ad:aa:41:b4:df   1/47          dvr-01           rB/rB\n"
         "1/47     b0:ad:aa:41:c2:aa   1/48          old-agg-02       rB/rB\n"
     )
-    assert parse_lldp_neighbors_summary(output) == {
+    assert {p: n.sysname for p, n in parse_lldp_neighbors_summary(output).items()} == {
         "1/1": "dvr-01", "1/47": "old-agg-02"}
+
+
+def test_parse_lldp_neighbors_summary_ip_and_empty_sysname():
+    # real VOSS 8.10.9 layout: IP/IPv6 ADDR column, and an EMPTY SYSNAME cell
+    # for a server (its REMOTE PORT/SYSDESCR must not bleed into the name)
+    output = (
+        "LOCAL            IP/IPv6                                  CHASSIS            REMOTE\n"
+        "PORT       PROT  ADDR                                     ID                 PORT               SYSNAME       SYSDESCR\n"
+        "-----------------------------------------------------------------------------------------------------------------------\n"
+        "1/3        LLDP  -                                        a4:00:00:00:00:03  a4:00:00:00:00:13  10/25Gb 2-po~ 235.1.164.2 fw_version:AFW_1\n"
+        "1/7        LLDP  10.0.48.192                              --                 a4:00:00:00:00:07                HPE ProLiant DL380 Gen10\n"
+        "2/1        LLDP  10.0.148.88                              a4:00:00:00:00:21  2/1                core-s72-q4   VSP-7254XSQ (8.10.9.0)\n"
+    )
+    n = parse_lldp_neighbors_summary(output)
+    assert n["1/3"].sysname == "10/25Gb" and n["1/3"].ip == ""          # truncated name, no IP
+    assert n["1/7"].sysname == "" and n["1/7"].ip == "10.0.48.192"      # server: name blank, IP set
+    assert n["1/7"].sys_descr == "HPE ProLiant DL380 Gen10"
+    assert n["2/1"].sysname == "core-s72-q4" and n["2/1"].ip == "10.0.148.88"
 
 
 def test_ers_unsupported_commands_stay_out_of_the_report(tmp_path: Path, cfg: Config):
