@@ -90,10 +90,11 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     if out:
         audit.vlans = voss_parsers.parse_vlan_isid(out)
     out = _run(audit, runner, "show vlan basic", required=False)
-    if out:
-        names = voss_parsers.parse_vlan_basic(out)
-        for vlan in audit.vlans:
-            vlan.name = vlan.name or names.get(vlan.vlan_id, "")
+    names = voss_parsers.parse_vlan_basic(out) if out else {}
+    for vlan in audit.vlans:
+        # the VLAN's own name; if 'show vlan basic' didn't cover it, fall back
+        # to the I-SID name so the name column is never needlessly blank
+        vlan.name = vlan.name or names.get(vlan.vlan_id, "") or vlan.isid_name
     # configured port membership per VLAN (for the inventory report); optional
     # and quiet - not every release has it and it is never load-bearing
     out = _run(audit, runner, "show vlan members", required=False, absent_ok=True)

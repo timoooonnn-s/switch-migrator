@@ -225,8 +225,10 @@ def parse_vlan_isid(output: str) -> list[VlanInfo]:
         if not 1 <= vlan_id <= 4094:
             continue
         isid = int(m.group(2)) if m.group(2) else None
-        name = (m.group(3) or "").strip()
-        vlans.append(VlanInfo(vlan_id=vlan_id, name=name, isid=isid))
+        # the third column is the I-SID NAME, not the VLAN name - keep them
+        # separate so the report can show both
+        isid_name = (m.group(3) or "").strip()
+        vlans.append(VlanInfo(vlan_id=vlan_id, isid=isid, isid_name=isid_name))
     return vlans
 
 

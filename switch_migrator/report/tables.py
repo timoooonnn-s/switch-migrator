@@ -79,14 +79,18 @@ def build_summary(audits: list[SwitchAudit],
 
 
 def build_vlan_inventory(audits: list[SwitchAudit]) -> Table:
-    """Per-switch VLAN state without any fabric comparison (--no-fabric)."""
-    t = Table("VLANs", ["Switch", "VLAN", "Name", "Local I-SID",
+    """Per-switch VLAN <-> I-SID overview, no fabric comparison (--no-fabric).
+
+    Same shape as 'VLAN vs Fabric' minus the DvR/verdict columns: which VLAN
+    carries which I-SID (and its name), plus the configured member ports.
+    """
+    t = Table("VLANs", ["Switch", "VLAN", "Name", "I-SID", "I-SID name",
                         "Member ports", "# ports"])
     for a in audits:
         for v in sorted(a.vlans, key=lambda v: v.vlan_id):
             t.add([a.name, v.vlan_id, v.name,
                    v.isid if v.isid is not None else "",
-                   ",".join(v.members) or "-", len(v.members)])
+                   v.isid_name, ",".join(v.members) or "-", len(v.members)])
     return t
 
 
