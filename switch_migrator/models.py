@@ -65,6 +65,7 @@ class VlanInfo:
     vlan_id: int
     name: str = ""
     isid: int | None = None       # local VLAN<->I-SID binding (VOSS only)
+    members: list[str] = field(default_factory=list)  # configured port members
 
 
 @dataclass

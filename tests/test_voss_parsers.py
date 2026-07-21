@@ -181,3 +181,13 @@ def test_parse_mlt_datapath_helper_reads_only_its_own_table():
         "1  6144  1/1  enable  up\n"
     )
     assert voss_parsers._parse_mlt_datapath(out) == {1: True, 2: False, 3: True}
+
+
+def test_parse_vlan_members(fixture):
+    m = voss_parsers.parse_vlan_members(fixture("voss", "show_vlan_members.txt"))
+    assert m[1] == []                                   # NONE -> no ports
+    assert m[100] == ["1/1", "1/2", "2/1/1"]            # PORT MEMBER col, channelized
+    assert m[200] == ["1/2", "1/47", "1/48"]
+    assert m[4000] == ["1/47", "1/48"]
+    # the 'N out of N Total' footer must not become a phantom VLAN
+    assert 5 not in m or m[5] != []

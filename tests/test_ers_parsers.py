@@ -18,6 +18,10 @@ def test_parse_vlans(fixture):
     assert set(by_id) == {1, 100, 200, 300, 666}
     assert by_id[100].name == "Users Floor 1"
     assert by_id[1].name == "VLAN #1"
+    # Port Members continuation line is attached to each VLAN
+    assert by_id[1].members == []                        # NONE
+    assert by_id[100].members == ["1", "2", "3", "4", "5", "6", "7", "8", "10", "26"]
+    assert by_id[200].members == ["11", "12", "13", "49", "50"]
 
 
 def test_parse_mlt(fixture):

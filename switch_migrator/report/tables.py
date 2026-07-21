@@ -45,10 +45,13 @@ def _mlt_up_severity(m) -> str | None:
 
 
 def build_summary(audits: list[SwitchAudit],
-                  comparisons: dict[str, list[VlanComparison]]) -> Table:
-    t = Table("Summary", ["Switch", "Platform", "Reachable", "Ports up/total",
-                          "Uplinks up/total", "MLTs", "MLT issues", "IST/vIST",
-                          "VLANs", "VLAN OK", "VLAN warn", "VLAN error"])
+                  comparisons: dict[str, list[VlanComparison]],
+                  no_fabric: bool = False) -> Table:
+    headers = ["Switch", "Platform", "Reachable", "Ports up/total",
+               "Uplinks up/total", "MLTs", "MLT issues", "IST/vIST", "VLANs"]
+    if not no_fabric:
+        headers += ["VLAN OK", "VLAN warn", "VLAN error"]
+    t = Table("Summary", headers)
     for a in audits:
         comps = [c for c in comparisons.get(a.name, [])
                  if c.status is not CompStatus.EXCLUDED]
@@ -56,20 +59,34 @@ def build_summary(audits: list[SwitchAudit],
         warn = sum(1 for c in comps if c.severity == "warn")
         err = sum(1 for c in comps if c.severity == "error")
         mlt_issues = sum(1 for m in a.mlts if _mlt_up_severity(m) in ("warn", "error"))
+        # in no-fabric mode the VLAN count is just how many VLANs the switch has
+        vlan_count = len(a.vlans) if no_fabric else len(comps)
         if not a.reachable:
-            t.add([a.name, a.platform.value, "NO", "-", "-", "-", "-", "-",
-                   "-", "-", "-", "-"], "error")
+            row = [a.name, a.platform.value, "NO", "-", "-", "-", "-", "-", "-"]
+            t.add(row + ([] if no_fabric else ["-", "-", "-"]), "error")
             continue
         ist = "-"
         if a.ist is not None:
             ist = _fmt_bool(a.ist.session_up).upper()
         severity = "error" if err or (a.ist and a.ist.session_up is False) \
             else ("warn" if warn or mlt_issues else "ok")
-        t.add([a.name, a.platform.value, "yes",
+        row = [a.name, a.platform.value, "yes",
                f"{a.ports_up}/{len(a.ports)}",
                f"{a.uplink_ports_up}/{a.uplink_ports_total}",
-               len(a.mlts), mlt_issues, ist, len(comps), ok, warn, err],
-              severity)
+               len(a.mlts), mlt_issues, ist, vlan_count]
+        t.add(row + ([] if no_fabric else [ok, warn, err]), severity)
+    return t
+
+
+def build_vlan_inventory(audits: list[SwitchAudit]) -> Table:
+    """Per-switch VLAN state without any fabric comparison (--no-fabric)."""
+    t = Table("VLANs", ["Switch", "VLAN", "Name", "Local I-SID",
+                        "Member ports", "# ports"])
+    for a in audits:
+        for v in sorted(a.vlans, key=lambda v: v.vlan_id):
+            t.add([a.name, v.vlan_id, v.name,
+                   v.isid if v.isid is not None else "",
+                   ",".join(v.members) or "-", len(v.members)])
     return t
 
 
@@ -161,7 +178,17 @@ def build_issues(audits: list[SwitchAudit], fabric: FabricState,
 
 
 def build_all(audits: list[SwitchAudit], fabric: FabricState,
-              comparisons: dict[str, list[VlanComparison]]) -> list[Table]:
+              comparisons: dict[str, list[VlanComparison]],
+              no_fabric: bool = False) -> list[Table]:
+    if no_fabric:
+        # inventory/state only: no fabric collected, nothing to compare against
+        return [
+            build_summary(audits, comparisons, no_fabric=True),
+            build_vlan_inventory(audits),
+            build_ports(audits),
+            build_mlts(audits),
+            build_issues(audits, fabric, comparisons),
+        ]
     return [
         build_summary(audits, comparisons),
         build_vlan_comparison(comparisons),

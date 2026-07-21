@@ -72,7 +72,11 @@ def _require(data: dict, key: str, path: Path):
     return data[key]
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path, require_fabric: bool = True) -> Config:
+    """Load the config. With require_fabric=False (the --no-fabric report mode)
+    the DvR controllers and I-SID conventions are optional: the tool only reads
+    and reports per-switch state and never compares against a fabric.
+    """
     try:
         data = yaml.safe_load(path.read_text()) or {}
     except FileNotFoundError:
@@ -82,8 +86,10 @@ def load_config(path: Path) -> Config:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: top level must be a mapping")
 
+    dvr_entries = (_require(data, "dvr_controllers", path) if require_fabric
+                   else (data.get("dvr_controllers") or []))
     dvrs = []
-    for i, entry in enumerate(_require(data, "dvr_controllers", path)):
+    for i, entry in enumerate(dvr_entries):
         if not isinstance(entry, dict) or "host" not in entry:
             raise ConfigError(f"{path}: dvr_controllers[{i}] needs at least 'host'")
         dvrs.append(DvrTarget(name=str(entry.get("name", entry["host"])), host=str(entry["host"])))
@@ -91,7 +97,7 @@ def load_config(path: Path) -> Config:
     conventions = data.get("isid_conventions") or {}
     offsets = [int(o) for o in (conventions.get("offsets") or [])]
     explicit = {int(k): int(v) for k, v in (conventions.get("explicit") or {}).items()}
-    if not offsets and not explicit:
+    if require_fabric and not offsets and not explicit:
         raise ConfigError(
             f"{path}: isid_conventions must define at least one offset or explicit mapping"
         )

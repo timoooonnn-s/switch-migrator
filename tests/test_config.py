@@ -37,3 +37,21 @@ def test_vlan_name_in_excluded_vlans_gives_helpful_error(tmp_path: Path):
         load_config(_write(tmp_path, """
 excluded_vlans: [1, quarantaine]
 """))
+
+
+NO_FABRIC = """
+switches: []
+"""
+
+
+def test_no_fabric_makes_dvr_and_conventions_optional(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    path.write_text("excluded_vlan_names: [\"quarant*\"]\n")
+    # default (require_fabric=True) still demands a fabric...
+    with pytest.raises(ConfigError):
+        load_config(path)
+    # ...but --no-fabric mode does not
+    cfg = load_config(path, require_fabric=False)
+    assert cfg.dvr_controllers == []
+    assert cfg.isid_offsets == [] and cfg.isid_explicit == {}
+    assert cfg.excluded_vlan_names == ["quarant*"]
