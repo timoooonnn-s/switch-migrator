@@ -133,14 +133,16 @@ def build_mlts(audits: list[SwitchAudit]) -> Table:
 
 def build_vlan_comparison(comparisons: dict[str, list[VlanComparison]]) -> Table:
     t = Table("VLAN vs Fabric", ["Switch", "VLAN", "Name", "Local I-SID",
-                                 "Expected I-SID(s)", "DvR attached I-SID(s)",
-                                 "Matched I-SID", "Status", "Detail"])
+                                 "I-SID name", "Expected I-SID(s)",
+                                 "DvR attached I-SID(s)", "Matched I-SID",
+                                 "Status", "Detail"])
     for comps in comparisons.values():
         for c in comps:
             # EXCLUDED rows stay in the table (uncolored) so it is visible on
             # WHICH switches an intentionally-unfabriced VLAN exists
             t.add([c.switch, c.vlan_id, c.vlan_name,
                    c.local_isid if c.local_isid is not None else "",
+                   c.vlan_isid_name,
                    ",".join(map(str, c.expected_isids)),
                    ",".join(map(str, c.dvr_isids)) or "-",
                    c.matched_isid if c.matched_isid is not None else "-",

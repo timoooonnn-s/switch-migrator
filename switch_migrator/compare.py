@@ -38,12 +38,12 @@ def compare_switch(audit: SwitchAudit, fabric: FabricState,
     results = []
     for vlan in audit.vlans:
         results.append(_compare_vlan(audit, vlan.vlan_id, vlan.name,
-                                     vlan.isid, fabric, cfg))
+                                     vlan.isid, vlan.isid_name, fabric, cfg))
     return results
 
 
 def _compare_vlan(audit: SwitchAudit, vlan_id: int, vlan_name: str,
-                  local_isid: int | None, fabric: FabricState,
+                  local_isid: int | None, isid_name: str, fabric: FabricState,
                   cfg: Config) -> VlanComparison:
     expected = expected_isids(vlan_id, cfg)
     dvr_attached = fabric.isids_for_cvid(vlan_id)
@@ -51,8 +51,8 @@ def _compare_vlan(audit: SwitchAudit, vlan_id: int, vlan_name: str,
     def result(status: CompStatus, matched: int | None, detail: str) -> VlanComparison:
         return VlanComparison(
             switch=audit.name, vlan_id=vlan_id, vlan_name=vlan_name,
-            local_isid=local_isid, expected_isids=expected,
-            dvr_isids=dvr_attached, matched_isid=matched,
+            vlan_isid_name=isid_name, local_isid=local_isid,
+            expected_isids=expected, dvr_isids=dvr_attached, matched_isid=matched,
             status=status, detail=detail,
         )
 

@@ -171,6 +171,7 @@ class VlanComparison:
     matched_isid: int | None
     status: CompStatus
     detail: str = ""
+    vlan_isid_name: str = ""          # name of the local I-SID (VOSS)
 
     @property
     def severity(self) -> str:

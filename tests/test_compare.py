@@ -204,3 +204,18 @@ def test_voss_no_isid_but_convention_in_fabric_is_not_local_only():
     audit = make_audit(Platform.VOSS, [VlanInfo(99, isid=None)])
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[99].status is CompStatus.IN_FABRIC_NOT_ATTACHED
+
+
+def test_isid_name_propagates_to_comparison_and_table():
+    from switch_migrator.report.tables import build_vlan_comparison
+    cfg = make_config()
+    fabric = make_fabric({10100: {"cvids": [100]}})
+    audit = make_audit(Platform.VOSS,
+                       [VlanInfo(100, "Users", isid=10100, isid_name="ISID-Users")])
+    res = compare_switch(audit, fabric, cfg)
+    assert res[0].vlan_name == "Users"            # VLAN name
+    assert res[0].vlan_isid_name == "ISID-Users"  # I-SID name, kept separate
+    table = build_vlan_comparison({"sw": res})
+    assert "Name" in table.headers and "I-SID name" in table.headers
+    assert table.rows[0][table.headers.index("Name")] == "Users"
+    assert table.rows[0][table.headers.index("I-SID name")] == "ISID-Users"
