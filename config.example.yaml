@@ -14,6 +14,10 @@
 # VLAN pairs via `show dvr interfaces`) plus fabric-wide I-SIDs via IS-IS.
 # The tool merges the view of all listed controllers; I-SIDs and VLAN
 # attachments found on ANY of them count as "exists in fabric".
+#
+# NOTE: with `--no-fabric` (inventory/state report for isolated environments
+# whose VLANs/I-SIDs intentionally are NOT in a fabric) this section and the
+# isid_conventions section below are OPTIONAL - nothing is compared.
 dvr_controllers:
   - name: dvr-01
     host: 10.0.0.1

@@ -43,22 +43,33 @@ def parse_ports(output: str) -> list[PortState]:
 def parse_vlans(output: str) -> list[VlanInfo]:
     """`show vlan`
 
-    Lines: <id> <name (may contain spaces)> <type> ... - the type keyword
-    anchors the end of the name column.
+    Header line: <id> <name (may contain spaces)> <type> ... - the type keyword
+    anchors the end of the name column. Many BOSS/ERS releases print an
+    indented 'Port Members: <list>' continuation line under each VLAN (real
+    5900 output); when present it is attached to the VLAN above. 'NONE' means
+    no ports.
     """
     vlans: list[VlanInfo] = []
     type_re = re.compile(
         r"^\s*(\d{1,4})\s+(.*?)\s+(" + "|".join(re.escape(t) for t in _VLAN_TYPES) + r")\b",
         re.IGNORECASE,
     )
+    member_re = re.compile(r"Port\s+Members?\s*:\s*(.+?)\s*$", re.IGNORECASE)
+    current: VlanInfo | None = None
     for line in output.splitlines():
         m = type_re.match(line)
-        if not m:
+        if m:
+            vlan_id = int(m.group(1))
+            if not 1 <= vlan_id <= 4094:
+                current = None
+                continue
+            current = VlanInfo(vlan_id=vlan_id, name=m.group(2).strip())
+            vlans.append(current)
             continue
-        vlan_id = int(m.group(1))
-        if not 1 <= vlan_id <= 4094:
-            continue
-        vlans.append(VlanInfo(vlan_id=vlan_id, name=m.group(2).strip()))
+        pm = member_re.search(line)
+        if pm and current is not None:
+            raw = pm.group(1).strip()
+            current.members = [] if raw.upper() == "NONE" else expand_port_list(raw)
     return vlans
 
 

@@ -1,8 +1,13 @@
 Id   Name                 Type     Protocol         PID    Active IVL/SVL Mgmt
 ---- -------------------- -------- ---------------- ------ ------ ------- ----
 1    VLAN #1              Port     None             0x0000 Yes    IVL     Yes
+        Port Members: NONE
 100  Users Floor 1        Port     None             0x0000 Yes    IVL     No
+        Port Members: 1-8,10,26
 200  Printers             Port     None             0x0000 Yes    IVL     No
+        Port Members: 11-13,49-50
 300  Legacy Special       Port     None             0x0000 Yes    IVL     No
+        Port Members: 9,49-50
 666  Orphan VLAN          Port     None             0x0000 Yes    IVL     No
+        Port Members: 49-50
 Total VLANs: 5

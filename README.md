@@ -137,7 +137,23 @@ switch-migrator -i switches.yaml --csv --save-raw -v
 
 # Re-run the analysis later without touching any device
 switch-migrator -i switches.yaml --offline output/raw
+
+# Inventory-only report for an ISOLATED environment (no fabric to compare to):
+# reports each switch's port/MLT/IST/VLAN state - incl. per-VLAN port members -
+# and skips DvR collection and comparison entirely. dvr_controllers and
+# isid_conventions are optional in the config for this mode.
+switch-migrator -c config.yaml -i isolated.yaml --no-fabric
 ```
+
+### Inventory mode (`--no-fabric`)
+
+For isolated environments whose VLANs and I-SIDs are intentionally **not** in a
+fabric, `--no-fabric` turns the tool into a pure state report: it collects
+ports, MLTs, IST/vIST and VLANs (with each VLAN's configured **member ports**)
+from every switch and renders **Summary**, **VLANs**, **Ports**, **MLTs** and
+**Issues** — no DvR controllers are contacted and the *VLAN vs Fabric* and
+*Fabric I-SIDs* tables are omitted. No `dvr_controllers` or `isid_conventions`
+are required in the config.
 
 Output goes to `./output/` by default:
 
@@ -167,9 +183,13 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor` → `show lldp neighbor summary` |
-| ERS (migrate) | `show interfaces`, `show mlt`, `show ist`, `show vlan`, `show lldp neighbor` |
+| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor` |
+| ERS (migrate) | `enable`, `show interfaces`, `show mlt`, `show ist`, `show vlan` (incl. `Port Members`), `show lldp neighbor` → `show lldp neighbor summary` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
+
+`show vlan members` (VOSS) and the `Port Members` line of `show vlan` (ERS)
+feed the per-VLAN member-port column of the inventory report. Both are optional
+and silently skipped on releases that don't support them.
 
 Which command variants a given 8.x release accepts varies (real captures show
 boxes rejecting the plain interfaces form or the block-style LLDP command

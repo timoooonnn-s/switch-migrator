@@ -63,8 +63,10 @@ class IstState:
 @dataclass
 class VlanInfo:
     vlan_id: int
-    name: str = ""
+    name: str = ""                # the VLAN's own name (from 'show vlan basic')
     isid: int | None = None       # local VLAN<->I-SID binding (VOSS only)
+    isid_name: str = ""           # the I-SID's name (from 'show vlan i-sid')
+    members: list[str] = field(default_factory=list)  # configured port members
 
 
 @dataclass
@@ -169,6 +171,7 @@ class VlanComparison:
     matched_isid: int | None
     status: CompStatus
     detail: str = ""
+    vlan_isid_name: str = ""          # name of the local I-SID (VOSS)
 
     @property
     def severity(self) -> str:

@@ -60,6 +60,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "(repeatable, combines with -i)")
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("output"),
                         help="directory for reports and logs (default: ./output)")
+    parser.add_argument("--no-fabric", action="store_true",
+                        help="inventory/state report only: read and report each "
+                             "switch's port/MLT/IST/VLAN state and do NOT collect "
+                             "or compare against any DvR fabric. For isolated "
+                             "environments whose VLANs/I-SIDs are intentionally "
+                             "not in the fabric. DvR controllers and I-SID "
+                             "conventions become optional in the config.")
     parser.add_argument("--csv", action="store_true",
                         help="additionally export the tables as CSV files")
     parser.add_argument("--no-excel", action="store_true",
@@ -169,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(args.output_dir, args.debug)
 
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, require_fabric=not args.no_fabric)
         targets: list[SwitchTarget] = []
         if args.inventory:
             targets.extend(load_inventory(args.inventory))
@@ -186,7 +193,9 @@ def main(argv: list[str] | None = None) -> int:
             creds = dvr_creds = Credentials("offline", "offline")
         else:
             creds = get_credentials("switches", "SM")
-            dvr_creds = get_credentials("DvR controllers", "SM_DVR", fallback=creds)
+            # no-fabric mode never touches a DvR, so don't prompt for its creds
+            dvr_creds = creds if args.no_fabric else get_credentials(
+                "DvR controllers", "SM_DVR", fallback=creds)
             if cfg.ssh.legacy_algorithms:
                 # initialize once on the main thread before any worker connects
                 enable_legacy_ssh_algorithms()
@@ -195,23 +204,28 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     started = datetime.now()
-    console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only audit "
-                  f"of {len(targets)} switch(es) against "
-                  f"{len(cfg.dvr_controllers)} DvR controller(s)")
-
-    # 1) Fabric state from the DvR controllers (sequential merge, small device count)
-    with console.status("Collecting fabric state from DvR controllers..."):
-        fabric = collect_fabric(cfg.dvr_controllers, dvr_creds, cfg, args)
-    if not fabric.dvrs_ok:
-        console.print("[bold red]No DvR controller could be read - aborting, "
-                      "there is no fabric state to compare against.[/bold red]")
-        for err in fabric.dvr_errors:
-            console.print(f"  [red]{err}[/red]")
-        return 1
-    console.print(f"Fabric state: {len(fabric.isids)} I-SIDs from "
-                  f"{', '.join(fabric.dvrs_ok)}"
-                  + (f" [yellow]({len(fabric.dvr_errors)} DvR error(s))[/yellow]"
-                     if fabric.dvr_errors else ""))
+    if args.no_fabric:
+        console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only "
+                      f"inventory of {len(targets)} switch(es) "
+                      f"[yellow](--no-fabric: no DvR comparison)[/yellow]")
+        fabric = FabricState()
+    else:
+        console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only "
+                      f"audit of {len(targets)} switch(es) against "
+                      f"{len(cfg.dvr_controllers)} DvR controller(s)")
+        # 1) Fabric state from the DvR controllers (sequential merge)
+        with console.status("Collecting fabric state from DvR controllers..."):
+            fabric = collect_fabric(cfg.dvr_controllers, dvr_creds, cfg, args)
+        if not fabric.dvrs_ok:
+            console.print("[bold red]No DvR controller could be read - aborting, "
+                          "there is no fabric state to compare against.[/bold red]")
+            for err in fabric.dvr_errors:
+                console.print(f"  [red]{err}[/red]")
+            return 1
+        console.print(f"Fabric state: {len(fabric.isids)} I-SIDs from "
+                      f"{', '.join(fabric.dvrs_ok)}"
+                      + (f" [yellow]({len(fabric.dvr_errors)} DvR error(s))[/yellow]"
+                         if fabric.dvr_errors else ""))
 
     # 2) Legacy switches in parallel
     audits: list[SwitchAudit] = []
@@ -230,12 +244,12 @@ def main(argv: list[str] | None = None) -> int:
             console.print(f"[bold red]UNREACHABLE[/bold red] {audit.name} "
                           f"({audit.host}): {reason}")
 
-    # 3) Compare
-    comparisons = {a.name: compare_switch(a, fabric, cfg)
-                   for a in audits if a.reachable}
+    # 3) Compare (skipped entirely in no-fabric mode)
+    comparisons = {} if args.no_fabric else {
+        a.name: compare_switch(a, fabric, cfg) for a in audits if a.reachable}
 
     # 4) Report
-    tables = build_all(audits, fabric, comparisons)
+    tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
     console_report.render(tables, Console(), verbose=args.verbose)
 
     written: list[Path] = []

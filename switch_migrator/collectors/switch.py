@@ -6,7 +6,7 @@ import fnmatch
 import logging
 
 from switch_migrator.config import Config, SwitchTarget
-from switch_migrator.connection import BaseRunner, CommandError, looks_like_error
+from switch_migrator.connection import BaseRunner, CommandError
 from switch_migrator.models import Platform, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
 from switch_migrator.parsers.common import (
@@ -45,10 +45,11 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
             if line.strip())[:200]
         # absent_ok: this command legitimately does not exist on every model /
         # release (e.g. 'show ist' on access ERS without an IST, the lldp
-        # variant of the other platform). An 'Invalid input' answer is then
-        # expected version variance - log it, but keep it out of the report.
-        if absent_ok and not required and looks_like_error(str(exc.output or "")):
-            log.info("[%s] '%s' not supported on this device (%s) - skipped",
+        # variant of the other platform, 'show vlan members' on older BOSS).
+        # Its failure is expected version variance - log it, but keep it out of
+        # the report entirely.
+        if absent_ok and not required:
+            log.info("[%s] '%s' unavailable on this device (%s) - skipped",
                      audit.name, command, detail)
             return None
         msg = f"'{command}' failed: {detail}"
@@ -89,10 +90,18 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     if out:
         audit.vlans = voss_parsers.parse_vlan_isid(out)
     out = _run(audit, runner, "show vlan basic", required=False)
+    names = voss_parsers.parse_vlan_basic(out) if out else {}
+    for vlan in audit.vlans:
+        # the VLAN's own name; if 'show vlan basic' didn't cover it, fall back
+        # to the I-SID name so the name column is never needlessly blank
+        vlan.name = vlan.name or names.get(vlan.vlan_id, "") or vlan.isid_name
+    # configured port membership per VLAN (for the inventory report); optional
+    # and quiet - not every release has it and it is never load-bearing
+    out = _run(audit, runner, "show vlan members", required=False, absent_ok=True)
     if out:
-        names = voss_parsers.parse_vlan_basic(out)
+        members = voss_parsers.parse_vlan_members(out)
         for vlan in audit.vlans:
-            vlan.name = vlan.name or names.get(vlan.vlan_id, "")
+            vlan.members = members.get(vlan.vlan_id, vlan.members)
     # port-level I-SID bindings catch services (e.g. CVLAN/switched-UNI) that
     # `show vlan i-sid` may not list
     out = _run(audit, runner, "show interfaces gigabitEthernet i-sid", required=False)

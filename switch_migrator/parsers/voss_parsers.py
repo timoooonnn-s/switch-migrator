@@ -225,9 +225,39 @@ def parse_vlan_isid(output: str) -> list[VlanInfo]:
         if not 1 <= vlan_id <= 4094:
             continue
         isid = int(m.group(2)) if m.group(2) else None
-        name = (m.group(3) or "").strip()
-        vlans.append(VlanInfo(vlan_id=vlan_id, name=name, isid=isid))
+        # the third column is the I-SID NAME, not the VLAN name - keep them
+        # separate so the report can show both
+        isid_name = (m.group(3) or "").strip()
+        vlans.append(VlanInfo(vlan_id=vlan_id, isid=isid, isid_name=isid_name))
     return vlans
+
+
+def parse_vlan_members(output: str) -> dict[int, list[str]]:
+    """`show vlan members` -> {vlan_id: [configured member ports]}.
+
+    VOSS columns: VLAN-ID | PORT MEMBER | ACTIVE MEMBER | STATIC MEMBER |
+    NOT_ALLOW MEMBER. PORT MEMBER (all configured members) is the first
+    port-list column, so we take the first slot/port token after the VLAN id;
+    'NONE' (or no port token) means the VLAN has no ports. Anchored on tokens,
+    not offsets, and only rows that actually carry a port-list or an explicit
+    NONE are recorded - so the 'N out of M Total' footer is ignored.
+    """
+    result: dict[int, list[str]] = {}
+    for line in output.splitlines():
+        tokens = line.split()
+        if len(tokens) < 2 or not tokens[0].isdigit():
+            continue
+        vid = int(tokens[0])
+        if not 1 <= vid <= 4094:
+            continue
+        for t in tokens[1:]:
+            if "/" in t and PORT_LIST_RE.match(t):
+                result[vid] = expand_port_list(t)
+                break
+            if t.upper() == "NONE":
+                result[vid] = []
+                break
+    return result
 
 
 def parse_vlan_basic(output: str) -> dict[int, str]:
