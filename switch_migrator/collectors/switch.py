@@ -32,9 +32,9 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
     else:
         _collect_ers(audit, runner)
     _enrich(audit, runner, cfg)
-    # running-config is only pulled for the --extract-config feature; VOSS only
-    # for now (the ERS generator is a later slice)
-    if pull_config and target.platform is Platform.VOSS:
+    # running-config is only pulled for the --extract-config feature (VOSS:
+    # filter+neutralize; ERS: translate to VOSS flex-UNI)
+    if pull_config:
         out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
         audit.running_config = out or ""
     return audit

@@ -17,6 +17,9 @@ from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.compare import compare_switch
 from switch_migrator.config_extract import extract_voss_config
+from switch_migrator.config_generate import generate_voss_from_ers
+from switch_migrator.isid import build_worksheet
+from switch_migrator.parsers.ers_config import parse_ers_config
 from switch_migrator.config import (
     DvrTarget,
     Config,
@@ -179,26 +182,37 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
 
 
 def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
+                           comparisons: dict, cfg: Config,
                            console: Console) -> list[Path]:
-    """Write a neutralized VOSS config extract per switch (--extract-config)."""
+    """Write a migration-ready config per switch (--extract-config): VOSS boxes
+    are filtered/neutralized; ERS boxes are translated to VOSS flex-UNI with an
+    I-SID decision worksheet."""
     written: list[Path] = []
     out_dir = output_dir / "config"
     for a in audits:
-        if a.platform is not Platform.VOSS:
-            if a.reachable:
-                console.print(f"[yellow]--extract-config: {a.name} is ERS - "
-                              f"config extraction is VOSS-only for now[/yellow]")
-            continue
         if not a.running_config:
             if a.reachable:
                 console.print(f"[yellow]--extract-config: no running-config "
                               f"obtained from {a.name}[/yellow]")
             continue
-        result = extract_voss_config(a.running_config, device_name=a.name)
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{a.name}.cfg"
-        path.write_text(result.text)
-        written.append(path)
+        if a.platform is Platform.VOSS:
+            text = extract_voss_config(a.running_config, device_name=a.name).text
+            path = out_dir / f"{a.name}.cfg"
+            path.write_text(text)
+            written.append(path)
+        else:  # ERS -> VOSS flex-UNI (generated draft) + I-SID worksheet
+            matched = {c.vlan_id: c.matched_isid
+                       for c in comparisons.get(a.name, []) if c.matched_isid}
+            model = parse_ers_config(a.running_config)
+            res = generate_voss_from_ers(model, cfg, matched_by_vlan=matched,
+                                         device_name=a.name)
+            path = out_dir / f"{a.name}.cfg"
+            path.write_text(res.text)
+            written.append(path)
+            wpath = out_dir / f"{a.name}.isid-decisions.txt"
+            wpath.write_text(build_worksheet(res.decisions, device_name=a.name))
+            written.append(wpath)
     return written
 
 
@@ -293,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.csv:
         written.extend(write_csv(tables, args.output_dir / f"csv-{stamp}"))
     if args.extract_config:
-        written.extend(_write_config_extracts(audits, args.output_dir, console))
+        written.extend(_write_config_extracts(
+            audits, args.output_dir, comparisons, cfg, console))
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 

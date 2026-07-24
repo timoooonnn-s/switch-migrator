@@ -167,8 +167,27 @@ sections verbatim and drops everything else, so:
   a `# [REVIEW]` marker, and the header lists the sections that were present but
   omitted so you remember to configure them separately.
 
-It works with `--offline`/`--save-raw` like everything else. ERS→VOSS config
-*generation* is a separate, later capability.
+It works with `--offline`/`--save-raw` like everything else.
+
+**ERS → VOSS (generated draft).** For an **ERS** switch, `--extract-config`
+instead *generates* a best-effort VOSS **flex-UNI** config from the ERS L2 model
+and writes two files:
+
+* `<device>.cfg` — each VLAN becomes an `i-sid <isid> elan` with
+  `c-vid <vlan> port …` (tagged members) and `untagged-traffic port …` (PVID
+  members); access ports get the flex-UNI boilerplate; old port numbers are kept
+  as `1/N`. It is clearly labelled a **DRAFT** with a "YOU MUST VERIFY" header
+  (tagged-vs-untagged, uplink/MLT handling, and the untranslated config).
+* `<device>.isid-decisions.txt` — the **I-SID decision worksheet**: because
+  several offsets run in parallel (`2500000/2510000/2700000/2710000`),
+  `offset + VLAN` is ambiguous, so any VLAN the fabric didn't confirm is listed
+  with all candidate I-SIDs plus a ready-to-paste `isid_conventions.explicit`
+  snippet. Fill in your choices, re-run, and those VLANs resolve. Until then the
+  service block is emitted **commented-out** with a `# [REVIEW]` marker — never a
+  guessed I-SID.
+
+I-SID resolution order is: excluded → your explicit decision → fabric-confirmed
+(from the audit) → REVIEW placeholder.
 
 ### Inventory mode (`--no-fabric`)
 
