@@ -143,7 +143,32 @@ switch-migrator -i switches.yaml --offline output/raw
 # and skips DvR collection and comparison entirely. dvr_controllers and
 # isid_conventions are optional in the config for this mode.
 switch-migrator -c config.yaml -i isolated.yaml --no-fabric
+
+# Also pull each VOSS switch's running-config and write a neutralized,
+# migration-ready extract (port/MLT/VLAN/I-SID only) to <output>/config/
+switch-migrator -i switches.yaml --extract-config
 ```
+
+### Config extraction (`--extract-config`, VOSS)
+
+Pulls each VOSS switch's `show running-config` and writes a **neutralized,
+migration-ready extract** to `<output>/config/<device>.cfg` for review before
+you build the new device. It keeps the **port / MLT / VLAN / I-SID** banner
+sections verbatim and drops everything else, so:
+
+* **neutralized by construction** — device identity and every secret (mgmt/OOB,
+  SNMP, RADIUS/TACACS, SSH/cert, syslog/NTP, boot flags, and the SPB/IS-IS core
+  identity: nick-name, system-id, manual-area) live in sections that are never
+  emitted, so nothing sensitive can leak;
+* **model-agnostic** — keys on the config's own section banners, so a flex-UNI
+  leaf, a traditional `vlan i-sid` BEB, a BCB (almost nothing to keep) or an
+  isolated VLAN-only box all work;
+* **annotated, not paste-ready** — fabric uplink ports (those running IS-IS) get
+  a `# [REVIEW]` marker, and the header lists the sections that were present but
+  omitted so you remember to configure them separately.
+
+It works with `--offline`/`--save-raw` like everything else. ERS→VOSS config
+*generation* is a separate, later capability.
 
 ### Inventory mode (`--no-fabric`)
 
@@ -183,7 +208,7 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor` |
+| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor`, and `show running-config` (only with `--extract-config`) |
 | ERS (migrate) | `enable`, `show interfaces`, `show mlt`, `show ist`, `show vlan` (incl. `Port Members`), `show lldp neighbor` → `show lldp neighbor summary` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
 

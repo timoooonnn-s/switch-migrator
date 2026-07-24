@@ -16,6 +16,7 @@ from switch_migrator import __version__
 from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.compare import compare_switch
+from switch_migrator.config_extract import extract_voss_config
 from switch_migrator.config import (
     DvrTarget,
     Config,
@@ -67,6 +68,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "environments whose VLANs/I-SIDs are intentionally "
                              "not in the fabric. DvR controllers and I-SID "
                              "conventions become optional in the config.")
+    parser.add_argument("--extract-config", action="store_true",
+                        help="also pull each VOSS switch's running-config and "
+                             "write a neutralized, migration-ready extract "
+                             "(port/MLT/VLAN/I-SID only, secrets & identity "
+                             "removed, uplinks annotated) to "
+                             "<output>/config/<device>.cfg. Review before use.")
     parser.add_argument("--csv", action="store_true",
                         help="additionally export the tables as CSV files")
     parser.add_argument("--no-excel", action="store_true",
@@ -129,7 +136,8 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         log.exception("[%s] unexpected connect error", target.name)
         return failed
     try:
-        return collect_switch(target, runner, cfg)
+        return collect_switch(target, runner, cfg,
+                              pull_config=args.extract_config)
     except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
         failed.errors.append(f"collection crashed: {exc.__class__.__name__}: {exc}")
         log.exception("[%s] collection crashed", target.name)
@@ -168,6 +176,30 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
         for fragment in pool.map(collect_one, dvrs):
             fabric.merge(fragment)
     return fabric
+
+
+def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
+                           console: Console) -> list[Path]:
+    """Write a neutralized VOSS config extract per switch (--extract-config)."""
+    written: list[Path] = []
+    out_dir = output_dir / "config"
+    for a in audits:
+        if a.platform is not Platform.VOSS:
+            if a.reachable:
+                console.print(f"[yellow]--extract-config: {a.name} is ERS - "
+                              f"config extraction is VOSS-only for now[/yellow]")
+            continue
+        if not a.running_config:
+            if a.reachable:
+                console.print(f"[yellow]--extract-config: no running-config "
+                              f"obtained from {a.name}[/yellow]")
+            continue
+        result = extract_voss_config(a.running_config, device_name=a.name)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{a.name}.cfg"
+        path.write_text(result.text)
+        written.append(path)
+    return written
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
         written.append(xlsx)
     if args.csv:
         written.extend(write_csv(tables, args.output_dir / f"csv-{stamp}"))
+    if args.extract_config:
+        written.extend(_write_config_extracts(audits, args.output_dir, console))
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 

@@ -96,6 +96,7 @@ class SwitchAudit:
     mlts: list[MltState] = field(default_factory=list)
     ist: IstState | None = None
     vlans: list[VlanInfo] = field(default_factory=list)
+    running_config: str = ""      # raw `show running-config`, only if requested
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 

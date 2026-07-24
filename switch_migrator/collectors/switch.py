@@ -21,7 +21,8 @@ def _is_core_neighbor(sysname: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(sysname.lower(), p.lower()) for p in patterns)
 
 
-def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config) -> SwitchAudit:
+def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
+                   pull_config: bool = False) -> SwitchAudit:
     audit = SwitchAudit(name=target.name, host=target.host,
                         platform=target.platform, reachable=True)
     # session-setup problems (e.g. paging disable rejected) must be visible
@@ -31,6 +32,11 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config) -> Swi
     else:
         _collect_ers(audit, runner)
     _enrich(audit, runner, cfg)
+    # running-config is only pulled for the --extract-config feature; VOSS only
+    # for now (the ERS generator is a later slice)
+    if pull_config and target.platform is Platform.VOSS:
+        out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
+        audit.running_config = out or ""
     return audit
 
 

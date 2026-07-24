@@ -1,0 +1,135 @@
+************************************************************************************
+                Command Execution Time: Fri Jul 24 09:40:46 2026 CEST
+************************************************************************************
+Preparing to Display Configuration...
+#
+# Fri Jul 24 09:40:46 2026 CEST
+# box type             : VSP-7254XSQ
+# software version     : 8.10.9.0
+# cli mode             : ECLI
+#
+
+#
+#!end
+#
+config terminal
+
+#
+# BOOT CONFIGURATION
+#
+
+boot config flags dvr-leaf-mode
+boot config flags sshd
+
+#
+# SNMP V3 GLOBAL CONFIGURATION
+#
+
+snmp-server contact "contact"
+snmp-server location "datacenter"
+snmp-server user secretuser
+
+#
+# CLI CONFIGURATION
+#
+
+prompt "leaf-01"
+password hash sha1
+
+#
+# MLT CONFIGURATION
+#
+
+mlt 197 enable name "srv-lag"
+
+#
+# VLAN CONFIGURATION
+#
+
+vlan members remove 1 1/1-1/48,2/1-2/6 portmember
+vlan create 4051 name "BVLAN-1" type spbm-bvlan
+vlan create 4052 name "BVLAN-2" type spbm-bvlan
+
+#
+# ISIS SPBM CONFIGURATION
+#
+
+router isis
+spbm 1
+spbm 1 nick-name f.30.42
+spbm 1 b-vid 4051-4052 primary 4051
+spbm 1 smlt-peer-system-id 00bb.0000.0000
+exit
+
+#
+# MLT INTERFACE CONFIGURATION
+#
+
+interface mlt 197
+smlt
+lacp enable key 197
+flex-uni enable
+exit
+
+#
+# PORT CONFIGURATION - PHASE I
+#
+
+interface GigabitEthernet 1/4
+encapsulation dot1q
+
+exit
+
+#
+# PORT CONFIGURATION - PHASE II
+#
+
+interface GigabitEthernet 1/4
+default-vlan-id 0
+flex-uni enable
+no shutdown
+slpp-guard enable timeout 0
+spanning-tree mstp edge-port true
+exit
+interface GigabitEthernet 2/1
+default-vlan-id 0
+name "core-s74-w5"
+no shutdown
+isis
+isis spbm 1
+isis spbm 1 l1-metric 250
+isis enable
+exit
+
+#
+# OSPF VLAN CONFIGURATION
+#
+
+router ospf
+exit
+
+#
+# RADIUS CONFIGURATION
+#
+
+radius server host 10.0.0.9 key supersecret retry 2
+radius enable
+
+#
+# I-SID CONFIGURATION
+#
+
+i-sid 2500695 elan
+c-vid 695 port 1/4
+untagged-traffic port 1/4
+exit
+i-sid 2510735 elan
+c-vid 735 port 1/4
+exit
+
+#
+# TACACS CONFIGURATION
+#
+
+
+end
