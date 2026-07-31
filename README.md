@@ -125,6 +125,46 @@ switches — one dead box never aborts the run.
 
 ## Usage
 
+### Interactive menu (default)
+
+Run it with no arguments and you land in the toolkit menu:
+
+```bash
+switch-migrator                      # or: switch-migrator --menu
+switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
+```
+
+```
+╭─ switch-migrator ───────────────────────────────╮
+│ Config:    config.yaml                          │
+│ Inventory: switches.yaml                        │
+│ Switches:  12 selected of 12                    │
+│ Output:    output                               │
+│ Data:      collected 14:03:11 (12 switch(es),   │
+│            incl. fabric, running-config, MACs)  │
+╰─────────────────────────────────────────────────╯
+  1  Select switches       pick targets from the inventory or add them by hand
+  2  Collect from devices  connect once; all outputs below reuse this data
+  3  Audit vs fabric       compare every VLAN against the DvR fabric state
+  4  Inventory report      port/MLT/VLAN state only, no fabric comparison
+  5  Migration sheets      port info + DC cabling sheet + MAC-check commands
+  6  Config extract        neutralized VOSS config / generated ERS->VOSS draft
+  7  Everything            run 3-6 in one go with the collected data
+  8  Settings              output directory, offline replay, target switch name
+  0  Quit
+```
+
+The menu holds a **session**: devices are collected **once** (option 2, which
+asks whether to include fabric state, running-config and MAC tables), and every
+output afterwards is produced from that same data — switching between use cases
+costs no further SSH round-trips. Options that need data you didn't collect say
+so instead of silently producing empty columns.
+
+**All command-line flags below keep working unchanged** — the menu is an extra
+entry point, not a replacement, so existing scripts and cron jobs are unaffected.
+
+### Command line
+
 ```bash
 # Standard run: inventory file + Excel report + console summary
 switch-migrator -c config.yaml -i switches.yaml
@@ -356,10 +396,14 @@ collectors, comparison and report writers.
 ```
 switch_migrator/
 ├── cli.py              # argument parsing + orchestration
+├── menu.py             # interactive toolkit menu (session: collect once, reuse)
 ├── config.py           # YAML config/inventory loading, credential resolution
 ├── connection.py       # netmiko SSH runner + offline replay runner
 ├── models.py           # dataclasses + comparison status model
 ├── compare.py          # VLAN↔I-SID comparison engine
+├── config_extract.py   # VOSS running-config -> neutralized extract
+├── config_generate.py  # ERS L2 model -> VOSS flex-UNI draft
+├── isid.py             # per-VLAN I-SID resolution + decision worksheet
 ├── collectors/
 │   ├── switch.py       # legacy switch collection (VOSS + ERS)
 │   └── dvr.py          # DvR fabric-state collection + merge
@@ -369,5 +413,6 @@ switch_migrator/
 │   └── common.py       # port-list expansion, LLDP block parser
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers
+    ├── migration.py    # port info + cabling sheets, migration commands
     └── excel.py        # xlsx + csv export; console.py renders to terminal
 ```

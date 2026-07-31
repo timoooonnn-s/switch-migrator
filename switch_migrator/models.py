@@ -70,6 +70,7 @@ class MltState:
     # nothing programmed); None = that table was absent. Lets us tell a live
     # MLT from a dead one even when per-port state is unavailable.
     in_datapath: bool | None = None
+    lacp: bool | None = None      # LACP admin state (VOSS: show mlt LACP table)
     is_ist: bool = False
     is_uplink: bool = False
 
@@ -114,6 +115,9 @@ class SwitchAudit:
     ist: IstState | None = None
     vlans: list[VlanInfo] = field(default_factory=list)
     running_config: str = ""      # raw `show running-config`, only if requested
+    # rows from `show interfaces gigabitEthernet i-sid`, kept so the per-port
+    # VLAN/I-SID columns need no second call
+    port_isid_rows: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 

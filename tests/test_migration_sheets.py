@@ -168,9 +168,10 @@ def test_collector_attributes_macs_and_lacp_from_real_capture(tmp_path):
     cfg = Config(dvr_controllers=[], core_switch_patterns=["gx-11-s74-*"],
                  isid_offsets=[2500000], isid_explicit={}, excluded_vlans=set(),
                  ssh=SshSettings())
+    # MAC/optic collection is opt-in (pull_macs) so plain audits stay fast
     audit = collect_switch(
         SwitchTarget("gx-11-s72-p1", "gx-11-s72-p1", Platform.VOSS),
-        OfflineRunner("gx-11-s72-p1", tmp_path), cfg)
+        OfflineRunner("gx-11-s72-p1", tmp_path), cfg, pull_macs=True)
     by_port = {p.port: p for p in audit.ports}
     # port MACs land on the right port ('Port-1/7')
     assert by_port["1/7"].macs == ["00:11:22:00:00:01", "00:11:22:00:00:02"]
@@ -179,3 +180,22 @@ def test_collector_attributes_macs_and_lacp_from_real_capture(tmp_path):
     # LACP comes from the show mlt LACP table (MLT 196 is enabled there)
     assert by_port["1/10"].lacp is True
     assert by_port["1/1"].lacp is False        # MLT 35: LACP disabled
+
+
+def test_macs_not_collected_unless_requested(tmp_path):
+    # a plain audit must not send 'show mac-address-table' (it can be a large
+    # output on a busy switch) - the MLT/VLAN/LACP derivations still happen
+    dev = tmp_path / "gx-11-s72-p1"
+    shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
+    (dev / "show_mac_address_table.txt").write_text(VOSS_MACS)
+
+    cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
+                 isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
+    audit = collect_switch(
+        SwitchTarget("gx-11-s72-p1", "gx-11-s72-p1", Platform.VOSS),
+        OfflineRunner("gx-11-s72-p1", tmp_path), cfg)          # pull_macs=False
+    by_port = {p.port: p for p in audit.ports}
+    assert by_port["1/7"].macs == []
+    # the free derivations are still there
+    assert by_port["1/1"].mlt_id == 35
+    assert by_port["1/1"].lacp is False

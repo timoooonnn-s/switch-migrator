@@ -108,6 +108,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="also print the ports/MLTs/fabric tables to the console")
     parser.add_argument("--debug", action="store_true",
                         help="debug logging (includes netmiko)")
+    parser.add_argument("--menu", action="store_true",
+                        help="open the interactive toolkit menu (also the "
+                             "default when no arguments are given): select "
+                             "switches, collect once, then produce any output "
+                             "from that same data")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -156,13 +161,28 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         return failed
     try:
         return collect_switch(target, runner, cfg,
-                              pull_config=args.extract_config)
+                              pull_config=args.extract_config,
+                              pull_macs=getattr(args, "migration_sheets", False))
     except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
         failed.errors.append(f"collection crashed: {exc.__class__.__name__}: {exc}")
         log.exception("[%s] collection crashed", target.name)
         return failed
     finally:
         runner.close()
+
+
+def run_collection(targets: list[SwitchTarget], creds: Credentials, cfg: Config,
+                   args: argparse.Namespace) -> list[SwitchAudit]:
+    """Collect every target in parallel, name-sorted. Shared by the flag
+    interface and the interactive menu so both behave identically."""
+    audits: list[SwitchAudit] = []
+    with cf.ThreadPoolExecutor(max_workers=cfg.ssh.workers) as pool:
+        futures = [pool.submit(audit_one_switch, t, creds, cfg, args)
+                   for t in targets]
+        for future in cf.as_completed(futures):
+            audits.append(future.result())
+    audits.sort(key=lambda a: a.name)
+    return audits
 
 
 def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
@@ -233,9 +253,17 @@ def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else argv
     args = build_arg_parser().parse_args(argv)
     console = Console(stderr=True)
     setup_logging(args.output_dir, args.debug)
+
+    # No arguments at all (or an explicit --menu): open the interactive toolkit
+    # menu. Every flag keeps working exactly as before.
+    if args.menu or not raw_argv:
+        from switch_migrator.menu import run_menu
+        return run_menu(config_path=args.config, inventory_path=args.inventory,
+                        output_dir=args.output_dir)
 
     try:
         cfg = load_config(args.config, require_fabric=not args.no_fabric)
@@ -290,14 +318,8 @@ def main(argv: list[str] | None = None) -> int:
                          if fabric.dvr_errors else ""))
 
     # 2) Legacy switches in parallel
-    audits: list[SwitchAudit] = []
     with console.status(f"Auditing {len(targets)} switch(es)..."):
-        with cf.ThreadPoolExecutor(max_workers=cfg.ssh.workers) as pool:
-            futures = {pool.submit(audit_one_switch, t, creds, cfg, args): t
-                       for t in targets}
-            for future in cf.as_completed(futures):
-                audits.append(future.result())
-    audits.sort(key=lambda a: a.name)
+        audits = run_collection(targets, creds, cfg, args)
 
     # unreachable devices go to the report too, but say it loudly right away
     for audit in audits:

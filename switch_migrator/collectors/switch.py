@@ -27,7 +27,8 @@ def _is_core_neighbor(sysname: str, patterns: list[str]) -> bool:
 
 
 def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
-                   pull_config: bool = False) -> SwitchAudit:
+                   pull_config: bool = False,
+                   pull_macs: bool = False) -> SwitchAudit:
     audit = SwitchAudit(name=target.name, host=target.host,
                         platform=target.platform, reachable=True)
     # session-setup problems (e.g. paging disable rejected) must be visible
@@ -36,7 +37,7 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
         _collect_voss(audit, runner)
     else:
         _collect_ers(audit, runner)
-    _enrich(audit, runner, cfg)
+    _enrich(audit, runner, cfg, pull_macs=pull_macs)
     # running-config is only pulled for the --extract-config feature (VOSS:
     # filter+neutralize; ERS: translate to VOSS flex-UNI)
     if pull_config:
@@ -94,6 +95,11 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     out = _run(audit, runner, "show mlt", required=True)
     if out:
         audit.mlts = voss_parsers.parse_mlt(out)
+        # LACP admin state comes from the same output - parse it here rather
+        # than sending 'show mlt' a second time later
+        lacp = voss_parsers.parse_mlt_lacp(out)
+        for mlt in audit.mlts:
+            mlt.lacp = lacp.get(mlt.mlt_id)
     out = _run(audit, runner, "show virtual-ist", required=False)
     if out:
         audit.ist = voss_parsers.parse_virtual_ist(out)
@@ -117,8 +123,12 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     # `show vlan i-sid` may not list
     out = _run(audit, runner, "show interfaces gigabitEthernet i-sid", required=False)
     if out:
+        port_isid_rows = voss_parsers.parse_port_isid(out)
+        # keep them for the per-port VLAN/I-SID columns (flex-UNI boxes have no
+        # platform-VLAN members) instead of re-running the command later
+        audit.port_isid_rows = port_isid_rows
         by_vlan = {v.vlan_id: v for v in audit.vlans}
-        for row in voss_parsers.parse_port_isid(out):
+        for row in port_isid_rows:
             if row["vlan"] is None:
                 continue
             existing = by_vlan.get(row["vlan"])
@@ -151,24 +161,23 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
         audit.vlans = ers_parsers.parse_vlans(out)
 
 
-def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner) -> None:
+def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
+                             pull_macs: bool = False) -> None:
     """Per-port data the migration sheets need: MLT membership + LACP, VLANs and
-    their I-SIDs, tagging, learned MACs and the pluggable optic."""
+    their I-SIDs, tagging, and - when pull_macs is set - learned MACs and the
+    pluggable optic. Everything except the MAC/optics fetch is derived from data
+    already collected, so it costs no extra commands.
+    """
     by_port = {p.port: p for p in audit.ports}
 
-    # --- MLT membership (+ LACP, VOSS reads it from the show mlt LACP table)
-    lacp_by_mlt: dict[int, bool] = {}
-    if audit.platform is Platform.VOSS:
-        out = _run(audit, runner, "show mlt", required=False, absent_ok=True)
-        if out:
-            lacp_by_mlt = voss_parsers.parse_mlt_lacp(out)
+    # --- MLT membership (+ LACP, parsed earlier from the same show mlt output)
     for mlt in audit.mlts:
         for member in mlt.members:
             port = by_port.get(member)
             if port is None:
                 continue
             port.mlt_id, port.mlt_name = mlt.mlt_id, mlt.name
-            port.lacp = lacp_by_mlt.get(mlt.mlt_id)
+            port.lacp = mlt.lacp
 
     # --- VLANs / I-SIDs per port (reverse of the VLAN member lists)
     isid_of = {v.vlan_id: v.isid for v in audit.vlans}
@@ -183,20 +192,16 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner) -> None:
             if isid is not None and isid not in port.isids:
                 port.isids.append(isid)
     # On a flex-UNI box the VLANs are not platform-VLAN members but per-port
-    # I-SID bindings, so `show vlan members` yields nothing - take the port's
-    # c-vid/I-SID bindings as the second source.
-    if audit.platform is Platform.VOSS:
-        out = _run(audit, runner, "show interfaces gigabitEthernet i-sid",
-                   required=False, absent_ok=True)
-        if out:
-            for row in voss_parsers.parse_port_isid(out):
-                port = by_port.get(row["port"])
-                if port is None:
-                    continue
-                if row["vlan"] is not None and row["vlan"] not in port.vlans:
-                    port.vlans.append(row["vlan"])
-                if row["isid"] not in port.isids:
-                    port.isids.append(row["isid"])
+    # I-SID bindings, so `show vlan members` yields nothing - use the port
+    # bindings already collected as the second source (no extra command).
+    for row in audit.port_isid_rows:
+        port = by_port.get(row["port"])
+        if port is None:
+            continue
+        if row["vlan"] is not None and row["vlan"] not in port.vlans:
+            port.vlans.append(row["vlan"])
+        if row["isid"] not in port.isids:
+            port.isids.append(row["isid"])
     for port in audit.ports:
         port.vlans.sort()
         port.isids.sort()
@@ -206,6 +211,9 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner) -> None:
             port.tagging = "tagged"
         elif len(port.vlans) == 1:
             port.tagging = "untagged"
+
+    if not pull_macs:
+        return
 
     # --- learned MACs (capped per port; MLT entries fan out to their members)
     out = _run(audit, runner, "show mac-address-table", required=False, absent_ok=True)
@@ -240,7 +248,8 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner) -> None:
                         port.transceiver = " ".join(tokens[1:4])[:40]
 
 
-def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
+def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,
+            pull_macs: bool = False) -> None:
     """LLDP neighbor names, uplink flags and MLT member-up counts."""
     # Platform-native command first; the other form only as fallback. VOSS has
     # the compact one-line-per-neighbor summary (preferred - stays small on
@@ -291,7 +300,7 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
         mlt.is_uplink = any(
             p.is_uplink for p in audit.ports if p.port in mlt.members)
 
-    _enrich_migration_fields(audit, runner)
+    _enrich_migration_fields(audit, runner, pull_macs=pull_macs)
 
     if audit.ist is not None and audit.ist.session_up is False:
         audit.warnings.append(
