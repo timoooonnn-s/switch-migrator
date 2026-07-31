@@ -40,6 +40,12 @@ from switch_migrator.connection import (
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator.report import console as console_report
+from switch_migrator.report.migration import (
+    assign_port_uids,
+    build_cabling,
+    build_commands,
+    build_port_info,
+)
 from switch_migrator.report.excel import write_csv, write_excel
 from switch_migrator.report.tables import build_all
 
@@ -77,6 +83,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "(port/MLT/VLAN/I-SID only, secrets & identity "
                              "removed, uplinks annotated) to "
                              "<output>/config/<device>.cfg. Review before use.")
+    parser.add_argument("--migration-sheets", action="store_true",
+                        help="add the migration-day deliverables: a per-port "
+                             "info sheet, a DC cabling sheet (connected ports, "
+                             "with empty NEW switch/port columns) and a "
+                             "commands file with per-port MAC checks for the "
+                             "new switch. Combine with --extract-config to "
+                             "include the device config in that file.")
+    parser.add_argument("--new-switch", metavar="NAME", default="",
+                        help="name of the target switch, used in the "
+                             "--migration-sheets command file")
     parser.add_argument("--csv", action="store_true",
                         help="additionally export the tables as CSV files")
     parser.add_argument("--no-excel", action="store_true",
@@ -296,6 +312,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # 4) Report
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
+    if args.migration_sheets:
+        assign_port_uids(audits)
+        tables += [build_port_info(audits), build_cabling(audits)]
     console_report.render(tables, Console(), verbose=args.verbose)
 
     written: list[Path] = []
@@ -309,6 +328,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.extract_config:
         written.extend(_write_config_extracts(
             audits, args.output_dir, comparisons, cfg, console))
+    if args.migration_sheets:
+        cmd_path = args.output_dir / f"migration-commands-{stamp}.txt"
+        cmd_path.write_text(build_commands(audits, new_switch=args.new_switch))
+        written.append(cmd_path)
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 

@@ -115,6 +115,44 @@ def parse_mlt(output: str) -> list[MltState]:
     return mlts
 
 
+def parse_mlt_lacp(output: str) -> dict[int, bool]:
+    """Parse the LACP table of `show mlt` -> {mlt_id: lacp_admin_enabled}.
+
+    Second table of the plain `show mlt` output:
+        MLTID IFINDEX  DESIGNATED PORTS  LACP ADMIN  LACP OPER
+        197   6340     1/43              enable      up
+    Scoped to the section that follows a header carrying 'LACP', and rows are
+    only accepted when they hold an enable/disable token - so the Mlt Info and
+    ENCAP tables (which also start with an id) can never be misread.
+    """
+    result: dict[int, bool] = {}
+    in_section = False
+    saw_lacp = False           # the real header spans TWO lines:
+    for line in output.splitlines():          # '... LACP  LACP' then 'MLTID ...'
+        upper = line.upper()
+        if "MLTID" in upper:
+            in_section = "LACP" in upper or saw_lacp
+            saw_lacp = False
+            continue
+        if "LACP" in upper and not in_section:
+            saw_lacp = True
+            continue
+        if not in_section:
+            continue
+        if "OUT OF" in upper and "TOTAL" in upper:
+            in_section = False
+            continue
+        tokens = line.split()
+        if not tokens or not tokens[0].isdigit():
+            continue
+        admin = next((t.lower() for t in tokens
+                      if t.lower() in ("enable", "disable",
+                                       "enabled", "disabled")), None)
+        if admin is not None:
+            result[int(tokens[0])] = admin.startswith("enable")
+    return result
+
+
 def _parse_mlt_datapath(output: str) -> dict[int, bool]:
     """Parse the "WHICH PORTS PROGRAMMED IN DATA PATH" table of `show mlt`.
 

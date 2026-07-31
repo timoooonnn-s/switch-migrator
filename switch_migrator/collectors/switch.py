@@ -10,9 +10,14 @@ from switch_migrator.connection import BaseRunner, CommandError
 from switch_migrator.models import Platform, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
 from switch_migrator.parsers.common import (
+    PORT_RE,
     parse_lldp_neighbors,
     parse_lldp_neighbors_summary,
+    parse_mac_table,
 )
+
+# how many learned MACs are kept per port for the migration sheet
+MAC_CAP = 10
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +151,95 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
         audit.vlans = ers_parsers.parse_vlans(out)
 
 
+def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner) -> None:
+    """Per-port data the migration sheets need: MLT membership + LACP, VLANs and
+    their I-SIDs, tagging, learned MACs and the pluggable optic."""
+    by_port = {p.port: p for p in audit.ports}
+
+    # --- MLT membership (+ LACP, VOSS reads it from the show mlt LACP table)
+    lacp_by_mlt: dict[int, bool] = {}
+    if audit.platform is Platform.VOSS:
+        out = _run(audit, runner, "show mlt", required=False, absent_ok=True)
+        if out:
+            lacp_by_mlt = voss_parsers.parse_mlt_lacp(out)
+    for mlt in audit.mlts:
+        for member in mlt.members:
+            port = by_port.get(member)
+            if port is None:
+                continue
+            port.mlt_id, port.mlt_name = mlt.mlt_id, mlt.name
+            port.lacp = lacp_by_mlt.get(mlt.mlt_id)
+
+    # --- VLANs / I-SIDs per port (reverse of the VLAN member lists)
+    isid_of = {v.vlan_id: v.isid for v in audit.vlans}
+    for vlan in audit.vlans:
+        for member in vlan.members:
+            port = by_port.get(member)
+            if port is None:
+                continue
+            if vlan.vlan_id not in port.vlans:
+                port.vlans.append(vlan.vlan_id)
+            isid = isid_of.get(vlan.vlan_id)
+            if isid is not None and isid not in port.isids:
+                port.isids.append(isid)
+    # On a flex-UNI box the VLANs are not platform-VLAN members but per-port
+    # I-SID bindings, so `show vlan members` yields nothing - take the port's
+    # c-vid/I-SID bindings as the second source.
+    if audit.platform is Platform.VOSS:
+        out = _run(audit, runner, "show interfaces gigabitEthernet i-sid",
+                   required=False, absent_ok=True)
+        if out:
+            for row in voss_parsers.parse_port_isid(out):
+                port = by_port.get(row["port"])
+                if port is None:
+                    continue
+                if row["vlan"] is not None and row["vlan"] not in port.vlans:
+                    port.vlans.append(row["vlan"])
+                if row["isid"] not in port.isids:
+                    port.isids.append(row["isid"])
+    for port in audit.ports:
+        port.vlans.sort()
+        port.isids.sort()
+        # a port carrying several VLANs must be tagged; a single VLAN is
+        # normally the untagged/native one. Left blank when unknown.
+        if len(port.vlans) > 1:
+            port.tagging = "tagged"
+        elif len(port.vlans) == 1:
+            port.tagging = "untagged"
+
+    # --- learned MACs (capped per port; MLT entries fan out to their members)
+    out = _run(audit, runner, "show mac-address-table", required=False, absent_ok=True)
+    if out:
+        table = parse_mac_table(out)
+        by_mlt = {m.mlt_id: m for m in audit.mlts}
+        for key, entries in table.items():
+            targets: list = []
+            if key.startswith("mlt:"):
+                mlt = by_mlt.get(int(key.split(":", 1)[1]))
+                targets = [by_port[m] for m in (mlt.members if mlt else [])
+                           if m in by_port]
+            elif key in by_port:
+                targets = [by_port[key]]
+            for port in targets:
+                for mac, _vlan in entries:
+                    port.mac_total += 1
+                    if len(port.macs) < MAC_CAP and mac not in port.macs:
+                        port.macs.append(mac)
+
+    # --- pluggable optics (VOSS); the media type itself is already in the
+    # port DESCRIPTION column, this adds the vendor/part when available
+    if audit.platform is Platform.VOSS:
+        out = _run(audit, runner, "show pluggable-optical-modules basic",
+                   required=False, absent_ok=True)
+        if out:
+            for line in out.splitlines():
+                tokens = line.split()
+                if len(tokens) >= 2 and PORT_RE.match(tokens[0]) and "/" in tokens[0]:
+                    port = by_port.get(tokens[0])
+                    if port is not None and not port.transceiver:
+                        port.transceiver = " ".join(tokens[1:4])[:40]
+
+
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
     """LLDP neighbor names, uplink flags and MLT member-up counts."""
     # Platform-native command first; the other form only as fallback. VOSS has
@@ -196,6 +290,8 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config) -> None:
             if have_port_state else None)
         mlt.is_uplink = any(
             p.is_uplink for p in audit.ports if p.port in mlt.members)
+
+    _enrich_migration_fields(audit, runner)
 
     if audit.ist is not None and audit.ist.session_up is False:
         audit.warnings.append(

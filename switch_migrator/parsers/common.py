@@ -60,6 +60,70 @@ def expand_port_list(raw: str) -> list[str]:
     return ports
 
 
+MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}[:.-]){5}[0-9a-fA-F]{2}$"
+                    r"|^(?:[0-9a-fA-F]{4}\.){2}[0-9a-fA-F]{4}$")
+
+
+def normalize_mac(raw: str) -> str:
+    """'00:11:22:33:44:55' / '0011.2233.4455' / '00-11-22-33-44-55' -> lower
+    colon form, so MACs from different platforms compare and sort alike."""
+    hexs = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+    if len(hexs) != 12:
+        return raw.strip().lower()
+    return ":".join(hexs[i:i + 2] for i in range(0, 12, 2))
+
+
+def parse_mac_table(output: str) -> dict[str, list[tuple[str, int | None]]]:
+    """`show mac-address-table` (VOSS and ERS/BOSS) -> {port: [(mac, vlan)]}.
+
+    Column order differs across platforms and releases, so rows are matched by
+    SHAPE rather than position: a line is a MAC entry when it contains exactly
+    one MAC-shaped token and one port-shaped token; the VLAN is the first small
+    integer (1-4094) that is not the port. Header, banner and footer lines carry
+    no MAC and are skipped. MLT entries ('mlt 1' / 'MLT-1') are attributed to
+    that MLT rather than a port and are returned under the 'mlt:<id>' key.
+    """
+    result: dict[str, list[tuple[str, int | None]]] = {}
+    for line in output.splitlines():
+        tokens = line.split()
+        macs = [t for t in tokens if MAC_RE.match(t)]
+        if len(macs) != 1:
+            continue
+        mac = normalize_mac(macs[0])
+        # VOSS prefixes the interface column ('Port-1/7', 'Mlt-35'); strip it
+        rest = []
+        for t in tokens:
+            if MAC_RE.match(t):
+                continue
+            m = re.match(r"^Port-?(\d+(?:/\d+){0,2})$", t, re.IGNORECASE)
+            if m:
+                rest.append(m.group(1))
+                continue
+            rest.append(t)
+        port = next((t for t in rest if PORT_RE.match(t) and "/" in t), None)
+        if port is None:
+            # ERS ports are bare numbers; an MLT reference wins over a number
+            mlt = next((t for i, t in enumerate(rest)
+                        if t.lower() in ("mlt", "trunk") and i + 1 < len(rest)
+                        and rest[i + 1].isdigit()), None)
+            if mlt is not None:
+                idx = rest.index(mlt)
+                port = f"mlt:{rest[idx + 1]}"
+            else:
+                m = re.search(r"\bMLT-(\d+)\b", line, re.IGNORECASE)
+                if m:
+                    port = f"mlt:{m.group(1)}"
+                else:
+                    cands = [t for t in rest if PORT_RE.match(t)]
+                    port = cands[-1] if cands else None
+        if port is None:
+            continue
+        vlan = next((int(t) for t in rest
+                     if t.isdigit() and t != port and 1 <= int(t) <= 4094), None)
+        result.setdefault(port, []).append((mac, vlan))
+    return result
+
+
 def parse_lldp_neighbors_summary(output: str) -> dict[str, LldpNeighbor]:
     """`show lldp neighbor summary` -> {local_port: LldpNeighbor}.
 

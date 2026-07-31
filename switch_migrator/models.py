@@ -36,6 +36,23 @@ class PortState:
     lldp_neighbor_ip: str = ""    # neighbor management IP, when it advertises one
     lldp_sys_descr: str = ""      # neighbor SysDescr (e.g. 'HPE ProLiant DL380 Gen10')
     is_uplink: bool = False
+    # --- migration-sheet fields -------------------------------------------
+    uid: str = ""                 # sequential migration ID (P0001), assigned per run
+    macs: list[str] = field(default_factory=list)   # learned MACs (capped)
+    mac_total: int = 0            # how many were learned in total (before the cap)
+    transceiver: str = ""         # pluggable optic type/vendor, when readable
+    lacp: bool | None = None      # LACP enabled on the port's MLT
+    mlt_id: int | None = None
+    mlt_name: str = ""
+    tagging: str = ""             # tagged / untagged / mixed / ""
+    vlans: list[int] = field(default_factory=list)  # VLANs configured on the port
+    isids: list[int] = field(default_factory=list)  # I-SIDs of those VLANs
+
+    @property
+    def media(self) -> str:
+        """Physical media from the Port Interface DESCRIPTION column
+        (10GbSR, Gbic1000BaseT, 40GbCR4, ...)."""
+        return self.description
 
 
 @dataclass

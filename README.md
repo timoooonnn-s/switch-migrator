@@ -147,7 +147,34 @@ switch-migrator -c config.yaml -i isolated.yaml --no-fabric
 # Also pull each VOSS switch's running-config and write a neutralized,
 # migration-ready extract (port/MLT/VLAN/I-SID only) to <output>/config/
 switch-migrator -i switches.yaml --extract-config
+
+# Migration-day deliverables: port info sheet + DC cabling sheet + commands
+switch-migrator -i switches.yaml --migration-sheets --new-switch new-sw-01 \
+                --extract-config
 ```
+
+### Migration sheets (`--migration-sheets`)
+
+Adds the two worksheets you take into the migration window, plus a commands
+file. Every port gets a **sequential migration ID** (`P0001`, …) assigned across
+the whole run — the key that ties both sheets together when several old
+switches consolidate onto fewer new ones.
+
+* **Port Info** (all ports) — Port ID, switch, port, device on the port (LLDP
+  name / IP / SysDescr), MAC addresses, tagging, VLAN IDs, I-SIDs, admin & oper
+  state, LACP, MLT ID & name, transceiver, media, uplink flag.
+* **Cabling** (connected ports only — what actually gets re-patched) — first
+  VLAN, type (access/mlt/uplink), Port ID, end device / neighbor, **empty NEW
+  switch + NEW port columns for the technicians to fill in**, old switch, old
+  port, MAC addresses and physical media.
+* **`migration-commands-<stamp>.txt`** — per-port `show mac-address-table`
+  commands to run on the **new** switch (each annotated with the Port ID, the
+  old switch/port and the MACs to expect), a post-migration state overview, and
+  — when combined with `--extract-config` — the neutralized device config ready
+  to copy.
+
+MAC addresses are capped at 10 per port with a `(+N more)` note. Pass
+`--new-switch NAME` to name the target device in the commands file.
 
 ### Config extraction (`--extract-config`, VOSS)
 
