@@ -161,6 +161,45 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
         audit.vlans = ers_parsers.parse_vlans(out)
 
 
+def _collect_fdb(audit: SwitchAudit, runner: BaseRunner,
+                 by_port: dict) -> dict[str, list[tuple[str, int | None]]]:
+    """Learned MAC addresses per port.
+
+    VOSS has no `show mac-address-table`; the forwarding database is read per
+    port with `show interfaces gigabitEthernet fdb-entry [<port>]`. The bare
+    form (whole box in one command) is tried first; if the release insists on a
+    port argument, fall back to asking only the ports that are operationally UP
+    - a down port has nothing learned, and this keeps a 48-port box from costing
+    48 commands. ERS/BOSS keeps the classic `show mac-address-table`.
+    """
+    if audit.platform is not Platform.VOSS:
+        out = _run(audit, runner, "show mac-address-table",
+                   required=False, absent_ok=True)
+        return parse_mac_table(out) if out else {}
+
+    out = _run(audit, runner, "show interfaces gigabitEthernet fdb-entry",
+               required=False, absent_ok=True)
+    if out:
+        table = parse_mac_table(out)
+        if table:
+            return table
+
+    table: dict[str, list[tuple[str, int | None]]] = {}
+    up_ports = [p.port for p in audit.ports if p.oper_up]
+    if not up_ports:
+        return table
+    log.info("[%s] per-port FDB fallback for %d up port(s)",
+             audit.name, len(up_ports))
+    for port in up_ports:
+        out = _run(audit, runner,
+                   f"show interfaces gigabitEthernet fdb-entry {port}",
+                   required=False, absent_ok=True)
+        if out:
+            for key, entries in parse_mac_table(out).items():
+                table.setdefault(key, []).extend(entries)
+    return table
+
+
 def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
                              pull_macs: bool = False) -> None:
     """Per-port data the migration sheets need: MLT membership + LACP, VLANs and
@@ -216,9 +255,8 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
         return
 
     # --- learned MACs (capped per port; MLT entries fan out to their members)
-    out = _run(audit, runner, "show mac-address-table", required=False, absent_ok=True)
-    if out:
-        table = parse_mac_table(out)
+    table = _collect_fdb(audit, runner, by_port)
+    if table:
         by_mlt = {m.mlt_id: m for m in audit.mlts}
         for key, entries in table.items():
             targets: list = []

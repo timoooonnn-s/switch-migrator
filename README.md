@@ -207,14 +207,21 @@ switches consolidate onto fewer new ones.
   VLAN, type (access/mlt/uplink), Port ID, end device / neighbor, **empty NEW
   switch + NEW port columns for the technicians to fill in**, old switch, old
   port, MAC addresses and physical media.
-* **`migration-commands-<stamp>.txt`** — per-port `show mac-address-table`
-  commands to run on the **new** switch (each annotated with the Port ID, the
+* **`migration-commands-<stamp>.txt`** — per-port
+  `show interfaces gigabitEthernet fdb-entry` commands to run on the **new**
+  switch (each annotated with the Port ID, the
   old switch/port and the MACs to expect), a post-migration state overview, and
   — when combined with `--extract-config` — the neutralized device config ready
   to copy.
 
 MAC addresses are capped at 10 per port with a `(+N more)` note. Pass
 `--new-switch NAME` to name the target device in the commands file.
+
+VOSS has **no** `show mac-address-table`; the forwarding database is read with
+`show interfaces gigabitEthernet fdb-entry`. The bare form (whole box, one
+command) is tried first, and releases that insist on a port argument fall back
+to querying only the ports that are operationally **up**. ERS/BOSS uses the
+classic `show mac-address-table`.
 
 ### Config extraction (`--extract-config`, VOSS)
 

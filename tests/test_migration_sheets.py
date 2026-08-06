@@ -20,17 +20,22 @@ from switch_migrator.report.migration import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+# real VOSS 'show interfaces gigabitEthernet fdb-entry' output ("Port Fdb"):
+# VOSS has NO 'show mac-address-table'.
 VOSS_MACS = """\
-================================================================================
-                              Vlan Fdb Info
-================================================================================
-VLAN                                       SMLT
-ID    STATUS     MAC-ADDRESS       INTERFACE REMOTE  TUNNEL
-------------------------------------------------------------------------
-695   learned    00:11:22:00:00:01 Port-1/7   false   -
-695   learned    00:11:22:00:00:02 Port-1/7   false   -
-174   learned    00:11:22:00:00:04 Mlt-35     false   -
-2 out of 2 entries in all fdb(s) displayed.
+====================================================================================================
+                                    Port Fdb
+====================================================================================================
+VLAN            MAC                           SMLT
+ID   STATUS     ADDRESS            INTERFACE  REMOTE
+----------------------------------------------------------------------------------------------------
+695  learned    00:11:22:00:00:01  Port-1/7      false
+695  learned    00:11:22:00:00:02  Port-1/7      false
+174  learned    00:11:22:00:00:04  Mlt-35        false
+
+c: customer vid   u: untagged-traffic
+
+3 out of 7 entries in all fdb(s) displayed.
 """
 
 ERS_MACS = """\
@@ -153,7 +158,7 @@ def test_commands_reference_new_switch_and_expected_macs():
     assign_port_uids([a])
     text = build_commands([a], new_switch="new-01")
     assert "new-01" in text
-    assert "show mac-address-table port <NEW-PORT>" in text
+    assert "show interfaces gigabitEthernet fdb-entry <NEW-PORT>" in text
     assert "P0001" in text and "00:11:22:00:00:01" in text
     assert "was old-01 1/1" in text
 
@@ -163,7 +168,7 @@ def test_commands_reference_new_switch_and_expected_macs():
 def test_collector_attributes_macs_and_lacp_from_real_capture(tmp_path):
     dev = tmp_path / "gx-11-s72-p1"
     shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
-    (dev / "show_mac_address_table.txt").write_text(VOSS_MACS)
+    (dev / "show_interfaces_gigabitethernet_fdb_entry.txt").write_text(VOSS_MACS)
 
     cfg = Config(dvr_controllers=[], core_switch_patterns=["gx-11-s74-*"],
                  isid_offsets=[2500000], isid_explicit={}, excluded_vlans=set(),
@@ -187,7 +192,7 @@ def test_macs_not_collected_unless_requested(tmp_path):
     # output on a busy switch) - the MLT/VLAN/LACP derivations still happen
     dev = tmp_path / "gx-11-s72-p1"
     shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
-    (dev / "show_mac_address_table.txt").write_text(VOSS_MACS)
+    (dev / "show_interfaces_gigabitethernet_fdb_entry.txt").write_text(VOSS_MACS)
 
     cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
                  isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
@@ -199,3 +204,29 @@ def test_macs_not_collected_unless_requested(tmp_path):
     # the free derivations are still there
     assert by_port["1/1"].mlt_id == 35
     assert by_port["1/1"].lacp is False
+
+
+def test_fdb_per_port_fallback_when_bare_form_rejected(tmp_path):
+    # some releases insist on a port argument. The bare command then fails and
+    # the collector must fall back to asking each UP port individually.
+    dev = tmp_path / "sw"
+    shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
+    invalid = "                     ^\n% Invalid input detected at '^' marker.\n"
+    (dev / "show_interfaces_gigabitethernet_fdb_entry.txt").write_text(invalid)
+    # per-port captures for two of the up ports (1/7 and 1/10)
+    (dev / "show_interfaces_gigabitethernet_fdb_entry_1_7.txt").write_text(
+        "VLAN ID   STATUS     ADDRESS            INTERFACE  REMOTE\n"
+        "695  learned    00:11:22:00:00:aa  Port-1/7      false\n")
+    (dev / "show_interfaces_gigabitethernet_fdb_entry_1_10.txt").write_text(
+        "VLAN ID   STATUS     ADDRESS            INTERFACE  REMOTE\n"
+        "735  learned    00:11:22:00:00:bb  Port-1/10     false\n")
+
+    cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
+                 isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
+    audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
+                           OfflineRunner("sw", tmp_path), cfg, pull_macs=True)
+    by_port = {p.port: p for p in audit.ports}
+    assert by_port["1/7"].macs == ["00:11:22:00:00:aa"]
+    assert by_port["1/10"].macs == ["00:11:22:00:00:bb"]
+    # the failed bare attempt and the missing per-port captures stay quiet
+    assert not [w for w in audit.warnings if "fdb-entry" in w]

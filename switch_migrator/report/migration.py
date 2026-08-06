@@ -117,7 +117,7 @@ def build_commands(audits: list[SwitchAudit], new_switch: str = "") -> str:
         for p in connected:
             expect = _macs_cell(p) or "(no MACs learned)"
             out.append(f"# {p.uid}  old {audit.name} {p.port}  expect: {expect}")
-            out.append(f"show mac-address-table port <NEW-PORT>   "
+            out.append(f"show interfaces gigabitEthernet fdb-entry <NEW-PORT>   "
                        f"# was {audit.name} {p.port}")
         out.append("")
 
