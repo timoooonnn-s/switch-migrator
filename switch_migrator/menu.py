@@ -12,6 +12,7 @@ point, not a replacement.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,9 @@ from switch_migrator.config import (
     parse_switch_arg,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
+from switch_migrator import manifest as manifest_mod
+from switch_migrator import snapshot as snapshot_mod
+from switch_migrator.report.progress import make_progress
 
 
 @dataclass
@@ -43,6 +47,7 @@ class Session:
     output_dir: Path = Path("output")
     offline_dir: Path | None = None
     save_raw: bool = False
+    write_manifest: bool = False
     new_switch: str = ""
     # collected data
     audits: list[SwitchAudit] = field(default_factory=list)
@@ -51,6 +56,9 @@ class Session:
     collected_fabric: bool = False
     collected_config: bool = False
     collected_macs: bool = False
+    # provenance: set when the data came from a snapshot rather than devices
+    loaded_from: Path | None = None
+    commands_by_device: dict = field(default_factory=dict)
 
     @property
     def has_data(self) -> bool:
@@ -65,7 +73,8 @@ class Session:
             extract_config=False, migration_sheets=False,
             new_switch=self.new_switch, csv=False, no_excel=False,
             save_raw=self.save_raw, offline=self.offline_dir, verbose=False,
-            debug=False,
+            debug=False, dry_run=False, save_snapshot=None, from_snapshot=None,
+            manifest=self.write_manifest,
         )
         base.update(over)
         return argparse.Namespace(**base)
@@ -104,13 +113,17 @@ def _status_panel(s: Session) -> Panel:
             extras.append("running-config")
         if s.collected_macs:
             extras.append("MACs")
-        lines.append(f"[bold green]Data:[/bold green]      collected {when} "
+        source = f"loaded from {s.loaded_from.name}" if s.loaded_from \
+            else f"collected {when}"
+        lines.append(f"[bold green]Data:[/bold green]      {source} "
                      f"({len(s.audits)} switch(es)"
                      + (f", incl. {', '.join(extras)}" if extras else "") + ")")
     else:
         lines.append("[bold yellow]Data:[/bold yellow]      not collected yet")
     return Panel("\n".join(lines), title="switch-migrator", title_align="left")
 
+
+_NEEDS_DATA = ("3", "4", "5", "6", "7")
 
 _ENTRIES = [
     ("1", "Select switches", "pick targets from the inventory or add them by hand"),
@@ -120,7 +133,9 @@ _ENTRIES = [
     ("5", "Migration sheets", "port info + DC cabling sheet + MAC-check commands"),
     ("6", "Config extract", "neutralized VOSS config / generated ERS->VOSS draft"),
     ("7", "Everything", "run 3-6 in one go with the collected data"),
-    ("8", "Settings", "output directory, offline replay, target switch name"),
+    ("8", "Snapshot", "save this session's data, or load an earlier one"),
+    ("9", "Dry run", "list every command a collection would send - connects to nothing"),
+    ("s", "Settings", "output directory, offline replay, manifest, target switch"),
     ("0", "Quit", ""),
 ]
 
@@ -131,7 +146,7 @@ def _menu_table(s: Session) -> RichTable:
     t.add_column(style="bold")
     t.add_column(style="dim")
     for key, label, hint in _ENTRIES:
-        needs_data = key in ("3", "4", "5", "6", "7") and not s.has_data
+        needs_data = key in _NEEDS_DATA and not s.has_data
         style = "dim" if needs_data else None
         suffix = "  (collect first)" if needs_data else ""
         t.add_row(key, label + suffix, hint, style=style)
@@ -218,10 +233,21 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
 
     args = s.to_args(no_fabric=not want_fabric, extract_config=want_config,
                      migration_sheets=want_macs)
+    started = datetime.now()
+    commands: dict = {}
     fabric = FabricState()
+    # the fabric read and the switch reads are independent - overlap them so
+    # the DvR round-trip is not in front of every device
+    with make_progress(console, len(s.selected),
+                       len(s.cfg.dvr_controllers) if want_fabric else 0) as prog:
+        with cf.ThreadPoolExecutor(max_workers=1) as pool:
+            future = (pool.submit(collect_fabric, s.cfg.dvr_controllers,
+                                  dvr_creds, s.cfg, args, prog)
+                      if want_fabric else None)
+            audits = run_collection(s.selected, creds, s.cfg, args, prog, commands)
+            if future is not None:
+                fabric = future.result()
     if want_fabric:
-        with console.status("Collecting fabric state from DvR controllers..."):
-            fabric = collect_fabric(s.cfg.dvr_controllers, dvr_creds, s.cfg, args)
         if not fabric.dvrs_ok:
             console.print("[red]No DvR controller could be read - continuing "
                           "without fabric data (audit comparison unavailable).[/red]")
@@ -230,20 +256,26 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
             console.print(f"[green]Fabric: {len(fabric.isids)} I-SIDs from "
                           f"{', '.join(fabric.dvrs_ok)}[/green]")
 
-    with console.status(f"Collecting from {len(s.selected)} switch(es)..."):
-        audits = run_collection(s.selected, creds, s.cfg, args)
-
     s.audits, s.fabric = audits, fabric
     s.collected_at = datetime.now()
     s.collected_fabric = want_fabric
     s.collected_config = want_config
     s.collected_macs = want_macs
+    s.loaded_from = None
+    s.commands_by_device = commands
     ok = sum(1 for a in audits if a.reachable)
     console.print(f"[green]Collected {ok}/{len(audits)} switch(es).[/green]")
     for a in audits:
         if not a.reachable:
             console.print(f"  [red]UNREACHABLE {a.name}: "
                           f"{a.errors[-1] if a.errors else 'unknown'}[/red]")
+    if s.write_manifest:
+        s.output_dir.mkdir(parents=True, exist_ok=True)
+        path = manifest_mod.write(
+            s.output_dir / f"manifest-{started.strftime('%Y%m%d-%H%M%S')}.json",
+            manifest_mod.build(audits, fabric, args, started, datetime.now(),
+                               [], commands, config_path=s.config_path))
+        console.print(f"[green]Run manifest:[/green] {path}")
 
 
 def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
@@ -331,6 +363,73 @@ def action_everything(s: Session, console: Console) -> None:
                    title="migration-full")
 
 
+def action_snapshot(s: Session, console: Console) -> None:
+    """Save the session's collected state, or load an earlier one.
+
+    A snapshot makes the collection reusable: the expensive, credential-bound,
+    device-touching part happens once and every report can be rebuilt from the
+    file afterwards - next week, or by a colleague who cannot reach the boxes.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if s.has_data:
+        console.print("[bold]1[/bold] save this session   "
+                      "[bold]2[/bold] load a snapshot (replaces the session data)")
+        choice = _ask(console, "Choose", "1")
+    else:
+        console.print("[dim]Nothing collected yet - loading a snapshot.[/dim]")
+        choice = "2"
+
+    if choice == "1":
+        default = str(s.output_dir / f"snapshot-{stamp}.json")
+        path = Path(_ask(console, "Snapshot file", default))
+        try:
+            written = snapshot_mod.save(
+                path, s.audits, s.fabric or FabricState(),
+                meta={"collected_at": s.collected_at.isoformat(timespec="seconds")
+                      if s.collected_at else "",
+                      "config": str(s.config_path),
+                      "no_fabric": not s.collected_fabric,
+                      "has_running_config": s.collected_config,
+                      "has_macs": s.collected_macs})
+        except OSError as exc:
+            console.print(f"[red]could not write {path}: {exc}[/red]")
+            return
+        console.print(f"[green]Snapshot written:[/green] {written}")
+        console.print("[dim]It holds device data (hostnames, IPs, MACs, "
+                      "neighbors) - keep it where the switch output belongs.[/dim]")
+        return
+
+    path = Path(_ask(console, "Snapshot file to load"))
+    if not str(path):
+        return
+    try:
+        audits, fabric, meta = snapshot_mod.load(path)
+    except snapshot_mod.SnapshotError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    s.audits, s.fabric = audits, fabric
+    s.loaded_from = path
+    s.collected_at = None
+    s.commands_by_device = {}
+    s.collected_fabric = bool(fabric.dvrs_ok) and not meta.get("no_fabric")
+    s.collected_config = any(a.running_config for a in audits)
+    s.collected_macs = any(p.macs or p.usage for a in audits for p in a.ports)
+    console.print(f"[green]Loaded:[/green] {snapshot_mod.describe(meta, audits)}")
+
+
+def action_dry_run(s: Session, console: Console) -> None:
+    from switch_migrator.cli import preview_commands, render_dry_run
+
+    if not s.selected:
+        console.print("[yellow]No switches selected - use option 1 first.[/yellow]")
+        return
+    want_config = _yes(console, "Include the running-config pull?", False)
+    want_macs = _yes(console, "Include the MAC/optics collection?", True)
+    args = s.to_args(extract_config=want_config, migration_sheets=want_macs)
+    render_dry_run(preview_commands(s.selected, s.cfg, args,
+                                    dvrs=s.cfg.dvr_controllers), console)
+
+
 def action_settings(s: Session, console: Console) -> None:
     out = _ask(console, "Output directory", str(s.output_dir))
     s.output_dir = Path(out)
@@ -344,6 +443,8 @@ def action_settings(s: Session, console: Console) -> None:
     else:
         s.offline_dir = None
     s.save_raw = _yes(console, "Save raw CLI output (--save-raw)?", s.save_raw)
+    s.write_manifest = _yes(console, "Write a run manifest after collecting?",
+                            s.write_manifest)
     s.new_switch = _ask(console, "Name of the NEW switch", s.new_switch)
     console.print("[green]Settings updated.[/green]")
 
@@ -402,13 +503,15 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         "5": lambda: action_sheets(s, console),
         "6": lambda: action_config(s, console),
         "7": lambda: action_everything(s, console),
-        "8": lambda: action_settings(s, console),
+        "8": lambda: action_snapshot(s, console),
+        "9": lambda: action_dry_run(s, console),
+        "s": lambda: action_settings(s, console),
     }
     while True:
         console.print()
         console.print(_status_panel(s))
         console.print(_menu_table(s))
-        choice = _ask(console, "Choose")
+        choice = _ask(console, "Choose").lower()
         if choice in ("0", "q", "quit", "exit", ""):
             console.print("[dim]Bye.[/dim]")
             return 0
@@ -416,7 +519,7 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         if action is None:
             console.print(f"[red]Unknown choice '{choice}'.[/red]")
             continue
-        if choice in ("3", "4", "5", "6", "7") and not s.has_data:
+        if choice in _NEEDS_DATA and not s.has_data:
             console.print("[yellow]Collect from the devices first (option 2).[/yellow]")
             continue
         try:

@@ -84,12 +84,31 @@ excluded_vlans:
 # reported as a fault on a live cable.
 unused_after_days: 30
 
+# --- Learned MAC addresses ----------------------------------------------------
+# How many MACs to keep per port in the migration sheets. Raise it on
+# server-heavy access ports (a virtualization host shows dozens), lower it on
+# busy uplinks. The true number is always reported as '(+N more)' whatever the
+# cap, so lowering it loses detail, never the count.
+mac_cap: 10
+
 # --- SSH settings -----------------------------------------------------------------
 ssh:
   conn_timeout: 20        # seconds to establish the SSH connection
   read_timeout: 60        # seconds to wait for a command to finish
   workers: 4              # parallel device connections
   retries: 1              # reconnect attempts after a connection failure
+
+  # Re-sends of a SINGLE command that died on a transport error (one dropped
+  # read, a stuck --More-- pager). One flaky command should not cost a whole
+  # column of the report. A command the DEVICE rejected ('% Invalid input') is
+  # never retried - that answer will not change.
+  command_retries: 1
+
+  # Consecutive transport failures after which the session for that device is
+  # abandoned, instead of burning read_timeout on every remaining command of a
+  # box that has stopped answering.
+  max_transport_failures: 2
+
   # Old ERS/BOSS gear only speaks SHA-1 kex, CBC ciphers and ssh-rsa/ssh-dss
   # host keys. true appends those to the client's algorithm lists (modern
   # algorithms keep priority, current devices are unaffected). Client-side

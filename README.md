@@ -150,7 +150,9 @@ switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
   5  Migration sheets      port info + DC cabling sheet + MAC-check commands
   6  Config extract        neutralized VOSS config / generated ERS->VOSS draft
   7  Everything            run 3-6 in one go with the collected data
-  8  Settings              output directory, offline replay, target switch name
+  8  Snapshot              save this session's data, or load an earlier one
+  9  Dry run               list every command a collection would send
+  s  Settings              output directory, offline replay, manifest, target switch
   0  Quit
 ```
 
@@ -191,7 +193,70 @@ switch-migrator -i switches.yaml --extract-config
 # Migration-day deliverables: port info sheet + DC cabling sheet + commands
 switch-migrator -i switches.yaml --migration-sheets --new-switch new-sw-01 \
                 --extract-config
+
+# Show a change board exactly which commands would be sent - connects to nothing
+switch-migrator -i switches.yaml --dry-run
+
+# Collect once, keep the state, and rebuild any report from it later
+switch-migrator -i switches.yaml --migration-sheets --save-snapshot
+switch-migrator --from-snapshot output/snapshot-20260812-140311.json \
+                --migration-sheets --csv
+
+# Write an audit trail of the run (every command sent and its outcome)
+switch-migrator -i switches.yaml --manifest
 ```
+
+### Snapshots (`--save-snapshot` / `--from-snapshot`)
+
+Collecting is the expensive part: it needs credentials, network reach and a
+moment when touching the switches is acceptable. Every report the toolkit
+produces is a pure function of the collected state — so that state is worth
+keeping.
+
+`--save-snapshot` writes it all to one JSON file (default
+`<output>/snapshot-<stamp>.json`). `--from-snapshot` rebuilds any report from
+that file: no SSH, no credentials, no load on the devices. The reports are
+byte-identical to the ones the live run produced.
+
+That makes a snapshot three useful things at once:
+
+* **the pre-migration record** — what the network looked like before you
+  touched it, in a form you can diff or re-read months later;
+* **a way to iterate** — try a different I-SID convention or a different
+  `unused_after_days` and re-render, without another maintenance window;
+* **something to hand over** — a colleague can produce the cabling sheet
+  without reaching the switches at all.
+
+A snapshot holds device data (hostnames, IPs, MAC addresses, LLDP neighbors,
+and with `--extract-config` the running-config). Keep it wherever the raw
+switch output belongs.
+
+### Dry run (`--dry-run`)
+
+Prints every command the run would send to each device — switches and DvR
+controllers — and connects to nothing:
+
+```
+gx-01 (16 command(s))
+    terminal more disable
+    show interfaces gigabitEthernet state
+    show mlt
+    ...
+```
+
+The list is produced by running the **real collectors** against a runner that
+answers every command with an empty string, so it cannot drift away from what
+the tool actually does. Because empty answers send the collectors down every
+fallback branch, what you see is the full set of commands that *could* be
+sent — not just the subset one release happens to accept.
+
+### Run manifest (`--manifest`)
+
+Writes `<output>/manifest-<stamp>.json`: tool version, start/end time and
+duration, every command sent to every device and whether it was accepted, the
+errors and warnings raised, and the files produced. It never contains
+credentials and never command output — only the command text and its outcome.
+Turns "we checked before the migration" into something you can show afterwards.
 
 ### Migration sheets (`--migration-sheets`)
 
@@ -305,6 +370,8 @@ Output goes to `./output/` by default:
   **Summary**, **VLAN vs Fabric**, **Ports**, **MLTs**, **Fabric I-SIDs**,
   **Issues** (color-coded, filterable, frozen header row),
 * `csv-<timestamp>/*.csv` with `--csv`,
+* `snapshot-<timestamp>.json` with `--save-snapshot`,
+* `manifest-<timestamp>.json` with `--manifest`,
 * `raw/<device>/<command>.txt` with `--save-raw`,
 * `switch-migrator.log`.
 
@@ -327,13 +394,16 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor`, and `show running-config` (only with `--extract-config`) |
+| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` **and** `show interfaces gigabitEthernet interface` (the first carries admin/oper state and the last-change date, the second the media type; either alone is enough to report), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor`, and `show running-config` (only with `--extract-config`) |
 | ERS (migrate) | `enable`, `show interfaces`, `show mlt`, `show ist`, `show vlan` (incl. `Port Members`), `show lldp neighbor` → `show lldp neighbor summary` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
 
 `show vlan members` (VOSS) and the `Port Members` line of `show vlan` (ERS)
 feed the per-VLAN member-port column of the inventory report. Both are optional
 and silently skipped on releases that don't support them.
+
+`--dry-run` prints the exact list for your inventory, produced by the real
+collectors rather than copied from this table.
 
 Which command variants a given 8.x release accepts varies (real captures show
 boxes rejecting the plain interfaces form or the block-style LLDP command
@@ -347,10 +417,12 @@ Notes on syntax (checked against the Extreme VOSS/Fabric Engine command
 references and real device output):
 
 * Port state comes from `show interfaces gigabitEthernet state` — a compact
-  table that includes the down `REASON` column (shown in the Ports sheet). On
-  releases without the `state` subcommand the tool falls back to plain
-  `show interfaces gigabitEthernet` and parses its leading **Port Interface**
-  section.
+  table that includes the down `REASON` column (shown in the Ports sheet) and
+  the `DATE` of the last state change, which is what the used/unused
+  classification rests on. It has no `DESCRIPTION` column, so the
+  `... interface` variant is read as well and its media type merged in; on a
+  release that has only one of the two, that one is used and the other's
+  columns stay empty rather than the run failing.
 * Plain `show mlt` prints **four** tables (Mlt Info, LACP, local/remote port
   members, ENCAP) plus `All N out of M ...` footers, and the trailing VLAN IDS
   column wraps onto continuation lines for long VLAN lists. The parser accepts
@@ -437,6 +509,9 @@ switch_migrator/
 ├── config_extract.py   # VOSS running-config -> neutralized extract
 ├── config_generate.py  # ERS L2 model -> VOSS flex-UNI draft
 ├── isid.py             # per-VLAN I-SID resolution + decision worksheet
+├── usage.py            # is this port actually in use? (evidence-based)
+├── snapshot.py         # save/load the whole collected state as JSON
+├── manifest.py         # per-run audit trail: commands, outcomes, files
 ├── collectors/
 │   ├── switch.py       # legacy switch collection (VOSS + ERS)
 │   └── dvr.py          # DvR fabric-state collection + merge
@@ -447,5 +522,6 @@ switch_migrator/
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers
     ├── migration.py    # port info + cabling sheets, migration commands
+    ├── progress.py     # live per-device progress during collection
     └── excel.py        # xlsx + csv export; console.py renders to terminal
 ```

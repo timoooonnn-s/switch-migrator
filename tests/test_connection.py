@@ -97,6 +97,8 @@ def _make_runner(conn: _FakeConn) -> SshRunner:
     runner.ssh = SshSettings()
     runner.raw_dir = None
     runner.setup_warnings = []
+    runner.command_log = []
+    runner.on_command = None
     runner._transport_failures = 0
     runner._dead = False
     runner._conn = conn
@@ -162,6 +164,7 @@ def test_paging_disable_rejection_is_surfaced():
 def test_stuck_pager_is_quit_after_transport_failure():
     conn = _FakeConn(TimeoutError("Pattern not detected"))
     runner = _make_runner(conn)
+    runner.ssh = SshSettings(command_retries=0)
     with pytest.raises(CommandError):
         runner.run("show interfaces gigabitEthernet state")
     # recovery: 'q' sent to kill a possible --More-- pager
@@ -171,6 +174,7 @@ def test_stuck_pager_is_quit_after_transport_failure():
 def test_circuit_breaker_abandons_dead_session():
     conn = _FakeConn(OSError("socket closed"))
     runner = _make_runner(conn)
+    runner.ssh = SshSettings(command_retries=0)
     for _ in range(2):
         with pytest.raises(CommandError):
             runner.run("show mlt")
@@ -185,6 +189,7 @@ def test_circuit_breaker_abandons_dead_session():
 def test_circuit_breaker_resets_on_success():
     conn = _FakeConn(OSError("hiccup"))
     runner = _make_runner(conn)
+    runner.ssh = SshSettings(command_retries=0)
     with pytest.raises(CommandError):
         runner.run("show mlt")
     conn.exc = None
@@ -196,6 +201,13 @@ def test_circuit_breaker_resets_on_success():
 @pytest.fixture(autouse=True)
 def reset_legacy_flag(monkeypatch):
     monkeypatch.setattr(connection, "_legacy_enabled", False)
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    # the retry/recovery backoffs are real seconds on a device and pure waiting
+    # in a test
+    monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
 
 
 def test_enable_legacy_ssh_algorithms():

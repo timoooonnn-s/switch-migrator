@@ -157,8 +157,77 @@ def test_config_extract_writes_when_running_config_present(env):
 def test_settings_update_session(env):
     tmp, cfg_path, inv, raw = env
     s = _session(env)
-    console = ScriptedConsole([str(tmp / "other"), "n", "n", "new-99"])
+    # output dir, offline replay?, save raw?, manifest?, new switch name
+    console = ScriptedConsole([str(tmp / "other"), "n", "n", "y", "new-99"])
     M.action_settings(s, console)
     assert s.output_dir == tmp / "other"
     assert s.offline_dir is None              # answered "no" -> live SSH
+    assert s.write_manifest
     assert s.new_switch == "new-99"
+
+
+# ------------------------- snapshot & dry run -------------------------------
+
+def test_snapshot_save_then_load_restores_the_session(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
+    before = [(a.name, len(a.ports), len(a.mlts)) for a in s.audits]
+    assert before
+
+    snap = tmp / "snap.json"
+    M.action_snapshot(s, ScriptedConsole(["1", str(snap)]))
+    assert snap.is_file()
+
+    fresh = _session(env)
+    assert not fresh.has_data
+    M.action_snapshot(fresh, ScriptedConsole([str(snap)]))
+    assert [(a.name, len(a.ports), len(a.mlts)) for a in fresh.audits] == before
+    assert fresh.loaded_from == snap
+    assert fresh.collected_macs                 # MAC collection is remembered
+
+
+def test_reports_from_a_loaded_snapshot_need_no_devices(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
+    snap = tmp / "snap.json"
+    M.action_snapshot(s, ScriptedConsole(["1", str(snap)]))
+
+    fresh = _session(env)
+    fresh.offline_dir = None                    # no replay dir, no SSH, nothing
+    M.action_snapshot(fresh, ScriptedConsole([str(snap)]))
+    fresh.new_switch = "new-01"
+    M.action_sheets(fresh, ScriptedConsole([]))
+    assert list((tmp / "out").glob("migration-sheets-*.xlsx"))
+
+
+def test_loading_a_bad_snapshot_keeps_the_session_intact(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
+    kept = list(s.audits)
+    bad = tmp / "bad.json"
+    bad.write_text("{}")
+    M.action_snapshot(s, ScriptedConsole(["2", str(bad)]))
+    assert s.audits == kept and s.loaded_from is None
+
+
+def test_dry_run_action_sends_nothing(env):
+    s = _session(env)
+    console = ScriptedConsole(["n", "y"])       # no running-config, yes MACs
+    M.action_dry_run(s, console)
+    assert not s.has_data                       # a preview is not a collection
+
+
+def test_manifest_is_written_when_enabled(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    s.write_manifest = True
+    M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
+    manifests = list((tmp / "out").glob("manifest-*.json"))
+    assert len(manifests) == 1
+    import json
+    data = json.loads(manifests[0].read_text())
+    assert data["totals"]["switches"] == 2
+    assert data["switches"][0]["commands"]["sent"] > 0

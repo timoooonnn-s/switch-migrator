@@ -95,3 +95,36 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     assert xlsx.stat().st_size > 0
     csvs = write_csv(tables, tmp_path / "csv")
     assert len(csvs) == len(tables)
+
+
+def test_snapshot_run_reproduces_the_live_reports_exactly(tmp_path):
+    """The promise of a snapshot: the sheets you get from the file are the
+    sheets you would have got from the switches."""
+    import shutil
+    from switch_migrator.cli import main
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    shutil.copytree(FIXTURES / "voss", raw / "sw-voss")
+    shutil.copytree(FIXTURES / "ers", raw / "sw-ers")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("excluded_vlan_names: ['quarant*']\n")
+
+    live = tmp_path / "live"
+    common = ["-c", str(cfg), "--offline", str(raw), "-s", "sw-voss:voss",
+              "-s", "sw-ers:ers", "--no-fabric", "--migration-sheets",
+              "--csv", "--no-excel"]
+    snap = tmp_path / "snap.json"
+    main(common + ["-o", str(live), "--save-snapshot", str(snap)])
+    assert snap.is_file()
+
+    replay = tmp_path / "replay"
+    main(["-c", str(cfg), "--from-snapshot", str(snap), "-o", str(replay),
+          "--no-fabric", "--migration-sheets", "--csv", "--no-excel"])
+
+    live_csv = next(live.glob("csv-*"))
+    replay_csv = next(replay.glob("csv-*"))
+    produced = sorted(p.name for p in live_csv.glob("*.csv"))
+    assert "cabling.csv" in produced and "port_info.csv" in produced
+    for name in produced:
+        assert (live_csv / name).read_text() == (replay_csv / name).read_text(), name

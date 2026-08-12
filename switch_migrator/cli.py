@@ -34,12 +34,16 @@ from switch_migrator.config import (
 from switch_migrator.connection import (
     BaseRunner,
     ConnectionFailed,
+    DryRunRunner,
     OfflineRunner,
     SshRunner,
     enable_legacy_ssh_algorithms,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
+from switch_migrator import manifest as manifest_mod
+from switch_migrator import snapshot as snapshot_mod
 from switch_migrator.report import console as console_report
+from switch_migrator.report.progress import NullProgress, make_progress
 from switch_migrator.report.migration import (
     assign_port_uids,
     build_cabling,
@@ -104,6 +108,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline", type=Path, metavar="RAW_DIR",
                         help="don't SSH anywhere; replay raw outputs previously "
                              "captured with --save-raw")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="connect to nothing and print every command the "
+                             "run would send to each device, then exit. Use it "
+                             "to show a change board exactly what the tool "
+                             "does - the list is produced by the real "
+                             "collection code, not a written-down copy.")
+    parser.add_argument("--save-snapshot", nargs="?", const="", metavar="FILE",
+                        help="write the complete collected state to a JSON "
+                             "snapshot (default: <output>/snapshot-<stamp>.json) "
+                             "so any report can be regenerated later without "
+                             "touching the switches again")
+    parser.add_argument("--from-snapshot", type=Path, metavar="FILE",
+                        help="produce the reports from a saved snapshot instead "
+                             "of collecting: no SSH, no credentials, no load on "
+                             "the devices")
+    parser.add_argument("--manifest", action="store_true",
+                        help="write a run manifest (<output>/manifest-<stamp>.json): "
+                             "every command sent and its outcome, what failed, "
+                             "which files were produced - an audit trail of the "
+                             "pre-migration check")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="also print the ports/MLTs/fabric tables to the console")
     parser.add_argument("--debug", action="store_true",
@@ -137,6 +161,8 @@ def setup_logging(output_dir: Path, debug: bool) -> None:
 
 def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
                 cfg: Config, args: argparse.Namespace) -> BaseRunner:
+    if getattr(args, "dry_run", False):
+        return DryRunRunner(name, platform)
     if args.offline:
         return OfflineRunner(name, args.offline)
     raw_dir = (args.output_dir / "raw" / name) if args.save_raw else None
@@ -145,39 +171,61 @@ def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
 
 
 def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
-                     args: argparse.Namespace) -> SwitchAudit:
+                     args: argparse.Namespace,
+                     progress: NullProgress | None = None,
+                     command_sink: dict[str, list[dict]] | None = None
+                     ) -> SwitchAudit:
+    progress = progress or NullProgress()
     failed = SwitchAudit(name=target.name, host=target.host,
                          platform=target.platform, reachable=False)
+    progress.device_start(target.name)
+    runner: BaseRunner | None = None
+    audit = failed
     try:
-        runner = make_runner(target.name, target.host, target.platform,
-                             creds, cfg, args)
-    except ConnectionFailed as exc:
-        failed.errors.append(str(exc))
-        log.error("%s", exc)
-        return failed
-    except Exception as exc:  # noqa: BLE001 - one bad device must not kill the run
-        failed.errors.append(f"unexpected connect error: {exc.__class__.__name__}: {exc}")
-        log.exception("[%s] unexpected connect error", target.name)
-        return failed
-    try:
-        return collect_switch(target, runner, cfg,
-                              pull_config=args.extract_config,
-                              pull_macs=getattr(args, "migration_sheets", False))
-    except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
-        failed.errors.append(f"collection crashed: {exc.__class__.__name__}: {exc}")
-        log.exception("[%s] collection crashed", target.name)
-        return failed
+        try:
+            runner = make_runner(target.name, target.host, target.platform,
+                                 creds, cfg, args)
+        except ConnectionFailed as exc:
+            failed.errors.append(str(exc))
+            log.error("%s", exc)
+            return failed
+        except Exception as exc:  # noqa: BLE001 - one bad device must not kill the run
+            failed.errors.append(
+                f"unexpected connect error: {exc.__class__.__name__}: {exc}")
+            log.exception("[%s] unexpected connect error", target.name)
+            return failed
+        runner.on_command = progress.device_command
+        try:
+            audit = collect_switch(
+                target, runner, cfg,
+                pull_config=args.extract_config,
+                pull_macs=getattr(args, "migration_sheets", False))
+            return audit
+        except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
+            failed.errors.append(
+                f"collection crashed: {exc.__class__.__name__}: {exc}")
+            log.exception("[%s] collection crashed", target.name)
+            return failed
+        finally:
+            runner.close()
     finally:
-        runner.close()
+        sent = list(getattr(runner, "command_log", []) or [])
+        if command_sink is not None:
+            command_sink[target.name] = [vars(r) for r in sent]
+        progress.device_done(audit, len(sent))
 
 
 def run_collection(targets: list[SwitchTarget], creds: Credentials, cfg: Config,
-                   args: argparse.Namespace) -> list[SwitchAudit]:
+                   args: argparse.Namespace,
+                   progress: NullProgress | None = None,
+                   command_sink: dict[str, list[dict]] | None = None
+                   ) -> list[SwitchAudit]:
     """Collect every target in parallel, name-sorted. Shared by the flag
     interface and the interactive menu so both behave identically."""
     audits: list[SwitchAudit] = []
     with cf.ThreadPoolExecutor(max_workers=cfg.ssh.workers) as pool:
-        futures = [pool.submit(audit_one_switch, t, creds, cfg, args)
+        futures = [pool.submit(audit_one_switch, t, creds, cfg, args,
+                               progress, command_sink)
                    for t in targets]
         for future in cf.as_completed(futures):
             audits.append(future.result())
@@ -185,12 +233,65 @@ def run_collection(targets: list[SwitchTarget], creds: Credentials, cfg: Config,
     return audits
 
 
+def preview_commands(targets: list[SwitchTarget], cfg: Config,
+                     args: argparse.Namespace,
+                     dvrs: list[DvrTarget] | None = None) -> dict[str, list[str]]:
+    """--dry-run: what each device WOULD be asked, without connecting.
+
+    The preview is produced by running the REAL collectors against a runner
+    that connects to nothing and answers every command with an empty string.
+    So the list cannot drift away from what the tool does, and because empty
+    output sends the collectors down every fallback branch it is the full set
+    of commands that could be sent - not just the subset one release accepts.
+    """
+    preview: dict[str, list[str]] = {}
+    for target in targets:
+        runner = DryRunRunner(target.name, target.platform)
+        try:
+            collect_switch(target, runner, cfg,
+                           pull_config=args.extract_config,
+                           pull_macs=getattr(args, "migration_sheets", False))
+        except Exception:  # noqa: BLE001 - a preview must never fail the run
+            log.exception("[%s] dry-run preview incomplete", target.name)
+        preview[target.name] = runner.commands
+    for dvr in (dvrs or []):
+        runner = DryRunRunner(dvr.name, Platform.VOSS)
+        try:
+            collect_dvr(dvr.name, runner, FabricState())
+        except Exception:  # noqa: BLE001 - same
+            log.exception("[%s] dry-run preview incomplete", dvr.name)
+        preview[f"{dvr.name} (DvR controller)"] = runner.commands
+    return preview
+
+
+def render_dry_run(preview: dict[str, list[str]], console: Console) -> None:
+    console.print("[bold]Dry run[/bold] - nothing was connected to and no "
+                  "command was sent.\n")
+    total = 0
+    for name, commands in preview.items():
+        total += len(commands)
+        console.print(f"[bold cyan]{name}[/bold cyan] "
+                      f"({len(commands)} command(s))")
+        for command in commands:
+            console.print(f"    {command}")
+        console.print("")
+    console.print(f"[dim]{total} command(s) in total. Every one of them is a "
+                  f"'show' or a terminal-paging setting - the tool never "
+                  f"configures anything. On releases that reject the bare "
+                  f"'show interfaces gigabitEthernet fdb-entry', each "
+                  f"operationally up port adds one more of that same read-only "
+                  f"command.[/dim]")
+
+
 def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
-                   args: argparse.Namespace) -> FabricState:
+                   args: argparse.Namespace,
+                   progress: NullProgress | None = None) -> FabricState:
     # fabric-wide listings (isis spbm i-sid) can be large - give the DvR
     # sessions extra read-timeout headroom
     dvr_cfg = replace(cfg, ssh=replace(cfg.ssh,
                                        read_timeout=max(cfg.ssh.read_timeout, 120)))
+
+    tracker = progress or NullProgress()
 
     def collect_one(dvr: DvrTarget) -> FabricState:
         fragment = FabricState()
@@ -200,6 +301,7 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
         except Exception as exc:  # noqa: BLE001 - keep reading the other DvRs
             fragment.dvr_errors.append(f"{dvr.name}: {exc}")
             log.error("%s: %s", dvr.name, exc)
+            tracker.fabric_done(dvr.name, False)
             return fragment
         try:
             collect_dvr(dvr.name, runner, fragment)
@@ -208,6 +310,7 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
             log.exception("[%s] collection crashed", dvr.name)
         finally:
             runner.close()
+            tracker.fabric_done(dvr.name, dvr.name in fragment.dvrs_ok)
         return fragment
 
     fabric = FabricState()
@@ -265,21 +368,25 @@ def main(argv: list[str] | None = None) -> int:
         return run_menu(config_path=args.config, inventory_path=args.inventory,
                         output_dir=args.output_dir)
 
+    # Reporting from a saved snapshot: no config, no credentials, no device is
+    # touched - every sheet below is a pure function of the collected state.
+    from_snapshot = getattr(args, "from_snapshot", None)
     try:
-        cfg = load_config(args.config, require_fabric=not args.no_fabric)
+        cfg = load_config(args.config,
+                          require_fabric=not args.no_fabric and not from_snapshot)
         targets: list[SwitchTarget] = []
         if args.inventory:
             targets.extend(load_inventory(args.inventory))
         for raw in args.switch:
             targets.append(parse_switch_arg(raw))
-        if not targets:
+        if not targets and not from_snapshot:
             raise ConfigError("no switches given: use -i inventory.yaml and/or "
                               "-s NAME:PLATFORM[:HOST]")
         dupes = {t.name for t in targets if [x.name for x in targets].count(t.name) > 1}
         if dupes:
             raise ConfigError(f"duplicate switch names: {', '.join(sorted(dupes))}")
 
-        if args.offline:
+        if args.offline or args.dry_run or from_snapshot:
             creds = dvr_creds = Credentials("offline", "offline")
         else:
             creds = get_credentials("switches", "SM")
@@ -293,33 +400,62 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[bold red]Config error:[/bold red] {exc}")
         return 2
 
+    if args.dry_run:
+        render_dry_run(preview_commands(
+            targets, cfg, args,
+            dvrs=[] if args.no_fabric else cfg.dvr_controllers), console)
+        return 0
+
     started = datetime.now()
-    if args.no_fabric:
+    commands_by_device: dict[str, list[dict]] = {}
+
+    if from_snapshot:
+        try:
+            audits, fabric, snap_meta = snapshot_mod.load(from_snapshot)
+        except snapshot_mod.SnapshotError as exc:
+            console.print(f"[bold red]Snapshot error:[/bold red] {exc}")
+            return 2
+        console.print(f"[bold]switch-migrator {__version__}[/bold] - "
+                      f"{snapshot_mod.describe(snap_meta, audits)}")
+        console.print("[yellow]No device was contacted: reporting from the "
+                      "saved snapshot.[/yellow]")
+    elif args.no_fabric:
         console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only "
                       f"inventory of {len(targets)} switch(es) "
                       f"[yellow](--no-fabric: no DvR comparison)[/yellow]")
         fabric = FabricState()
+        with make_progress(console, len(targets)) as progress:
+            audits = run_collection(targets, creds, cfg, args,
+                                    progress, commands_by_device)
     else:
         console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only "
                       f"audit of {len(targets)} switch(es) against "
                       f"{len(cfg.dvr_controllers)} DvR controller(s)")
-        # 1) Fabric state from the DvR controllers (sequential merge)
-        with console.status("Collecting fabric state from DvR controllers..."):
-            fabric = collect_fabric(cfg.dvr_controllers, dvr_creds, cfg, args)
+        # The fabric read and the switch reads are independent - the comparison
+        # is what needs both - so they run at the same time and the fabric
+        # round-trip leaves the critical path.
+        with make_progress(console, len(targets),
+                           len(cfg.dvr_controllers)) as progress:
+            with cf.ThreadPoolExecutor(max_workers=1) as fabric_pool:
+                fabric_future = fabric_pool.submit(
+                    collect_fabric, cfg.dvr_controllers, dvr_creds, cfg, args,
+                    progress)
+                audits = run_collection(targets, creds, cfg, args,
+                                        progress, commands_by_device)
+                fabric = fabric_future.result()
         if not fabric.dvrs_ok:
             console.print("[bold red]No DvR controller could be read - aborting, "
                           "there is no fabric state to compare against.[/bold red]")
             for err in fabric.dvr_errors:
                 console.print(f"  [red]{err}[/red]")
+            console.print("[dim]The switches were read successfully; re-run "
+                          "with --no-fabric for an inventory report without "
+                          "the fabric comparison.[/dim]")
             return 1
         console.print(f"Fabric state: {len(fabric.isids)} I-SIDs from "
                       f"{', '.join(fabric.dvrs_ok)}"
                       + (f" [yellow]({len(fabric.dvr_errors)} DvR error(s))[/yellow]"
                          if fabric.dvr_errors else ""))
-
-    # 2) Legacy switches in parallel
-    with console.status(f"Auditing {len(targets)} switch(es)..."):
-        audits = run_collection(targets, creds, cfg, args)
 
     # unreachable devices go to the report too, but say it loudly right away
     for audit in audits:
@@ -354,15 +490,32 @@ def main(argv: list[str] | None = None) -> int:
         cmd_path = args.output_dir / f"migration-commands-{stamp}.txt"
         cmd_path.write_text(build_commands(audits, new_switch=args.new_switch))
         written.append(cmd_path)
+    if args.save_snapshot is not None and not from_snapshot:
+        # '--save-snapshot' on its own carries the empty sentinel -> default
+        # name in the output dir; '--save-snapshot FILE' names it explicitly
+        args.save_snapshot = (Path(args.save_snapshot) if args.save_snapshot
+                              else args.output_dir / f"snapshot-{stamp}.json")
+        written.append(snapshot_mod.save(
+            args.save_snapshot, audits, fabric,
+            meta={"started": started.isoformat(timespec="seconds"),
+                  "config": str(args.config),
+                  "no_fabric": bool(args.no_fabric)}))
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 
     # Exit code mirrors the worst finding so the tool is scriptable
     severities = [t for table in tables for t in table.severities]
     unreachable = [a for a in audits if not a.reachable]
-    if "error" in severities or unreachable or fabric.dvr_errors:
-        return 1
-    return 0
+    code = 1 if ("error" in severities or unreachable or fabric.dvr_errors) else 0
+
+    if args.manifest:
+        path = manifest_mod.write(
+            args.output_dir / f"manifest-{stamp}.json",
+            manifest_mod.build(audits, fabric, args, started, datetime.now(),
+                               written, commands_by_device,
+                               config_path=args.config, exit_code=code))
+        console.print(f"Run manifest: [bold]{path}[/bold]")
+    return code
 
 
 if __name__ == "__main__":

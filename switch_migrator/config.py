@@ -40,7 +40,13 @@ class SshSettings:
     conn_timeout: int = 20
     read_timeout: int = 60
     workers: int = 4
-    retries: int = 1
+    retries: int = 1                # reconnect attempts after a connect failure
+    # re-sends of a single command that died on a transport error (a stuck
+    # pager, one dropped read). A command the DEVICE rejected is never retried
+    # - that answer will not change.
+    command_retries: int = 1
+    # consecutive transport failures after which the session is abandoned
+    max_transport_failures: int = 2
     legacy_algorithms: bool = True  # old ERS/BOSS kex/ciphers/host keys
     global_delay_factor: float = 1.0  # slow gear: raise to give reads more time
     default_enter: str | None = None  # e.g. "\r\n" for ERS/BOSS that ignore "\n"
@@ -65,6 +71,10 @@ class Config:
     excluded_vlan_names: list[str] = field(default_factory=list)
     # a port down longer than this counts as unused (see usage.py)
     unused_after_days: int = 30
+    # learned MACs kept per port for the migration sheets. Raise it on
+    # server-heavy access ports, lower it on busy uplinks - the full count is
+    # always reported as '(+N more)' regardless.
+    mac_cap: int = 10
     ssh: SshSettings = field(default_factory=SshSettings)
 
 
@@ -116,6 +126,8 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         read_timeout=int(ssh_data.get("read_timeout", 60)),
         workers=max(1, int(ssh_data.get("workers", 4))),
         retries=max(0, int(ssh_data.get("retries", 1))),
+        command_retries=max(0, int(ssh_data.get("command_retries", 1))),
+        max_transport_failures=max(1, int(ssh_data.get("max_transport_failures", 2))),
         legacy_algorithms=bool(ssh_data.get("legacy_algorithms", True)),
         global_delay_factor=float(ssh_data.get("global_delay_factor", 1.0)),
         default_enter=str(default_enter) if default_enter else None,
@@ -140,6 +152,7 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         excluded_vlans=excluded_vlans,
         excluded_vlan_names=[str(p) for p in (data.get("excluded_vlan_names") or [])],
         unused_after_days=int(data.get("unused_after_days", 30)),
+        mac_cap=max(1, int(data.get("mac_cap", 10))),
         ssh=ssh,
     )
 

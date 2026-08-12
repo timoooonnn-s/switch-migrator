@@ -17,7 +17,8 @@ from switch_migrator.parsers.common import (
     parse_mac_table,
 )
 
-# how many learned MACs are kept per port for the migration sheet
+# fallback cap on learned MACs kept per port; the configured value
+# (Config.mac_cap) is what the collection actually uses
 MAC_CAP = 10
 
 log = logging.getLogger(__name__)
@@ -244,7 +245,8 @@ def _collect_fdb(audit: SwitchAudit, runner: BaseRunner,
 
 
 def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
-                             pull_macs: bool = False) -> None:
+                             pull_macs: bool = False,
+                             mac_cap: int = MAC_CAP) -> None:
     """Per-port data the migration sheets need: MLT membership + LACP, VLANs and
     their I-SIDs, tagging, and - when pull_macs is set - learned MACs and the
     pluggable optic. Everything except the MAC/optics fetch is derived from data
@@ -324,7 +326,7 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
             for port in targets:
                 for mac, _vlan in entries:
                     port.mac_total += 1
-                    if len(port.macs) < MAC_CAP and mac not in port.macs:
+                    if len(port.macs) < mac_cap and mac not in port.macs:
                         port.macs.append(mac)
 
     # --- pluggable optics (VOSS). Real columns are
@@ -424,7 +426,8 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,
         mlt.is_uplink = any(
             p.is_uplink for p in audit.ports if p.port in mlt.members)
 
-    _enrich_migration_fields(audit, runner, pull_macs=pull_macs)
+    _enrich_migration_fields(audit, runner, pull_macs=pull_macs,
+                             mac_cap=cfg.mac_cap)
 
     if audit.ist is not None and audit.ist.session_up is False:
         audit.warnings.append(
