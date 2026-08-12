@@ -16,6 +16,10 @@ from switch_migrator import __version__
 from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.compare import compare_switch
+from switch_migrator.config_extract import extract_voss_config
+from switch_migrator.config_generate import generate_voss_from_ers
+from switch_migrator.isid import build_worksheet
+from switch_migrator.parsers.ers_config import parse_ers_config
 from switch_migrator.config import (
     DvrTarget,
     Config,
@@ -36,6 +40,12 @@ from switch_migrator.connection import (
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator.report import console as console_report
+from switch_migrator.report.migration import (
+    assign_port_uids,
+    build_cabling,
+    build_commands,
+    build_port_info,
+)
 from switch_migrator.report.excel import write_csv, write_excel
 from switch_migrator.report.tables import build_all
 
@@ -67,6 +77,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "environments whose VLANs/I-SIDs are intentionally "
                              "not in the fabric. DvR controllers and I-SID "
                              "conventions become optional in the config.")
+    parser.add_argument("--extract-config", action="store_true",
+                        help="also pull each VOSS switch's running-config and "
+                             "write a neutralized, migration-ready extract "
+                             "(port/MLT/VLAN/I-SID only, secrets & identity "
+                             "removed, uplinks annotated) to "
+                             "<output>/config/<device>.cfg. Review before use.")
+    parser.add_argument("--migration-sheets", action="store_true",
+                        help="add the migration-day deliverables: a per-port "
+                             "info sheet, a DC cabling sheet (connected ports, "
+                             "with empty NEW switch/port columns) and a "
+                             "commands file with per-port MAC checks for the "
+                             "new switch. Combine with --extract-config to "
+                             "include the device config in that file.")
+    parser.add_argument("--new-switch", metavar="NAME", default="",
+                        help="name of the target switch, used in the "
+                             "--migration-sheets command file")
     parser.add_argument("--csv", action="store_true",
                         help="additionally export the tables as CSV files")
     parser.add_argument("--no-excel", action="store_true",
@@ -82,6 +108,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="also print the ports/MLTs/fabric tables to the console")
     parser.add_argument("--debug", action="store_true",
                         help="debug logging (includes netmiko)")
+    parser.add_argument("--menu", action="store_true",
+                        help="open the interactive toolkit menu (also the "
+                             "default when no arguments are given): select "
+                             "switches, collect once, then produce any output "
+                             "from that same data")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -129,13 +160,29 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         log.exception("[%s] unexpected connect error", target.name)
         return failed
     try:
-        return collect_switch(target, runner, cfg)
+        return collect_switch(target, runner, cfg,
+                              pull_config=args.extract_config,
+                              pull_macs=getattr(args, "migration_sheets", False))
     except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
         failed.errors.append(f"collection crashed: {exc.__class__.__name__}: {exc}")
         log.exception("[%s] collection crashed", target.name)
         return failed
     finally:
         runner.close()
+
+
+def run_collection(targets: list[SwitchTarget], creds: Credentials, cfg: Config,
+                   args: argparse.Namespace) -> list[SwitchAudit]:
+    """Collect every target in parallel, name-sorted. Shared by the flag
+    interface and the interactive menu so both behave identically."""
+    audits: list[SwitchAudit] = []
+    with cf.ThreadPoolExecutor(max_workers=cfg.ssh.workers) as pool:
+        futures = [pool.submit(audit_one_switch, t, creds, cfg, args)
+                   for t in targets]
+        for future in cf.as_completed(futures):
+            audits.append(future.result())
+    audits.sort(key=lambda a: a.name)
+    return audits
 
 
 def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
@@ -170,10 +217,53 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
     return fabric
 
 
+def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
+                           comparisons: dict, cfg: Config,
+                           console: Console) -> list[Path]:
+    """Write a migration-ready config per switch (--extract-config): VOSS boxes
+    are filtered/neutralized; ERS boxes are translated to VOSS flex-UNI with an
+    I-SID decision worksheet."""
+    written: list[Path] = []
+    out_dir = output_dir / "config"
+    for a in audits:
+        if not a.running_config:
+            if a.reachable:
+                console.print(f"[yellow]--extract-config: no running-config "
+                              f"obtained from {a.name}[/yellow]")
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if a.platform is Platform.VOSS:
+            text = extract_voss_config(a.running_config, device_name=a.name).text
+            path = out_dir / f"{a.name}.cfg"
+            path.write_text(text)
+            written.append(path)
+        else:  # ERS -> VOSS flex-UNI (generated draft) + I-SID worksheet
+            matched = {c.vlan_id: c.matched_isid
+                       for c in comparisons.get(a.name, []) if c.matched_isid}
+            model = parse_ers_config(a.running_config)
+            res = generate_voss_from_ers(model, cfg, matched_by_vlan=matched,
+                                         device_name=a.name)
+            path = out_dir / f"{a.name}.cfg"
+            path.write_text(res.text)
+            written.append(path)
+            wpath = out_dir / f"{a.name}.isid-decisions.txt"
+            wpath.write_text(build_worksheet(res.decisions, device_name=a.name))
+            written.append(wpath)
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else argv
     args = build_arg_parser().parse_args(argv)
     console = Console(stderr=True)
     setup_logging(args.output_dir, args.debug)
+
+    # No arguments at all (or an explicit --menu): open the interactive toolkit
+    # menu. Every flag keeps working exactly as before.
+    if args.menu or not raw_argv:
+        from switch_migrator.menu import run_menu
+        return run_menu(config_path=args.config, inventory_path=args.inventory,
+                        output_dir=args.output_dir)
 
     try:
         cfg = load_config(args.config, require_fabric=not args.no_fabric)
@@ -228,14 +318,8 @@ def main(argv: list[str] | None = None) -> int:
                          if fabric.dvr_errors else ""))
 
     # 2) Legacy switches in parallel
-    audits: list[SwitchAudit] = []
     with console.status(f"Auditing {len(targets)} switch(es)..."):
-        with cf.ThreadPoolExecutor(max_workers=cfg.ssh.workers) as pool:
-            futures = {pool.submit(audit_one_switch, t, creds, cfg, args): t
-                       for t in targets}
-            for future in cf.as_completed(futures):
-                audits.append(future.result())
-    audits.sort(key=lambda a: a.name)
+        audits = run_collection(targets, creds, cfg, args)
 
     # unreachable devices go to the report too, but say it loudly right away
     for audit in audits:
@@ -250,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # 4) Report
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
+    if args.migration_sheets:
+        assign_port_uids(audits)
+        tables += [build_port_info(audits), build_cabling(audits)]
     console_report.render(tables, Console(), verbose=args.verbose)
 
     written: list[Path] = []
@@ -260,6 +347,13 @@ def main(argv: list[str] | None = None) -> int:
         written.append(xlsx)
     if args.csv:
         written.extend(write_csv(tables, args.output_dir / f"csv-{stamp}"))
+    if args.extract_config:
+        written.extend(_write_config_extracts(
+            audits, args.output_dir, comparisons, cfg, console))
+    if args.migration_sheets:
+        cmd_path = args.output_dir / f"migration-commands-{stamp}.txt"
+        cmd_path.write_text(build_commands(audits, new_switch=args.new_switch))
+        written.append(cmd_path)
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 

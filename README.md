@@ -125,6 +125,46 @@ switches — one dead box never aborts the run.
 
 ## Usage
 
+### Interactive menu (default)
+
+Run it with no arguments and you land in the toolkit menu:
+
+```bash
+switch-migrator                      # or: switch-migrator --menu
+switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
+```
+
+```
+╭─ switch-migrator ───────────────────────────────╮
+│ Config:    config.yaml                          │
+│ Inventory: switches.yaml                        │
+│ Switches:  12 selected of 12                    │
+│ Output:    output                               │
+│ Data:      collected 14:03:11 (12 switch(es),   │
+│            incl. fabric, running-config, MACs)  │
+╰─────────────────────────────────────────────────╯
+  1  Select switches       pick targets from the inventory or add them by hand
+  2  Collect from devices  connect once; all outputs below reuse this data
+  3  Audit vs fabric       compare every VLAN against the DvR fabric state
+  4  Inventory report      port/MLT/VLAN state only, no fabric comparison
+  5  Migration sheets      port info + DC cabling sheet + MAC-check commands
+  6  Config extract        neutralized VOSS config / generated ERS->VOSS draft
+  7  Everything            run 3-6 in one go with the collected data
+  8  Settings              output directory, offline replay, target switch name
+  0  Quit
+```
+
+The menu holds a **session**: devices are collected **once** (option 2, which
+asks whether to include fabric state, running-config and MAC tables), and every
+output afterwards is produced from that same data — switching between use cases
+costs no further SSH round-trips. Options that need data you didn't collect say
+so instead of silently producing empty columns.
+
+**All command-line flags below keep working unchanged** — the menu is an extra
+entry point, not a replacement, so existing scripts and cron jobs are unaffected.
+
+### Command line
+
 ```bash
 # Standard run: inventory file + Excel report + console summary
 switch-migrator -c config.yaml -i switches.yaml
@@ -143,7 +183,87 @@ switch-migrator -i switches.yaml --offline output/raw
 # and skips DvR collection and comparison entirely. dvr_controllers and
 # isid_conventions are optional in the config for this mode.
 switch-migrator -c config.yaml -i isolated.yaml --no-fabric
+
+# Also pull each VOSS switch's running-config and write a neutralized,
+# migration-ready extract (port/MLT/VLAN/I-SID only) to <output>/config/
+switch-migrator -i switches.yaml --extract-config
+
+# Migration-day deliverables: port info sheet + DC cabling sheet + commands
+switch-migrator -i switches.yaml --migration-sheets --new-switch new-sw-01 \
+                --extract-config
 ```
+
+### Migration sheets (`--migration-sheets`)
+
+Adds the two worksheets you take into the migration window, plus a commands
+file. Every port gets a **sequential migration ID** (`P0001`, …) assigned across
+the whole run — the key that ties both sheets together when several old
+switches consolidate onto fewer new ones.
+
+* **Port Info** (all ports) — Port ID, switch, port, device on the port (LLDP
+  name / IP / SysDescr), MAC addresses, tagging, VLAN IDs, I-SIDs, admin & oper
+  state, LACP, MLT ID & name, transceiver, media, uplink flag.
+* **Cabling** (connected ports only — what actually gets re-patched) —
+  deliberately wide, *one big paper*, so every row is self-contained at the
+  rack: first VLAN, type (access/mlt/uplink), Port ID, end device / neighbor,
+  **empty NEW switch + NEW port columns for the technicians to fill in**, old
+  switch, old port, **MLT ID, MLT name, the MLT's VLANs and I-SIDs**, the
+  **port's own VLANs and I-SIDs**, MAC addresses and physical media.
+* **`migration-commands-<stamp>.txt`** — per-port
+  `show interfaces gigabitEthernet fdb-entry` commands to run on the **new**
+  switch (each annotated with the Port ID, the
+  old switch/port and the MACs to expect), a post-migration state overview, and
+  — when combined with `--extract-config` — the neutralized device config ready
+  to copy.
+
+MAC addresses are capped at 10 per port with a `(+N more)` note. Pass
+`--new-switch NAME` to name the target device in the commands file.
+
+VOSS has **no** `show mac-address-table`; the forwarding database is read with
+`show interfaces gigabitEthernet fdb-entry`. The bare form (whole box, one
+command) is tried first, and releases that insist on a port argument fall back
+to querying only the ports that are operationally **up**. ERS/BOSS uses the
+classic `show mac-address-table`.
+
+### Config extraction (`--extract-config`, VOSS)
+
+Pulls each VOSS switch's `show running-config` and writes a **neutralized,
+migration-ready extract** to `<output>/config/<device>.cfg` for review before
+you build the new device. It keeps the **port / MLT / VLAN / I-SID** banner
+sections verbatim and drops everything else, so:
+
+* **neutralized by construction** — device identity and every secret (mgmt/OOB,
+  SNMP, RADIUS/TACACS, SSH/cert, syslog/NTP, boot flags, and the SPB/IS-IS core
+  identity: nick-name, system-id, manual-area) live in sections that are never
+  emitted, so nothing sensitive can leak;
+* **model-agnostic** — keys on the config's own section banners, so a flex-UNI
+  leaf, a traditional `vlan i-sid` BEB, a BCB (almost nothing to keep) or an
+  isolated VLAN-only box all work;
+* **annotated, not paste-ready** — fabric uplink ports (those running IS-IS) get
+  a `# [REVIEW]` marker, and the header lists the sections that were present but
+  omitted so you remember to configure them separately.
+
+It works with `--offline`/`--save-raw` like everything else.
+
+**ERS → VOSS (generated draft).** For an **ERS** switch, `--extract-config`
+instead *generates* a best-effort VOSS **flex-UNI** config from the ERS L2 model
+and writes two files:
+
+* `<device>.cfg` — each VLAN becomes an `i-sid <isid> elan` with
+  `c-vid <vlan> port …` (tagged members) and `untagged-traffic port …` (PVID
+  members); access ports get the flex-UNI boilerplate; old port numbers are kept
+  as `1/N`. It is clearly labelled a **DRAFT** with a "YOU MUST VERIFY" header
+  (tagged-vs-untagged, uplink/MLT handling, and the untranslated config).
+* `<device>.isid-decisions.txt` — the **I-SID decision worksheet**: because
+  several offsets run in parallel (`2500000/2510000/2700000/2710000`),
+  `offset + VLAN` is ambiguous, so any VLAN the fabric didn't confirm is listed
+  with all candidate I-SIDs plus a ready-to-paste `isid_conventions.explicit`
+  snippet. Fill in your choices, re-run, and those VLANs resolve. Until then the
+  service block is emitted **commented-out** with a `# [REVIEW]` marker — never a
+  guessed I-SID.
+
+I-SID resolution order is: excluded → your explicit decision → fabric-confirmed
+(from the audit) → REVIEW placeholder.
 
 ### Inventory mode (`--no-fabric`)
 
@@ -183,7 +303,7 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor` |
+| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor`, and `show running-config` (only with `--extract-config`) |
 | ERS (migrate) | `enable`, `show interfaces`, `show mlt`, `show ist`, `show vlan` (incl. `Port Members`), `show lldp neighbor` → `show lldp neighbor summary` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
 
@@ -285,10 +405,14 @@ collectors, comparison and report writers.
 ```
 switch_migrator/
 ├── cli.py              # argument parsing + orchestration
+├── menu.py             # interactive toolkit menu (session: collect once, reuse)
 ├── config.py           # YAML config/inventory loading, credential resolution
 ├── connection.py       # netmiko SSH runner + offline replay runner
 ├── models.py           # dataclasses + comparison status model
 ├── compare.py          # VLAN↔I-SID comparison engine
+├── config_extract.py   # VOSS running-config -> neutralized extract
+├── config_generate.py  # ERS L2 model -> VOSS flex-UNI draft
+├── isid.py             # per-VLAN I-SID resolution + decision worksheet
 ├── collectors/
 │   ├── switch.py       # legacy switch collection (VOSS + ERS)
 │   └── dvr.py          # DvR fabric-state collection + merge
@@ -298,5 +422,6 @@ switch_migrator/
 │   └── common.py       # port-list expansion, LLDP block parser
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers
+    ├── migration.py    # port info + cabling sheets, migration commands
     └── excel.py        # xlsx + csv export; console.py renders to terminal
 ```

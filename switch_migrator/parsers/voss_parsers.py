@@ -80,8 +80,16 @@ def parse_mlt(output: str) -> list[MltState]:
     datapath = _parse_mlt_datapath(output)
     mlts: list[MltState] = []
     seen: set[int] = set()
+    current: MltState | None = None   # last Mlt Info row, for VLAN continuations
     for line in output.splitlines():
         tokens = line.split()
+        # a line of bare VLAN ids continues the previous row's VLAN IDS column
+        if (current is not None and tokens
+                and all(t.isdigit() and 1 <= int(t) <= 4094 for t in tokens)):
+            current.vlans.extend(int(t) for t in tokens
+                                 if int(t) not in current.vlans)
+            continue
+        current = None
         if len(tokens) < 3 or not tokens[0].isdigit():
             continue
         mlt_id = int(tokens[0])
@@ -93,26 +101,73 @@ def parse_mlt(output: str) -> list[MltState]:
             continue
         name = rest[0]
         members: list[str] = []
-        for t in rest[1:]:
+        members_at = None
+        for i, t in enumerate(rest[1:], start=1):
             if "/" in t and PORT_LIST_RE.match(t):
                 members = expand_port_list(t)
+                members_at = i
                 break
         mlt_type = next((t for t in rest if t.lower() in ("access", "trunk")), "")
         states = [t for t in rest if t.lower() in ("norm", "smlt", "ist")]
         if (not mlt_type and not states) or mlt_id in seen:
             continue
         seen.add(mlt_id)
-        mlts.append(MltState(
+        # everything after the PORT MEMBERS column is the VLAN IDS list
+        vlans = ([int(t) for t in rest[members_at + 1:]
+                  if t.isdigit() and 1 <= int(t) <= 4094]
+                 if members_at is not None else [])
+        mlt = MltState(
             mlt_id=mlt_id,
             name=name,
             mlt_type=mlt_type,
             admin=states[0] if states else "",
             current=states[1] if len(states) > 1 else "",
             members=members,
+            vlans=vlans,
             in_datapath=datapath.get(mlt_id),
             is_ist="ist" in name.lower() or "ist" in [s.lower() for s in states],
-        ))
+        )
+        mlts.append(mlt)
+        current = mlt
     return mlts
+
+
+def parse_mlt_lacp(output: str) -> dict[int, bool]:
+    """Parse the LACP table of `show mlt` -> {mlt_id: lacp_admin_enabled}.
+
+    Second table of the plain `show mlt` output:
+        MLTID IFINDEX  DESIGNATED PORTS  LACP ADMIN  LACP OPER
+        197   6340     1/43              enable      up
+    Scoped to the section that follows a header carrying 'LACP', and rows are
+    only accepted when they hold an enable/disable token - so the Mlt Info and
+    ENCAP tables (which also start with an id) can never be misread.
+    """
+    result: dict[int, bool] = {}
+    in_section = False
+    saw_lacp = False           # the real header spans TWO lines:
+    for line in output.splitlines():          # '... LACP  LACP' then 'MLTID ...'
+        upper = line.upper()
+        if "MLTID" in upper:
+            in_section = "LACP" in upper or saw_lacp
+            saw_lacp = False
+            continue
+        if "LACP" in upper and not in_section:
+            saw_lacp = True
+            continue
+        if not in_section:
+            continue
+        if "OUT OF" in upper and "TOTAL" in upper:
+            in_section = False
+            continue
+        tokens = line.split()
+        if not tokens or not tokens[0].isdigit():
+            continue
+        admin = next((t.lower() for t in tokens
+                      if t.lower() in ("enable", "disable",
+                                       "enabled", "disabled")), None)
+        if admin is not None:
+            result[int(tokens[0])] = admin.startswith("enable")
+    return result
 
 
 def _parse_mlt_datapath(output: str) -> dict[int, bool]:

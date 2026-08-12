@@ -12,14 +12,47 @@ class Platform(str, Enum):
 
 
 @dataclass
+class LldpNeighbor:
+    """One LLDP neighbor as seen on a local port.
+
+    sysname is what the neighbor advertises as its system name - often a real
+    hostname, but some devices put an adapter model there (Broadcom NICs) or
+    leave it empty (HP iLO). ip / sys_descr give a second and third way to
+    identify the neighbor when the name is unhelpful.
+    """
+    sysname: str = ""
+    ip: str = ""
+    sys_descr: str = ""
+
+
+@dataclass
 class PortState:
     port: str
     description: str = ""
     admin_up: bool | None = None
     oper_up: bool | None = None
     state_reason: str = ""        # VOSS `show int gig state` REASON column (e.g. SSH)
-    lldp_neighbor: str = ""
+    lldp_neighbor: str = ""       # neighbor SysName (may be empty / an adapter model)
+    lldp_neighbor_ip: str = ""    # neighbor management IP, when it advertises one
+    lldp_sys_descr: str = ""      # neighbor SysDescr (e.g. 'HPE ProLiant DL380 Gen10')
     is_uplink: bool = False
+    # --- migration-sheet fields -------------------------------------------
+    uid: str = ""                 # sequential migration ID (P0001), assigned per run
+    macs: list[str] = field(default_factory=list)   # learned MACs (capped)
+    mac_total: int = 0            # how many were learned in total (before the cap)
+    transceiver: str = ""         # pluggable optic type/vendor, when readable
+    lacp: bool | None = None      # LACP enabled on the port's MLT
+    mlt_id: int | None = None
+    mlt_name: str = ""
+    tagging: str = ""             # tagged / untagged / mixed / ""
+    vlans: list[int] = field(default_factory=list)  # VLANs configured on the port
+    isids: list[int] = field(default_factory=list)  # I-SIDs of those VLANs
+
+    @property
+    def media(self) -> str:
+        """Physical media from the Port Interface DESCRIPTION column
+        (10GbSR, Gbic1000BaseT, 40GbCR4, ...)."""
+        return self.description
 
 
 @dataclass
@@ -37,6 +70,9 @@ class MltState:
     # nothing programmed); None = that table was absent. Lets us tell a live
     # MLT from a dead one even when per-port state is unavailable.
     in_datapath: bool | None = None
+    lacp: bool | None = None      # LACP admin state (VOSS: show mlt LACP table)
+    vlans: list[int] = field(default_factory=list)  # VLAN IDS column of show mlt
+    isids: list[int] = field(default_factory=list)  # I-SIDs of those VLANs
     is_ist: bool = False
     is_uplink: bool = False
 
@@ -80,6 +116,10 @@ class SwitchAudit:
     mlts: list[MltState] = field(default_factory=list)
     ist: IstState | None = None
     vlans: list[VlanInfo] = field(default_factory=list)
+    running_config: str = ""      # raw `show running-config`, only if requested
+    # rows from `show interfaces gigabitEthernet i-sid`, kept so the per-port
+    # VLAN/I-SID columns need no second call
+    port_isid_rows: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
