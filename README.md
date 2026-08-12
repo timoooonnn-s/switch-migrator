@@ -219,6 +219,30 @@ switches consolidate onto fewer new ones.
 MAC addresses are capped at 10 per port with a `(+N more)` note. Pass
 `--new-switch NAME` to name the target device in the commands file.
 
+#### Is this port actually used?
+
+Link state alone can't answer that — a momentarily-down MLT member looks exactly
+like a dead port. Both sheets therefore carry a **Usage** column and the
+**evidence** behind it, combining three signals that say something about *time*:
+
+* **how long** the port has been in its current state (the `DATE` column of
+  `show interfaces gigabitEthernet state`),
+* whether it has **ever passed traffic** (interface counters, read together with
+  the switch uptime — `0 packets` is only trusted on a long-running box),
+* whether it belongs to an **MLT that is still forwarding**.
+
+| Class | Meaning |
+|---|---|
+| `IN USE` | link up, or MACs learned |
+| `IN USE - degraded` | down member of a still-forwarding MLT — a **fault on a live cable**, never filtered away |
+| `UNCERTAIN` | down, but has passed traffic or went down recently (server reboot, link flap) |
+| `LIKELY UNUSED` | down longer than the threshold, but the counters can't be trusted |
+| `UNUSED` | down long, zero counters over a long uptime, or admin-disabled |
+
+Nothing is ever silently dropped: likely-unused ports stay on the sheet and just
+sort to the bottom, so the techs work top-down. The threshold is
+`unused_after_days` in `config.yaml` (default 30).
+
 VOSS has **no** `show mac-address-table`; the forwarding database is read with
 `show interfaces gigabitEthernet fdb-entry`. The bare form (whole box, one
 command) is tried first, and releases that insist on a port argument fall back

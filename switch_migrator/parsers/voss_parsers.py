@@ -219,8 +219,18 @@ def parse_port_state(output: str) -> list[PortState]:
         if admin is None or oper is None:
             continue
         reason = tokens[3] if len(tokens) > 3 and tokens[3] != "--" else ""
+        # trailing DATE column = when the port last changed state. Free, and
+        # the single best evidence for "is this port actually used": down since
+        # May is decommissioned, down since 10 minutes ago is a link flap.
+        last_change = ""
+        for i, t in enumerate(tokens[3:], start=3):
+            if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", t):
+                last_change = t + (f" {tokens[i + 1]}" if i + 1 < len(tokens)
+                                   and re.fullmatch(r"\d{1,2}:\d{2}:\d{2}",
+                                                    tokens[i + 1]) else "")
+                break
         ports.append(PortState(port=tokens[0], admin_up=admin, oper_up=oper,
-                               state_reason=reason))
+                               state_reason=reason, last_change=last_change))
     return ports
 
 

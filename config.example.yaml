@@ -77,6 +77,13 @@ excluded_vlans:
   - 4058
   - 4059
 
+# --- Port usage classification ----------------------------------------------
+# A port that has been down longer than this counts as unused in the migration
+# sheets (it still appears, sorted to the bottom, with the evidence shown).
+# A down member of a still-forwarding MLT is never counted as unused - it is
+# reported as a fault on a live cable.
+unused_after_days: 30
+
 # --- SSH settings -----------------------------------------------------------------
 ssh:
   conn_timeout: 20        # seconds to establish the SSH connection

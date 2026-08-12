@@ -38,6 +38,11 @@ class PortState:
     is_uplink: bool = False
     # --- migration-sheet fields -------------------------------------------
     uid: str = ""                 # sequential migration ID (P0001), assigned per run
+    last_change: str = ""         # when the port last changed state (DATE column)
+    last_change_days: int | None = None   # age of that change, in days
+    has_traffic: bool | None = None       # any non-zero counter; None = unknown
+    usage: str = ""               # IN USE / DEGRADED / UNCERTAIN / LIKELY UNUSED / UNUSED
+    usage_evidence: str = ""      # why the tool decided that
     macs: list[str] = field(default_factory=list)   # learned MACs (capped)
     mac_total: int = 0            # how many were learned in total (before the cap)
     transceiver: str = ""         # pluggable optic type/vendor, when readable
@@ -117,6 +122,7 @@ class SwitchAudit:
     ist: IstState | None = None
     vlans: list[VlanInfo] = field(default_factory=list)
     running_config: str = ""      # raw `show running-config`, only if requested
+    uptime_days: int | None = None  # how long counters have accumulated
     # rows from `show interfaces gigabitEthernet i-sid`, kept so the per-port
     # VLAN/I-SID columns need no second call
     port_isid_rows: list[dict] = field(default_factory=list)

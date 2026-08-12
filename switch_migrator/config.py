@@ -63,6 +63,8 @@ class Config:
     isid_explicit: dict[int, int]
     excluded_vlans: set[int]
     excluded_vlan_names: list[str] = field(default_factory=list)
+    # a port down longer than this counts as unused (see usage.py)
+    unused_after_days: int = 30
     ssh: SshSettings = field(default_factory=SshSettings)
 
 
@@ -137,6 +139,7 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         isid_explicit=explicit,
         excluded_vlans=excluded_vlans,
         excluded_vlan_names=[str(p) for p in (data.get("excluded_vlan_names") or [])],
+        unused_after_days=int(data.get("unused_after_days", 30)),
         ssh=ssh,
     )
 

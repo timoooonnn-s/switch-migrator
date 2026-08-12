@@ -9,6 +9,7 @@ from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
 from switch_migrator.models import Platform, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
+from switch_migrator.usage import classify_audit, parse_uptime_days
 from switch_migrator.parsers.common import (
     PORT_RE,
     parse_lldp_neighbors,
@@ -43,6 +44,14 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
     if pull_config:
         out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
         audit.running_config = out or ""
+    if pull_macs:
+        # switch uptime tells us how long the interface counters have been
+        # accumulating - '0 packets' only means something on a long-running box
+        out = _run(audit, runner, "show sys-info", required=False, absent_ok=True)
+        if out:
+            audit.uptime_days = parse_uptime_days(out)
+        classify_audit(audit, unused_after_days=cfg.unused_after_days,
+                       uptime_days=audit.uptime_days)
     return audit
 
 
@@ -307,6 +316,26 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
                 else:
                     parts = tokens[1:]
                 port.transceiver = " ".join(parts)[:60]
+
+        # --- interface counters: has this port EVER passed traffic?
+        # Deliberately layout-independent: the classification only needs
+        # "are all counters on this row zero?", so no assumption is made about
+        # which column is packets-in vs octets-out (that layout varies by
+        # release and I have no capture to pin it to).
+        out = _run(audit, runner, "show interfaces gigabitEthernet statistics",
+                   required=False, absent_ok=True)
+        if out:
+            for line in out.splitlines():
+                tokens = line.split()
+                if len(tokens) < 2 or not PORT_RE.match(tokens[0]) \
+                        or "/" not in tokens[0]:
+                    continue
+                port = by_port.get(tokens[0])
+                if port is None:
+                    continue
+                counters = [int(t) for t in tokens[1:] if t.isdigit()]
+                if counters:
+                    port.has_traffic = any(c > 0 for c in counters)
 
 
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,
