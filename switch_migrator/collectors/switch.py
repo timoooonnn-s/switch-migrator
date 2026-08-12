@@ -262,12 +262,20 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
     table = _collect_fdb(audit, runner, by_port)
     if table:
         by_mlt = {m.mlt_id: m for m in audit.mlts}
+        by_mlt_name = {m.name: m for m in audit.mlts if m.name}
         for key, entries in table.items():
             targets: list = []
+            mlt = None
             if key.startswith("mlt:"):
                 mlt = by_mlt.get(int(key.split(":", 1)[1]))
-                targets = [by_port[m] for m in (mlt.members if mlt else [])
-                           if m in by_port]
+            elif key.startswith("name:"):
+                # real VOSS prints the MLT's NAME in the fdb INTERFACE column
+                mlt = by_mlt_name.get(key.split(":", 1)[1])
+                if mlt is None:
+                    log.info("[%s] fdb interface '%s' matches no known MLT - "
+                             "entries skipped", audit.name, key[5:])
+            if mlt is not None:
+                targets = [by_port[m] for m in mlt.members if m in by_port]
             elif key in by_port:
                 targets = [by_port[key]]
             for port in targets:
@@ -276,18 +284,29 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
                     if len(port.macs) < MAC_CAP and mac not in port.macs:
                         port.macs.append(mac)
 
-    # --- pluggable optics (VOSS); the media type itself is already in the
-    # port DESCRIPTION column, this adds the vendor/part when available
+    # --- pluggable optics (VOSS). Real columns are
+    #   PORT NUM | TYPE | DDM SUPPORTED | VENDOR NAME | PART NUMBER | SKU
+    # so the TYPE/VENDOR/PART are taken around the TRUE/FALSE DDM token rather
+    # than by blind position (releases add/drop trailing columns).
     if audit.platform is Platform.VOSS:
         out = _run(audit, runner, "show pluggable-optical-modules basic",
                    required=False, absent_ok=True)
         if out:
             for line in out.splitlines():
                 tokens = line.split()
-                if len(tokens) >= 2 and PORT_RE.match(tokens[0]) and "/" in tokens[0]:
-                    port = by_port.get(tokens[0])
-                    if port is not None and not port.transceiver:
-                        port.transceiver = " ".join(tokens[1:4])[:40]
+                if len(tokens) < 2 or not PORT_RE.match(tokens[0]) \
+                        or "/" not in tokens[0]:
+                    continue
+                port = by_port.get(tokens[0])
+                if port is None or port.transceiver:
+                    continue
+                ddm = next((i for i, t in enumerate(tokens)
+                            if t.upper() in ("TRUE", "FALSE")), None)
+                if ddm is not None:
+                    parts = tokens[1:ddm] + tokens[ddm + 1:]   # drop the DDM flag
+                else:
+                    parts = tokens[1:]
+                port.transceiver = " ".join(parts)[:60]
 
 
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,

@@ -82,7 +82,8 @@ def build_cabling(audits: list[SwitchAudit]) -> Table:
     """
     t = Table("Cabling", [
         "VLAN", "Type", "Port ID", "End device / neighbor",
-        "NEW switch", "NEW port",          # filled in by the technician
+        # filled in by the technician / planner during the migration
+        "NEW switch", "NEW port", "NEW MLT ID", "NEW MLT name", "NEW VLAN",
         "Old switch", "Old port",
         "MLT ID", "MLT name", "MLT VLANs", "MLT I-SIDs",
         "Port VLANs", "Port I-SIDs",
@@ -103,7 +104,7 @@ def build_cabling(audits: list[SwitchAudit]) -> Table:
                 first_vlan = mlt.vlans[0]
             t.add([
                 first_vlan, kind, p.uid, _neighbor(p),
-                "", "",                     # NEW switch / NEW port: to fill in
+                "", "", "", "", "",         # NEW switch/port/MLT id/MLT name/VLAN
                 audit.name, p.port,
                 p.mlt_id if p.mlt_id is not None else "",
                 p.mlt_name,

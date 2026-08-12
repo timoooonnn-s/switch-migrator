@@ -31,20 +31,23 @@ ID   STATUS     ADDRESS            INTERFACE  REMOTE
 ----------------------------------------------------------------------------------------------------
 695  learned    00:11:22:00:00:01  Port-1/7      false
 695  learned    00:11:22:00:00:02  Port-1/7      false
-174  learned    00:11:22:00:00:04  Mlt-35        false
+174  learned    00:11:22:00:00:04  MLT035.s.1/2/23/24 true
 
 c: customer vid   u: untagged-traffic
 
 3 out of 7 entries in all fdb(s) displayed.
 """
 
+# real ERS/BOSS 'show mac-address-table': MAC first, source is 'Port:48'
 ERS_MACS = """\
-              Mac Address Table
-Vlan    Mac Address       Type        Ports
-----    -----------       ----        -----
-735     0011.2200.0011    Learned     7
-735     0011.2200.0012    Learned     8
-174     0011.2200.0013    Learned     Trunk 1
+Mac Address Table Aging Time: 300
+Number of addresses: 1655
+
+   MAC Address    Vid   Type       Source
+----------------- ---- ------- --------------
+0011.2200.0011       735 Dynamic Port:7
+0011.2200.0012       735 Dynamic Port:8
+0011.2200.0013       174 Dynamic Trunk:1
 """
 
 
@@ -61,7 +64,7 @@ def test_parse_mac_table_voss_port_prefix_and_mlt():
     # 'Port-1/7' must be attributed to port 1/7, not dropped
     assert [m for m, _ in t["1/7"]] == ["00:11:22:00:00:01", "00:11:22:00:00:02"]
     assert t["1/7"][0][1] == 695                      # VLAN column picked up
-    assert [m for m, _ in t["mlt:35"]] == ["00:11:22:00:00:04"]
+    assert [m for m, _ in t["name:MLT035.s.1/2/23/24"]] == ["00:11:22:00:00:04"]
     # the footer line carries no MAC and must not create an entry
     assert all(not k.startswith("2 ") for k in t)
 
@@ -267,3 +270,53 @@ def test_cabling_sheet_carries_mlt_and_port_vlans(tmp_path):
     # a row with no MLT leaves those cells blank rather than inventing data
     non_mlt = [r for r in t.rows if r[hdr.index("MLT ID")] == ""]
     assert all(r[hdr.index("MLT VLANs")] == "" for r in non_mlt)
+
+
+def test_real_optics_columns_drop_the_ddm_flag():
+    # real 'show pluggable-optical-modules basic':
+    #   PORT NUM | TYPE | DDM SUPPORTED | VENDOR NAME | PART NUMBER | SKU
+    # the TRUE/FALSE DDM flag must not end up in the transceiver text
+    import shutil, tempfile
+    tmp = Path(tempfile.mkdtemp())
+    dev = tmp / "sw"
+    shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
+    (dev / "show_pluggable_optical_modules_basic.txt").write_text(
+        "PORT                  DDM\n"
+        "NUM    TYPE           SUPPORTED          VENDOR NAME        PART NUMBER\n"
+        "-----------------------------------------------------------------------\n"
+        "1/7    10GbSR         TRUE               Extreme            10301\n")
+    cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
+                 isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
+    audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
+                           OfflineRunner("sw", tmp), cfg, pull_macs=True)
+    t = {p.port: p.transceiver for p in audit.ports}
+    assert t["1/7"] == "10GbSR Extreme 10301"
+    assert "TRUE" not in t["1/7"]
+
+
+def test_fdb_mlt_name_fans_out_to_member_ports(tmp_path):
+    # real VOSS fdb prints the MLT's NAME in the INTERFACE column; it must be
+    # resolved against the known MLTs, not filed under a bogus port
+    dev = tmp_path / "sw"
+    shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
+    (dev / "show_interfaces_gigabitethernet_fdb_entry.txt").write_text(VOSS_MACS)
+    cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
+                 isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
+    audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
+                           OfflineRunner("sw", tmp_path), cfg, pull_macs=True)
+    by_port = {p.port: p for p in audit.ports}
+    # MLT035 members are 1/1,1/2,1/23,1/24 - all get the MLT-learned MAC
+    for member in ("1/1", "1/2", "1/23", "1/24"):
+        assert "00:11:22:00:00:04" in by_port[member].macs, member
+    # and nothing was filed under the VLAN id as if it were a port
+    assert "31" not in by_port and "174" not in by_port
+
+
+def test_cabling_sheet_has_new_mlt_placeholders():
+    a = _audit_with_ports()
+    assign_port_uids([a])
+    t = build_cabling([a])
+    hdr = t.headers
+    for col in ("NEW switch", "NEW port", "NEW MLT ID", "NEW MLT name", "NEW VLAN"):
+        assert col in hdr, col
+        assert all(r[hdr.index(col)] == "" for r in t.rows), f"{col} must be blank"

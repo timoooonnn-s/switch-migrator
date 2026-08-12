@@ -73,15 +73,38 @@ def normalize_mac(raw: str) -> str:
     return ":".join(hexs[i:i + 2] for i in range(0, 12, 2))
 
 
-def parse_mac_table(output: str) -> dict[str, list[tuple[str, int | None]]]:
-    """`show mac-address-table` (VOSS and ERS/BOSS) -> {port: [(mac, vlan)]}.
+# tokens that are status/flag words, never an interface
+_FDB_KEYWORDS = {
+    "learned", "self", "dynamic", "static", "mgmt", "invalid", "config",
+    "true", "false", "-", "cpu", "secure", "aging", "other", "management",
+}
+# 'Port-1/7', 'Port:48', 'Port 48' (VOSS / ERS spell it differently)
+_IFACE_PORT_RE = re.compile(r"^Port[-: ]?(\d+(?:/\d+){0,2})$", re.IGNORECASE)
+# 'Mlt-35', 'MLT:35', 'Trunk:1'
+_IFACE_MLT_RE = re.compile(r"^(?:Mlt|Trunk)[-: ]?(\d+)$", re.IGNORECASE)
 
-    Column order differs across platforms and releases, so rows are matched by
-    SHAPE rather than position: a line is a MAC entry when it contains exactly
-    one MAC-shaped token and one port-shaped token; the VLAN is the first small
-    integer (1-4094) that is not the port. Header, banner and footer lines carry
-    no MAC and are skipped. MLT entries ('mlt 1' / 'MLT-1') are attributed to
-    that MLT rather than a port and are returned under the 'mlt:<id>' key.
+
+def parse_mac_table(output: str) -> dict[str, list[tuple[str, int | None]]]:
+    """Forwarding-database output -> {interface: [(mac, vlan)]}.
+
+    Covers VOSS `show interfaces gigabitEthernet fdb-entry` and ERS/BOSS
+    `show mac-address-table`, whose column ORDER and interface SPELLING both
+    differ, so rows are matched by shape: a line is an entry when it holds
+    exactly one MAC-shaped token. The interface is then resolved in order of
+    decreasing certainty:
+
+      1. an explicitly labelled column - 'Port-1/7', 'Port:48', 'Mlt-35',
+         'Trunk:1', 'mlt 35' (unambiguous, so it wins);
+      2. a bare slot/port token ('1/7');
+      3. on ERS the port column can be a bare number, which is ambiguous with
+         the VLAN column - the LAST bare number is the port, the first is the
+         VLAN;
+      4. anything else non-numeric that is not a status word is an MLT NAME
+         (real VOSS prints the MLT's name, not 'Mlt-<id>') and is returned as
+         'name:<name>' for the caller to resolve against the known MLTs.
+
+    MLT entries are returned under 'mlt:<id>' so the caller can fan them out to
+    the member ports.
     """
     result: dict[str, list[tuple[str, int | None]]] = {}
     for line in output.splitlines():
@@ -90,37 +113,42 @@ def parse_mac_table(output: str) -> dict[str, list[tuple[str, int | None]]]:
         if len(macs) != 1:
             continue
         mac = normalize_mac(macs[0])
-        # VOSS prefixes the interface column ('Port-1/7', 'Mlt-35'); strip it
-        rest = []
-        for t in tokens:
-            if MAC_RE.match(t):
-                continue
-            m = re.match(r"^Port-?(\d+(?:/\d+){0,2})$", t, re.IGNORECASE)
+        rest = [t for t in tokens if not MAC_RE.match(t)]
+
+        iface: str | None = None
+        for t in rest:                                   # (1) labelled column
+            m = _IFACE_PORT_RE.match(t)
             if m:
-                rest.append(m.group(1))
-                continue
-            rest.append(t)
-        port = next((t for t in rest if PORT_RE.match(t) and "/" in t), None)
-        if port is None:
-            # ERS ports are bare numbers; an MLT reference wins over a number
-            mlt = next((t for i, t in enumerate(rest)
-                        if t.lower() in ("mlt", "trunk") and i + 1 < len(rest)
-                        and rest[i + 1].isdigit()), None)
-            if mlt is not None:
-                idx = rest.index(mlt)
-                port = f"mlt:{rest[idx + 1]}"
-            else:
-                m = re.search(r"\bMLT-(\d+)\b", line, re.IGNORECASE)
-                if m:
-                    port = f"mlt:{m.group(1)}"
-                else:
-                    cands = [t for t in rest if PORT_RE.match(t)]
-                    port = cands[-1] if cands else None
-        if port is None:
+                iface = m.group(1)
+                break
+            m = _IFACE_MLT_RE.match(t)
+            if m:
+                iface = f"mlt:{m.group(1)}"
+                break
+        if iface is None:                                # 'mlt 35' / 'Trunk 1'
+            for i, t in enumerate(rest[:-1]):
+                if t.lower() in ("mlt", "trunk") and rest[i + 1].isdigit():
+                    iface = f"mlt:{rest[i + 1]}"
+                    break
+        if iface is None:                                # (2) bare slot/port
+            slots = [t for t in rest if PORT_RE.match(t) and "/" in t]
+            if slots:
+                iface = slots[-1]
+        numbers = [t for t in rest if t.isdigit()]
+        if iface is None and len(numbers) >= 2:          # (3) ERS bare numbers
+            iface = numbers[-1]
+        if iface is None:                                # (4) an MLT name
+            names = [t for t in rest
+                     if not t.isdigit() and t.lower() not in _FDB_KEYWORDS
+                     and not PORT_RE.match(t)]
+            if names:
+                iface = f"name:{names[0]}"
+        if iface is None:
             continue
-        vlan = next((int(t) for t in rest
-                     if t.isdigit() and t != port and 1 <= int(t) <= 4094), None)
-        result.setdefault(port, []).append((mac, vlan))
+        # the VLAN is the first small integer that is not the interface itself
+        vlan = next((int(t) for t in numbers
+                     if t != iface and 1 <= int(t) <= 4094), None)
+        result.setdefault(iface, []).append((mac, vlan))
     return result
 
 
