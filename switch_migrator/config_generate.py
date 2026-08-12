@@ -11,6 +11,7 @@ every assumption is annotated; it is not for blind paste.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from switch_migrator.config import Config
@@ -24,21 +25,53 @@ class ErsGenerateResult:
     decisions: list[IsidDecision] = field(default_factory=list)
 
 
-def _compress(nums: list[int]) -> str:
-    """[4,5,6,9,11,12] -> '1/4-1/6,1/9,1/11-1/12'."""
-    nums = sorted(set(nums))
-    if not nums:
-        return ""
-    runs: list[tuple[int, int]] = []
-    start = prev = nums[0]
-    for n in nums[1:]:
-        if n == prev + 1:
-            prev = n
-            continue
+_PORT_ID_RE = re.compile(r"^(?:(\d+)/)?(\d+)$")
+
+
+def _split(port: str) -> tuple[int, int] | None:
+    """ERS port id -> (unit, port).
+
+    A standalone ERS numbers its ports flat ('7'); a stack qualifies them with
+    the unit ('2/7'). Both map onto the new box as <unit>/<port>, so a flat id
+    is simply unit 1. Anything else (an 'ALL' keyword, a mangled line) returns
+    None and is skipped rather than crashing the run.
+    """
+    m = _PORT_ID_RE.match(port.strip())
+    return (int(m.group(1) or 1), int(m.group(2))) if m else None
+
+
+def _voss_port(port: str) -> str:
+    """ERS port id -> the VOSS interface id it becomes ('7' -> '1/7')."""
+    sp = _split(port)
+    return f"{sp[0]}/{sp[1]}" if sp else port
+
+
+def _compress(ports: list[str] | list[int]) -> str:
+    """['4','5','6','9'] -> '1/4-1/6,1/9'; stacked ids keep their unit.
+
+    Runs are built per unit, so a stack never collapses 1/48 and 2/1 into a
+    range that does not exist on the hardware.
+    """
+    by_unit: dict[int, list[int]] = {}
+    for p in ports:
+        sp = _split(str(p))
+        if sp is not None:
+            by_unit.setdefault(sp[0], []).append(sp[1])
+    out: list[str] = []
+    for unit in sorted(by_unit):
+        nums = sorted(set(by_unit[unit]))
+        runs: list[tuple[int, int]] = []
+        start = prev = nums[0]
+        for n in nums[1:]:
+            if n == prev + 1:
+                prev = n
+                continue
+            runs.append((start, prev))
+            start = prev = n
         runs.append((start, prev))
-        start = prev = n
-    runs.append((start, prev))
-    return ",".join(f"1/{a}" if a == b else f"1/{a}-1/{b}" for a, b in runs)
+        out += [f"{unit}/{a}" if a == b else f"{unit}/{a}-{unit}/{b}"
+                for a, b in runs]
+    return ",".join(out)
 
 
 _HEADER = """\
@@ -87,7 +120,10 @@ def generate_voss_from_ers(ers: ErsModel, cfg: Config,
 
     decisions: list[IsidDecision] = []
     services: list[str] = []
-    access_used: set[int] = set()
+    access_used: set[str] = set()
+
+    def _order(p: str) -> tuple[int, int]:
+        return _split(p) or (0, 0)
 
     for vid in sorted(ers.vlans):
         vlan = ers.vlans[vid]
@@ -95,14 +131,25 @@ def generate_voss_from_ers(ers: ErsModel, cfg: Config,
         decisions.append(d)
         if d.excluded:
             continue
-        access = [p for p in vlan.members if p not in uplink]
-        low = sorted(int(p) for p in access if int(p) <= 48)
-        high = sorted(int(p) for p in access if int(p) > 48)
+        # ports 1-48 are the copper access ports that map 1:1 onto the new box;
+        # anything above is the SFP cage, which has no equivalent port number
+        low: list[str] = []
+        high: list[str] = []
+        for p in vlan.members:
+            if p in uplink:
+                continue
+            sp = _split(p)
+            if sp is None:
+                continue
+            (low if sp[1] <= 48 else high).append(p)
+        low.sort(key=_order)
+        high.sort(key=_order)
         if not low and not high:
             continue  # VLAN lives only on the uplink -> carried by the fabric
 
-        untagged = [n for n in low if ers.ports.get(str(n)) and ers.ports[str(n)].pvid == vid]
-        tagged = [n for n in low if n not in untagged]
+        untagged = [p for p in low
+                    if p in ers.ports and ers.ports[p].pvid == vid]
+        tagged = [p for p in low if p not in untagged]
         access_used.update(low)
 
         name = f' ({vlan.name})' if vlan.name else ""
@@ -124,15 +171,15 @@ def generate_voss_from_ers(ers: ErsModel, cfg: Config,
         block.append(f"{prefix}exit")
         if high:
             block.append(f"# [REVIEW] VLAN {vid} also on ERS port(s) "
-                         f"{','.join(map(str, high))} (SFP/high) - no 1/N "
+                         f"{','.join(high)} (SFP/high) - no 1/N "
                          f"equivalent, remap to the new hardware")
         services.append("\n".join(block))
 
     # flex-UNI access ports
     ports_out: list[str] = []
-    for n in sorted(access_used):
-        p = ers.ports.get(str(n))
-        ports_out.append(f"interface GigabitEthernet 1/{n}")
+    for port_id in sorted(access_used, key=_order):
+        p = ers.ports.get(port_id)
+        ports_out.append(f"interface GigabitEthernet {_voss_port(port_id)}")
         ports_out.append("default-vlan-id 0")
         if p and p.name:
             ports_out.append(f'name "{p.name}"')

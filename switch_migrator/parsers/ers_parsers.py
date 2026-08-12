@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 
 from switch_migrator.models import IstState, MltState, PortState, VlanInfo
-from switch_migrator.parsers.common import PORT_RE, expand_port_list
+from switch_migrator.parsers.common import PORT_RE, expand_port_list, name_says_ist
 
 _VLAN_TYPES = ("Port", "Protocol", "Protocol-based", "MAC", "MACSA", "SPBM-BVLAN",
                "Spbm-bvlan", "Private", "IDS", "RSPAN")
@@ -116,7 +116,7 @@ def parse_mlt(output: str) -> list[MltState]:
             mlt_type=mlt_type,
             admin=status,
             members=members,
-            is_ist="ist" in name.lower(),
+            is_ist=name_says_ist(name),
         ))
     return mlts
 

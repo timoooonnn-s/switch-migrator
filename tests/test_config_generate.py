@@ -132,3 +132,39 @@ def test_cli_extract_config_ers_end_to_end(tmp_path):
     assert "I-SID decision worksheet" in ws
     assert "isid_conventions:" in ws                       # paste-ready snippet
     assert "VLAN 695" in ws                                # needs a decision (no fabric)
+
+
+# ---- stacked ERS (unit-qualified port ids) --------------------------------
+
+_STACKED = """\
+vlan create 100 type port
+vlan name 100 "servers"
+vlan members add 100 1/5-1/6,2/5
+vlan ports 1/5-1/6,2/5 pvid 100
+name port 1/5 "srv-a"
+vlan create 200 type port
+vlan members add 200 2/49
+mlt 1 name "uplink" enable member 1/49-1/50
+"""
+
+
+def test_stacked_ers_port_ids_do_not_crash_and_keep_their_unit():
+    """A stack numbers its ports '<unit>/<port>'. Feeding those through the
+    generator used to raise ValueError on int('1/1') and abort the whole run."""
+    m = parse_ers_config(_STACKED)
+    res = generate_voss_from_ers(m, _cfg(isid_explicit={100: 2510100}),
+                                 device_name="ers-stack-01")
+    text = res.text
+    assert "untagged-traffic port 1/5-1/6,2/5" in text
+    assert "interface GigabitEthernet 1/5" in text
+    assert "interface GigabitEthernet 2/5" in text
+    assert 'name "srv-a"' in text
+    # 2/49 is above the copper range -> flagged for remapping, not emitted
+    assert "2/49 (SFP/high)" in text
+    assert "interface GigabitEthernet 2/49" not in text
+
+
+def test_compress_never_bridges_a_range_across_units():
+    assert _compress(["1/47", "1/48", "2/1", "2/2"]) == "1/47-1/48,2/1-2/2"
+    assert _compress(["3"]) == "1/3"
+    assert _compress(["ALL"]) == ""

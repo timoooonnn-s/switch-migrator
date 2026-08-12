@@ -7,7 +7,7 @@ import logging
 
 from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
-from switch_migrator.models import Platform, SwitchAudit, VlanInfo
+from switch_migrator.models import Platform, PortState, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
 from switch_migrator.usage import classify_audit, parse_uptime_days
 from switch_migrator.parsers.common import (
@@ -79,6 +79,25 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
         return None
 
 
+def _merge_port_details(audit: SwitchAudit, extra: list[PortState]) -> None:
+    """Fill gaps in the already-collected ports from a second port table.
+
+    Only ever adds: the first source stays authoritative for the state it
+    reported, and ports it never mentioned are appended rather than dropped.
+    """
+    by_port = {p.port: p for p in audit.ports}
+    for other in extra:
+        port = by_port.get(other.port)
+        if port is None:
+            audit.ports.append(other)
+            continue
+        port.description = port.description or other.description
+        if port.admin_up is None:
+            port.admin_up = other.admin_up
+        if port.oper_up is None:
+            port.oper_up = other.oper_up
+
+
 def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     # Port-state fallback chain: which variants exist differs across 8.x
     # releases. First command that yields ports wins. The plain
@@ -92,11 +111,26 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
         ("show interfaces gigabitEthernet interface", voss_parsers.parse_ports),
     )
     for command, parser in port_sources:
-        out = _run(audit, runner, command, required=False)
-        if out:
-            audit.ports = parser(out)
-            if audit.ports:
+        # once we already have the port state, a later variant only adds the
+        # media type - its absence on this release is not worth a warning
+        out = _run(audit, runner, command, required=False,
+                   absent_ok=bool(audit.ports))
+        if not out:
+            continue
+        parsed = parser(out)
+        if not parsed:
+            continue
+        if not audit.ports:
+            audit.ports = parsed
+            # the 'state' table has no DESCRIPTION column, so on its own it
+            # leaves the media type blank. Keep going to the 'interface'
+            # variant and merge that column in rather than sending a second
+            # command later; both tables are one narrow row per port.
+            if all(p.description for p in parsed):
                 break
+            continue
+        _merge_port_details(audit, parsed)
+        break
     if not audit.ports:
         audit.errors.append(
             "no port state obtained: all 'show interfaces gigabitEthernet' "
