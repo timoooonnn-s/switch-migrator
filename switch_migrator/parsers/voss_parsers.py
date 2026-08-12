@@ -80,8 +80,16 @@ def parse_mlt(output: str) -> list[MltState]:
     datapath = _parse_mlt_datapath(output)
     mlts: list[MltState] = []
     seen: set[int] = set()
+    current: MltState | None = None   # last Mlt Info row, for VLAN continuations
     for line in output.splitlines():
         tokens = line.split()
+        # a line of bare VLAN ids continues the previous row's VLAN IDS column
+        if (current is not None and tokens
+                and all(t.isdigit() and 1 <= int(t) <= 4094 for t in tokens)):
+            current.vlans.extend(int(t) for t in tokens
+                                 if int(t) not in current.vlans)
+            continue
+        current = None
         if len(tokens) < 3 or not tokens[0].isdigit():
             continue
         mlt_id = int(tokens[0])
@@ -93,25 +101,34 @@ def parse_mlt(output: str) -> list[MltState]:
             continue
         name = rest[0]
         members: list[str] = []
-        for t in rest[1:]:
+        members_at = None
+        for i, t in enumerate(rest[1:], start=1):
             if "/" in t and PORT_LIST_RE.match(t):
                 members = expand_port_list(t)
+                members_at = i
                 break
         mlt_type = next((t for t in rest if t.lower() in ("access", "trunk")), "")
         states = [t for t in rest if t.lower() in ("norm", "smlt", "ist")]
         if (not mlt_type and not states) or mlt_id in seen:
             continue
         seen.add(mlt_id)
-        mlts.append(MltState(
+        # everything after the PORT MEMBERS column is the VLAN IDS list
+        vlans = ([int(t) for t in rest[members_at + 1:]
+                  if t.isdigit() and 1 <= int(t) <= 4094]
+                 if members_at is not None else [])
+        mlt = MltState(
             mlt_id=mlt_id,
             name=name,
             mlt_type=mlt_type,
             admin=states[0] if states else "",
             current=states[1] if len(states) > 1 else "",
             members=members,
+            vlans=vlans,
             in_datapath=datapath.get(mlt_id),
             is_ist="ist" in name.lower() or "ist" in [s.lower() for s in states],
-        ))
+        )
+        mlts.append(mlt)
+        current = mlt
     return mlts
 
 

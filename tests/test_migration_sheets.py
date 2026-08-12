@@ -230,3 +230,40 @@ def test_fdb_per_port_fallback_when_bare_form_rejected(tmp_path):
     assert by_port["1/10"].macs == ["00:11:22:00:00:bb"]
     # the failed bare attempt and the missing per-port captures stay quiet
     assert not [w for w in audit.warnings if "fdb-entry" in w]
+
+
+def test_mlt_vlans_parsed_from_show_mlt_incl_continuation(fixture):
+    from switch_migrator.parsers.voss_parsers import parse_mlt
+    # the VLAN IDS column of the Mlt Info table, incl. lines that wrap
+    mlts = {m.mlt_id: m for m in parse_mlt(
+        "38  6181  s129  trunk  smlt  smlt  1/29   174 695 735\n"
+        "2246 2901 2952\n"
+        "2600\n")}
+    assert mlts[38].vlans == [174, 695, 735, 2246, 2901, 2952, 2600]
+    assert mlts[38].members == ["1/29"]
+
+
+def test_cabling_sheet_carries_mlt_and_port_vlans(tmp_path):
+    dev = tmp_path / "sw"
+    shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
+    (dev / "show_interfaces_gigabitethernet_fdb_entry.txt").write_text(VOSS_MACS)
+    cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
+                 isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
+    audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
+                           OfflineRunner("sw", tmp_path), cfg, pull_macs=True)
+    assign_port_uids([audit])
+    t = build_cabling([audit])
+    hdr = t.headers
+    for col in ("MLT ID", "MLT name", "MLT VLANs", "MLT I-SIDs",
+                "Port VLANs", "Port I-SIDs"):
+        assert col in hdr, col
+    # 1/1 is a member of MLT 35, which carries 34 VLANs on this box
+    row = next(r for r in t.rows if r[hdr.index("Old port")] == "1/1")
+    assert row[hdr.index("MLT ID")] == 35
+    assert row[hdr.index("MLT name")] == "MLT035.s.1/2/23/24"
+    mlt_vlans = row[hdr.index("MLT VLANs")].split(",")
+    assert "174" in mlt_vlans and len(mlt_vlans) == 34
+    assert row[hdr.index("MLT I-SIDs")]          # mapped through the VLAN table
+    # a row with no MLT leaves those cells blank rather than inventing data
+    non_mlt = [r for r in t.rows if r[hdr.index("MLT ID")] == ""]
+    assert all(r[hdr.index("MLT VLANs")] == "" for r in non_mlt)

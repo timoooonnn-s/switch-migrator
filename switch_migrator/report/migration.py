@@ -73,23 +73,44 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
 
 def build_cabling(audits: list[SwitchAudit]) -> Table:
     """Sheet 2: the DC cabling worksheet - connected ports only, with empty
-    columns the technicians fill in as they re-patch."""
+    columns the technicians fill in as they re-patch.
+
+    Deliberately WIDE ("one big paper"): every row is self-contained, carrying
+    both the port's own VLANs/I-SIDs and, when the port is an MLT member, the
+    MLT's id, name and its VLANs/I-SIDs - so nobody has to cross-reference a
+    second sheet while standing at the rack.
+    """
     t = Table("Cabling", [
         "VLAN", "Type", "Port ID", "End device / neighbor",
         "NEW switch", "NEW port",          # filled in by the technician
-        "Old switch", "Old port", "MAC addresses", "Media",
+        "Old switch", "Old port",
+        "MLT ID", "MLT name", "MLT VLANs", "MLT I-SIDs",
+        "Port VLANs", "Port I-SIDs",
+        "MAC addresses", "Media",
     ])
     for audit in sorted(audits, key=lambda a: a.name):
+        mlt_by_id = {m.mlt_id: m for m in audit.mlts}
         for p in audit.ports:
             if not _connected(p):
                 continue
             first_vlan = p.vlans[0] if p.vlans else ""
             kind = "uplink" if p.is_uplink else ("mlt" if p.mlt_id is not None
                                                  else "access")
+            mlt = mlt_by_id.get(p.mlt_id) if p.mlt_id is not None else None
+            # an MLT member's traffic is the union of the MLT's VLANs; fall back
+            # to the MLT's list when the port itself has no per-port bindings
+            if not first_vlan and mlt is not None and mlt.vlans:
+                first_vlan = mlt.vlans[0]
             t.add([
                 first_vlan, kind, p.uid, _neighbor(p),
                 "", "",                     # NEW switch / NEW port: to fill in
-                audit.name, p.port, _macs_cell(p), p.media,
+                audit.name, p.port,
+                p.mlt_id if p.mlt_id is not None else "",
+                p.mlt_name,
+                ",".join(map(str, mlt.vlans)) if mlt else "",
+                ",".join(map(str, mlt.isids)) if mlt else "",
+                ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
+                _macs_cell(p), p.media,
             ])
     return t
 

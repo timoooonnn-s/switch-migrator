@@ -210,7 +210,11 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
     by_port = {p.port: p for p in audit.ports}
 
     # --- MLT membership (+ LACP, parsed earlier from the same show mlt output)
+    isid_of_vlan = {v.vlan_id: v.isid for v in audit.vlans}
     for mlt in audit.mlts:
+        # the MLT's own VLAN IDS list (from show mlt) mapped to I-SIDs
+        mlt.isids = sorted({isid_of_vlan[v] for v in mlt.vlans
+                            if isid_of_vlan.get(v) is not None})
         for member in mlt.members:
             port = by_port.get(member)
             if port is None:

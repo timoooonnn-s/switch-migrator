@@ -203,10 +203,12 @@ switches consolidate onto fewer new ones.
 * **Port Info** (all ports) — Port ID, switch, port, device on the port (LLDP
   name / IP / SysDescr), MAC addresses, tagging, VLAN IDs, I-SIDs, admin & oper
   state, LACP, MLT ID & name, transceiver, media, uplink flag.
-* **Cabling** (connected ports only — what actually gets re-patched) — first
-  VLAN, type (access/mlt/uplink), Port ID, end device / neighbor, **empty NEW
-  switch + NEW port columns for the technicians to fill in**, old switch, old
-  port, MAC addresses and physical media.
+* **Cabling** (connected ports only — what actually gets re-patched) —
+  deliberately wide, *one big paper*, so every row is self-contained at the
+  rack: first VLAN, type (access/mlt/uplink), Port ID, end device / neighbor,
+  **empty NEW switch + NEW port columns for the technicians to fill in**, old
+  switch, old port, **MLT ID, MLT name, the MLT's VLANs and I-SIDs**, the
+  **port's own VLANs and I-SIDs**, MAC addresses and physical media.
 * **`migration-commands-<stamp>.txt`** — per-port
   `show interfaces gigabitEthernet fdb-entry` commands to run on the **new**
   switch (each annotated with the Port ID, the

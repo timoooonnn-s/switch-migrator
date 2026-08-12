@@ -71,6 +71,8 @@ class MltState:
     # MLT from a dead one even when per-port state is unavailable.
     in_datapath: bool | None = None
     lacp: bool | None = None      # LACP admin state (VOSS: show mlt LACP table)
+    vlans: list[int] = field(default_factory=list)  # VLAN IDS column of show mlt
+    isids: list[int] = field(default_factory=list)  # I-SIDs of those VLANs
     is_ist: bool = False
     is_uplink: bool = False
 
