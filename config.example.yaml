@@ -77,12 +77,64 @@ excluded_vlans:
   - 4058
   - 4059
 
+# --- Port usage classification ----------------------------------------------
+# A port that has been down longer than this counts as unused in the migration
+# sheets (it still appears, sorted to the bottom, with the evidence shown).
+# A down member of a still-forwarding MLT is never counted as unused - it is
+# reported as a fault on a live cable.
+unused_after_days: 30
+
+# --- Locations ----------------------------------------------------------------
+# Switch names carry the site in their prefix, so the DC cabling sheet can be
+# split per location (--split-by-location) without maintaining a second list of
+# which box is where. Only the cabling sheet is split; everything else stays
+# whole.
+locations:
+  # Switch-name glob -> location name, in order; the FIRST match wins. The name
+  # is what the worksheet tab is called, so use what your technicians say.
+  patterns:
+    "gx-11-*": "Frankfurt DC1"
+    "gx-12-*": "Frankfurt DC2"
+    "mu-*": "Munich"
+
+  # When no pattern matches, the location is the first N '-' segments of the
+  # name (gx-11-s72-p1 -> gx-11). A site nobody has configured yet still groups
+  # sensibly instead of landing in a bucket called "other".
+  fallback_segments: 2
+
+  # Which locations share ONE worksheet. A location in no group gets its own
+  # sheet, so "separate everything" is what you get by writing nothing here.
+  # Location names or globs both work.
+  groups:
+    Frankfurt: ["Frankfurt DC1", "Frankfurt DC2"]
+  # Override for a single run without editing this file:
+  #   --location-group 'Frankfurt=Frankfurt DC*' --location-group 'South=Munich'
+
+# --- Learned MAC addresses ----------------------------------------------------
+# How many MACs to keep per port in the migration sheets. Raise it on
+# server-heavy access ports (a virtualization host shows dozens), lower it on
+# busy uplinks. The true number is always reported as '(+N more)' whatever the
+# cap, so lowering it loses detail, never the count.
+mac_cap: 10
+
 # --- SSH settings -----------------------------------------------------------------
 ssh:
   conn_timeout: 20        # seconds to establish the SSH connection
   read_timeout: 60        # seconds to wait for a command to finish
   workers: 4              # parallel device connections
   retries: 1              # reconnect attempts after a connection failure
+
+  # Re-sends of a SINGLE command that died on a transport error (one dropped
+  # read, a stuck --More-- pager). One flaky command should not cost a whole
+  # column of the report. A command the DEVICE rejected ('% Invalid input') is
+  # never retried - that answer will not change.
+  command_retries: 1
+
+  # Consecutive transport failures after which the session for that device is
+  # abandoned, instead of burning read_timeout on every remaining command of a
+  # box that has stopped answering.
+  max_transport_failures: 2
+
   # Old ERS/BOSS gear only speaks SHA-1 kex, CBC ciphers and ssh-rsa/ssh-dss
   # host keys. true appends those to the client's algorithm lists (modern
   # algorithms keep priority, current devices are unaffected). Client-side

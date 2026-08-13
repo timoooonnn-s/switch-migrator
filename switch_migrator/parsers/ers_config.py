@@ -94,9 +94,12 @@ def parse_ers_config(text: str) -> ErsModel:
                 m.port(p).pvid = int(mm.group(2))
             continue
 
-        mm = re.match(r'name port\s+(\d+)\s+"(.*)"', s)
+        # port ids are flat on a standalone ('5') and unit-qualified on a
+        # stack ('1/5') - both forms appear in the same commands
+        mm = re.match(r'name port\s+(\S+)\s+"(.*)"', s)
         if mm:
-            m.port(mm.group(1)).name = mm.group(2)
+            for p in expand_port_list(mm.group(1)):
+                m.port(p).name = mm.group(2)
             continue
 
         mm = re.match(r"shutdown port\s+(\S+)", s)

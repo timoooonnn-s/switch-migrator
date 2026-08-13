@@ -7,8 +7,9 @@ import logging
 
 from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
-from switch_migrator.models import Platform, SwitchAudit, VlanInfo
+from switch_migrator.models import Platform, PortState, SwitchAudit, VlanInfo
 from switch_migrator.parsers import ers_parsers, voss_parsers
+from switch_migrator.usage import classify_audit, parse_uptime_days
 from switch_migrator.parsers.common import (
     PORT_RE,
     parse_lldp_neighbors,
@@ -16,7 +17,8 @@ from switch_migrator.parsers.common import (
     parse_mac_table,
 )
 
-# how many learned MACs are kept per port for the migration sheet
+# fallback cap on learned MACs kept per port; the configured value
+# (Config.mac_cap) is what the collection actually uses
 MAC_CAP = 10
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,14 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
     if pull_config:
         out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
         audit.running_config = out or ""
+    if pull_macs:
+        # switch uptime tells us how long the interface counters have been
+        # accumulating - '0 packets' only means something on a long-running box
+        out = _run(audit, runner, "show sys-info", required=False, absent_ok=True)
+        if out:
+            audit.uptime_days = parse_uptime_days(out)
+        classify_audit(audit, unused_after_days=cfg.unused_after_days,
+                       uptime_days=audit.uptime_days)
     return audit
 
 
@@ -70,6 +80,25 @@ def _run(audit: SwitchAudit, runner: BaseRunner, command: str,
         return None
 
 
+def _merge_port_details(audit: SwitchAudit, extra: list[PortState]) -> None:
+    """Fill gaps in the already-collected ports from a second port table.
+
+    Only ever adds: the first source stays authoritative for the state it
+    reported, and ports it never mentioned are appended rather than dropped.
+    """
+    by_port = {p.port: p for p in audit.ports}
+    for other in extra:
+        port = by_port.get(other.port)
+        if port is None:
+            audit.ports.append(other)
+            continue
+        port.description = port.description or other.description
+        if port.admin_up is None:
+            port.admin_up = other.admin_up
+        if port.oper_up is None:
+            port.oper_up = other.oper_up
+
+
 def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
     # Port-state fallback chain: which variants exist differs across 8.x
     # releases. First command that yields ports wins. The plain
@@ -83,11 +112,26 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
         ("show interfaces gigabitEthernet interface", voss_parsers.parse_ports),
     )
     for command, parser in port_sources:
-        out = _run(audit, runner, command, required=False)
-        if out:
-            audit.ports = parser(out)
-            if audit.ports:
+        # once we already have the port state, a later variant only adds the
+        # media type - its absence on this release is not worth a warning
+        out = _run(audit, runner, command, required=False,
+                   absent_ok=bool(audit.ports))
+        if not out:
+            continue
+        parsed = parser(out)
+        if not parsed:
+            continue
+        if not audit.ports:
+            audit.ports = parsed
+            # the 'state' table has no DESCRIPTION column, so on its own it
+            # leaves the media type blank. Keep going to the 'interface'
+            # variant and merge that column in rather than sending a second
+            # command later; both tables are one narrow row per port.
+            if all(p.description for p in parsed):
                 break
+            continue
+        _merge_port_details(audit, parsed)
+        break
     if not audit.ports:
         audit.errors.append(
             "no port state obtained: all 'show interfaces gigabitEthernet' "
@@ -201,7 +245,8 @@ def _collect_fdb(audit: SwitchAudit, runner: BaseRunner,
 
 
 def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
-                             pull_macs: bool = False) -> None:
+                             pull_macs: bool = False,
+                             mac_cap: int = MAC_CAP) -> None:
     """Per-port data the migration sheets need: MLT membership + LACP, VLANs and
     their I-SIDs, tagging, and - when pull_macs is set - learned MACs and the
     pluggable optic. Everything except the MAC/optics fetch is derived from data
@@ -281,7 +326,7 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
             for port in targets:
                 for mac, _vlan in entries:
                     port.mac_total += 1
-                    if len(port.macs) < MAC_CAP and mac not in port.macs:
+                    if len(port.macs) < mac_cap and mac not in port.macs:
                         port.macs.append(mac)
 
     # --- pluggable optics (VOSS). Real columns are
@@ -307,6 +352,26 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
                 else:
                     parts = tokens[1:]
                 port.transceiver = " ".join(parts)[:60]
+
+        # --- interface counters: has this port EVER passed traffic?
+        # Deliberately layout-independent: the classification only needs
+        # "are all counters on this row zero?", so no assumption is made about
+        # which column is packets-in vs octets-out (that layout varies by
+        # release and I have no capture to pin it to).
+        out = _run(audit, runner, "show interfaces gigabitEthernet statistics",
+                   required=False, absent_ok=True)
+        if out:
+            for line in out.splitlines():
+                tokens = line.split()
+                if len(tokens) < 2 or not PORT_RE.match(tokens[0]) \
+                        or "/" not in tokens[0]:
+                    continue
+                port = by_port.get(tokens[0])
+                if port is None:
+                    continue
+                counters = [int(t) for t in tokens[1:] if t.isdigit()]
+                if counters:
+                    port.has_traffic = any(c > 0 for c in counters)
 
 
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,
@@ -361,7 +426,8 @@ def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,
         mlt.is_uplink = any(
             p.is_uplink for p in audit.ports if p.port in mlt.members)
 
-    _enrich_migration_fields(audit, runner, pull_macs=pull_macs)
+    _enrich_migration_fields(audit, runner, pull_macs=pull_macs,
+                             mac_cap=cfg.mac_cap)
 
     if audit.ist is not None and audit.ist.session_up is False:
         audit.warnings.append(

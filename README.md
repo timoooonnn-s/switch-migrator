@@ -150,7 +150,12 @@ switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
   5  Migration sheets      port info + DC cabling sheet + MAC-check commands
   6  Config extract        neutralized VOSS config / generated ERS->VOSS draft
   7  Everything            run 3-6 in one go with the collected data
-  8  Settings              output directory, offline replay, target switch name
+  8  Snapshot              save this session's data, or load an earlier one
+  9  Dry run               list every command a collection would send
+  h  Health check          go/no-go before the window: what is already broken?
+  m  Generate MLT blocks   new switches' MLT config from a filled-in cabling sheet
+  v  Verify migration      after the window: check every re-patched link
+  s  Settings              output directory, offline replay, manifest, target switch
   0  Quit
 ```
 
@@ -191,7 +196,179 @@ switch-migrator -i switches.yaml --extract-config
 # Migration-day deliverables: port info sheet + DC cabling sheet + commands
 switch-migrator -i switches.yaml --migration-sheets --new-switch new-sw-01 \
                 --extract-config
+
+# One cabling worksheet per site instead of one for everything
+switch-migrator -i switches.yaml --migration-sheets --split-by-location
+
+# Show a change board exactly which commands would be sent - connects to nothing
+switch-migrator -i switches.yaml --dry-run
+
+# Collect once, keep the state, and rebuild any report from it later
+switch-migrator -i switches.yaml --migration-sheets --save-snapshot
+switch-migrator --from-snapshot output/snapshot-20260812-140311.json \
+                --migration-sheets --csv
+
+# Write an audit trail of the run (every command sent and its outcome)
+switch-migrator -i switches.yaml --manifest
+
+# Go/no-go before the window opens
+switch-migrator -i switches.yaml --health-check
+
+# The sheet comes back filled in: generate the new switches' MLT blocks
+switch-migrator --generate-mlt cabling.xlsx
+
+# After the window: check every re-patched link on the new switches
+switch-migrator --verify-migration cabling.xlsx
 ```
+
+## The migration itself
+
+The audit tells you whether the configuration lines up. These three answer the
+questions asked on the night.
+
+### Before: health check (`--health-check`)
+
+A different and more urgent question than the audit's: **is anything already
+broken that the migration would make worse**, or that would hide behind the
+migration and get blamed on it afterwards?
+
+| Verdict | Meaning |
+|---|---|
+| `BLOCK` | do not start; fix this or re-plan the window |
+| `WARN` | start, but know about it |
+| `UNKNOWN` | the switch did not say enough to judge |
+| `OK` | nothing found |
+
+What blocks: an unreachable switch, no readable port state, a **degraded MLT**
+(running on one leg — the first cable you unplug is an outage, not a re-patch),
+a **down vIST** (the SMLT pair is not a pair right now), lost uplink
+redundancy, and VLANs with nowhere to land in the fabric. What warns: an MLT
+that is already fully down, ports the usage classification flagged as a fault
+on a live cable, session problems that make the collected data less
+trustworthy.
+
+Every check is derived from the state the normal collection already gathers —
+**no extra command is sent to any device** — so it costs nothing on top of the
+audit you were running anyway. A `BLOCK` sets exit code 1, so a change pipeline
+can gate on it.
+
+### During: MLT blocks (`--generate-mlt`)
+
+Reads the filled-in cabling sheet and emits the aggregations to create on the
+new switches, in the two sections a VOSS box prints in its own
+`show running-config`:
+
+```
+mlt 35 enable name "MLT035.srv"
+mlt 35 member 1/11,1/12
+
+interface mlt 35
+smlt
+lacp enable key 35
+flex-uni enable
+exit
+```
+
+The MLT id and name come from the sheet's **NEW MLT ID / NEW MLT name**
+columns when the planner filled them in, and are carried over from the old MLT
+when they didn't — so it produces something useful from a half-filled sheet and
+gets more precise as the sheet does. `--no-smlt` emits plain single-switch MLTs
+instead of SMLT pairs.
+
+It refuses to guess where guessing is dangerous. **No I-SID, c-vid or VLAN
+binding is ever emitted** — that is `--extract-config` and the I-SID decision
+worksheet's job, and they have their own rules about what may be assumed.
+Anything it only half understands is written into the file as a `# [!]` line
+rather than silently configured: an aggregation of one member, an id claimed
+twice on one switch, members facing three different neighbours, or an SMLT
+that ended up on only one of the two peers (a single point of failure wearing
+the costume of a redundant one). An uplink facing **two** neighbours is the
+normal SMLT-pair shape and is not flagged.
+
+### After: verification (`--verify-migration`)
+
+Reads the same sheet back, collects the **new** switches — it takes their names
+from the sheet, so no inventory is needed — and checks every link a technician
+recorded:
+
+| Result | Meaning |
+|---|---|
+| `PASS` | the port is up **and** at least one MAC the old port used to learn is now learned here (or the LLDP neighbour matches, when the old port had learned nothing). The same machine is talking on the new port. |
+| `WARN` | the port is up, but nothing else lines up yet — no expected MAC back, or the neighbour, VLANs or MLT membership differ from the sheet |
+| `FAIL` | the port is down, missing from the switch, or the switch could not be read |
+| `PENDING` | no NEW switch/port in the sheet yet — not migrated, not a problem |
+
+MACs age out in about five minutes and a machine that has not sent a frame
+since the cutover has no entry anywhere, so *"no MAC yet"* is a **warn with
+that explanation**, never a failure — re-run a few minutes later and most warns
+turn into passes on their own. A `FAIL` sets exit code 1.
+
+The summary sheet also lists **ports that are up on a new switch but appear in
+no sheet row** — the other direction: a link somebody patched without writing
+it down.
+
+### Reading the sheet back
+
+The cabling sheet has been through a data centre before it comes back, so
+reading it is deliberately forgiving: columns are matched **by name, not
+position** (add your own columns, reorder them, it does not matter), `.xlsx`
+and `.csv` both work, port ids are normalised (`Port 1/7`, `1 / 7`, `1/7`),
+rows nobody has filled in are *pending* rather than errors, and a cell it
+cannot make sense of becomes a note on that row instead of killing the file.
+The one thing it does complain about is a **half-filled row** — a NEW switch
+with no NEW port, or the reverse — because that looks migrated and isn't.
+
+### Snapshots (`--save-snapshot` / `--from-snapshot`)
+
+Collecting is the expensive part: it needs credentials, network reach and a
+moment when touching the switches is acceptable. Every report the toolkit
+produces is a pure function of the collected state — so that state is worth
+keeping.
+
+`--save-snapshot` writes it all to one JSON file (default
+`<output>/snapshot-<stamp>.json`). `--from-snapshot` rebuilds any report from
+that file: no SSH, no credentials, no load on the devices. The reports are
+byte-identical to the ones the live run produced.
+
+That makes a snapshot three useful things at once:
+
+* **the pre-migration record** — what the network looked like before you
+  touched it, in a form you can diff or re-read months later;
+* **a way to iterate** — try a different I-SID convention or a different
+  `unused_after_days` and re-render, without another maintenance window;
+* **something to hand over** — a colleague can produce the cabling sheet
+  without reaching the switches at all.
+
+A snapshot holds device data (hostnames, IPs, MAC addresses, LLDP neighbors,
+and with `--extract-config` the running-config). Keep it wherever the raw
+switch output belongs.
+
+### Dry run (`--dry-run`)
+
+Prints every command the run would send to each device — switches and DvR
+controllers — and connects to nothing:
+
+```
+gx-01 (16 command(s))
+    terminal more disable
+    show interfaces gigabitEthernet state
+    show mlt
+    ...
+```
+
+The list is produced by running the **real collectors** against a runner that
+answers every command with an empty string, so it cannot drift away from what
+the tool actually does. Because empty answers send the collectors down every
+fallback branch, what you see is the full set of commands that *could* be
+sent — not just the subset one release happens to accept.
+
+### Run manifest (`--manifest`)
+
+Writes `<output>/manifest-<stamp>.json`: tool version, start/end time and
+duration, every command sent to every device and whether it was accepted, the
+errors and warnings raised, and the files produced. It never contains
+credentials and never command output — only the command text and its outcome.
+Turns "we checked before the migration" into something you can show afterwards.
 
 ### Migration sheets (`--migration-sheets`)
 
@@ -219,11 +396,86 @@ switches consolidate onto fewer new ones.
 MAC addresses are capped at 10 per port with a `(+N more)` note. Pass
 `--new-switch NAME` to name the target device in the commands file.
 
+#### Is this port actually used?
+
+Link state alone can't answer that — a momentarily-down MLT member looks exactly
+like a dead port. Both sheets therefore carry a **Usage** column and the
+**evidence** behind it, combining three signals that say something about *time*:
+
+* **how long** the port has been in its current state (the `DATE` column of
+  `show interfaces gigabitEthernet state`),
+* whether it has **ever passed traffic** (interface counters, read together with
+  the switch uptime — `0 packets` is only trusted on a long-running box),
+* whether it belongs to an **MLT that is still forwarding**.
+
+| Class | Meaning |
+|---|---|
+| `IN USE` | link up, or MACs learned |
+| `IN USE - degraded` | down member of a still-forwarding MLT — a **fault on a live cable**, never filtered away |
+| `UNCERTAIN` | down, but has passed traffic or went down recently (server reboot, link flap) |
+| `LIKELY UNUSED` | down longer than the threshold, but the counters can't be trusted |
+| `UNUSED` | down long, zero counters over a long uptime, or admin-disabled |
+
+Nothing is ever silently dropped: likely-unused ports stay on the sheet and just
+sort to the bottom, so the techs work top-down. The threshold is
+`unused_after_days` in `config.yaml` (default 30).
+
 VOSS has **no** `show mac-address-table`; the forwarding database is read with
 `show interfaces gigabitEthernet fdb-entry`. The bare form (whole box, one
 command) is tried first, and releases that insist on a port argument fall back
 to querying only the ports that are operationally **up**. ERS/BOSS uses the
 classic `show mac-address-table`.
+
+### Splitting the cabling sheet by location (`--split-by-location`)
+
+Switch names carry the site in their prefix, so the cabling sheet can be split
+per location without anyone maintaining a second list of which box is where.
+Each site's technicians then get a worksheet with only their own links on it.
+
+Configure the sites once:
+
+```yaml
+locations:
+  patterns:                       # first match wins
+    "gx-11-*": "Frankfurt DC1"
+    "gx-12-*": "Frankfurt DC2"
+    "mu-*": "Munich"
+  fallback_segments: 2            # unmatched: gx-11-s72-p1 -> "gx-11"
+  groups:                         # which sites share one worksheet
+    Frankfurt: ["Frankfurt DC1", "Frankfurt DC2"]
+```
+
+then `--split-by-location` turns the single **Cabling** sheet into one per
+group:
+
+```
+Cabling sheet split by location:
+  Frankfurt: gx-11-s72-p1, gx-11-s74-wu, gx-12-s01-p9
+  Munich: mu-01-a
+```
+
+A location that is in **no** group gets its own worksheet, so *"separate
+everything"* is the behaviour you get by writing no groups at all. To scope one
+window differently without editing the config, `--location-group` replaces the
+groups for that run (repeatable):
+
+```bash
+switch-migrator -i switches.yaml --migration-sheets \
+    --location-group 'Frankfurt=Frankfurt DC*' --location-group 'South=Munich'
+```
+
+Two deliberate choices:
+
+* **No combined sheet is written alongside the split ones.** This is a document
+  people write into by hand — if a link appeared on both a per-site tab and an
+  all-sites tab, two technicians could fill in two copies of the same row and
+  one set of answers would be lost. Every link is on exactly one sheet.
+* **The split keys on the OLD switch name**, because that is the only thing
+  that exists when the sheet is written — the NEW columns are what gets filled
+  in afterwards.
+
+Only the cabling sheet is split. The port info sheet, the audit tables, the
+health check and the verification stay whole.
 
 ### Config extraction (`--extract-config`, VOSS)
 
@@ -281,11 +533,14 @@ Output goes to `./output/` by default:
   **Summary**, **VLAN vs Fabric**, **Ports**, **MLTs**, **Fabric I-SIDs**,
   **Issues** (color-coded, filterable, frozen header row),
 * `csv-<timestamp>/*.csv` with `--csv`,
+* `snapshot-<timestamp>.json` with `--save-snapshot`,
+* `manifest-<timestamp>.json` with `--manifest`,
 * `raw/<device>/<command>.txt` with `--save-raw`,
 * `switch-migrator.log`.
 
 **Exit codes** (scriptable): `0` = clean, `1` = errors found (unreachable
-device, DvR read failure, or any red comparison result), `2` = config error.
+device, DvR read failure, any red comparison result, a health-check `BLOCK`, or
+a failed link in the verification), `2` = config error.
 
 ### Reading the report
 
@@ -303,13 +558,16 @@ device, DvR read failure, or any red comparison result), `2` = config error.
 
 | Platform | Commands (read-only) |
 |---|---|
-| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` → `show interfaces gigabitEthernet interface` (fallback chain, first that answers wins), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor`, and `show running-config` (only with `--extract-config`) |
+| VOSS (migrate) | `enable` (both VOSS and ERS log in at user-EXEC `>`, where `show interfaces`/`show lldp` don't exist — the tool enters privileged EXEC first), `show interfaces gigabitEthernet state` **and** `show interfaces gigabitEthernet interface` (the first carries admin/oper state and the last-change date, the second the media type; either alone is enough to report), `show mlt`, `show virtual-ist`, `show vlan i-sid`, `show vlan basic`, `show vlan members`, `show interfaces gigabitEthernet i-sid`, `show lldp neighbor summary` → `show lldp neighbor`, and `show running-config` (only with `--extract-config`) |
 | ERS (migrate) | `enable`, `show interfaces`, `show mlt`, `show ist`, `show vlan` (incl. `Port Members`), `show lldp neighbor` → `show lldp neighbor summary` |
 | DvR controller (VOSS) | `show dvr interfaces`, `show isis spbm i-sid all`, `show i-sid`, `show vlan i-sid` |
 
 `show vlan members` (VOSS) and the `Port Members` line of `show vlan` (ERS)
 feed the per-VLAN member-port column of the inventory report. Both are optional
 and silently skipped on releases that don't support them.
+
+`--dry-run` prints the exact list for your inventory, produced by the real
+collectors rather than copied from this table.
 
 Which command variants a given 8.x release accepts varies (real captures show
 boxes rejecting the plain interfaces form or the block-style LLDP command
@@ -323,10 +581,12 @@ Notes on syntax (checked against the Extreme VOSS/Fabric Engine command
 references and real device output):
 
 * Port state comes from `show interfaces gigabitEthernet state` — a compact
-  table that includes the down `REASON` column (shown in the Ports sheet). On
-  releases without the `state` subcommand the tool falls back to plain
-  `show interfaces gigabitEthernet` and parses its leading **Port Interface**
-  section.
+  table that includes the down `REASON` column (shown in the Ports sheet) and
+  the `DATE` of the last state change, which is what the used/unused
+  classification rests on. It has no `DESCRIPTION` column, so the
+  `... interface` variant is read as well and its media type merged in; on a
+  release that has only one of the two, that one is used and the other's
+  columns stay empty rather than the run failing.
 * Plain `show mlt` prints **four** tables (Mlt Info, LACP, local/remote port
   members, ENCAP) plus `All N out of M ...` footers, and the trailing VLAN IDS
   column wraps onto continuation lines for long VLAN lists. The parser accepts
@@ -413,6 +673,14 @@ switch_migrator/
 ├── config_extract.py   # VOSS running-config -> neutralized extract
 ├── config_generate.py  # ERS L2 model -> VOSS flex-UNI draft
 ├── isid.py             # per-VLAN I-SID resolution + decision worksheet
+├── usage.py            # is this port actually in use? (evidence-based)
+├── health.py           # pre-migration go/no-go, derived from collected state
+├── location.py         # switch name -> site, and which sites share a sheet
+├── cabling_sheet.py    # read the filled-in cabling sheet back (.xlsx/.csv)
+├── mlt_generate.py     # cabling sheet -> new switches' MLT config blocks
+├── verify.py           # post-migration: did every link come back up?
+├── snapshot.py         # save/load the whole collected state as JSON
+├── manifest.py         # per-run audit trail: commands, outcomes, files
 ├── collectors/
 │   ├── switch.py       # legacy switch collection (VOSS + ERS)
 │   └── dvr.py          # DvR fabric-state collection + merge
@@ -423,5 +691,7 @@ switch_migrator/
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers
     ├── migration.py    # port info + cabling sheets, migration commands
+    ├── migration_tables.py  # health-check and verification tables
+    ├── progress.py     # live per-device progress during collection
     └── excel.py        # xlsx + csv export; console.py renders to terminal
 ```

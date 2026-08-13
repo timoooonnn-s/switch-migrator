@@ -19,10 +19,24 @@ class Table:
     rows: list[list] = field(default_factory=list)
     # per-row severity for coloring: ok / warn / error / None
     severities: list[str | None] = field(default_factory=list)
+    # Headers worth showing on a terminal. The migration sheets are deliberately
+    # wide - twenty columns is fine on a printed page and unreadable in an
+    # 80-column shell, where rich squeezes every column to three characters.
+    # Excel and CSV always get every column; None means "show them all".
+    console_columns: list[str] | None = None
 
     def add(self, row: list, severity: str | None = None):
         self.rows.append(row)
         self.severities.append(severity)
+
+    def for_console(self) -> tuple[list[str], list[list]]:
+        """(headers, rows) reduced to the console subset."""
+        if not self.console_columns:
+            return self.headers, self.rows
+        keep = [i for i, h in enumerate(self.headers)
+                if h in self.console_columns]
+        return ([self.headers[i] for i in keep],
+                [[row[i] for i in keep] for row in self.rows])
 
 
 def _fmt_bool(value: bool | None, true: str = "up", false: str = "down") -> str:

@@ -95,3 +95,117 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     assert xlsx.stat().st_size > 0
     csvs = write_csv(tables, tmp_path / "csv")
     assert len(csvs) == len(tables)
+
+
+def test_snapshot_run_reproduces_the_live_reports_exactly(tmp_path):
+    """The promise of a snapshot: the sheets you get from the file are the
+    sheets you would have got from the switches."""
+    import shutil
+    from switch_migrator.cli import main
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    shutil.copytree(FIXTURES / "voss", raw / "sw-voss")
+    shutil.copytree(FIXTURES / "ers", raw / "sw-ers")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("excluded_vlan_names: ['quarant*']\n")
+
+    live = tmp_path / "live"
+    common = ["-c", str(cfg), "--offline", str(raw), "-s", "sw-voss:voss",
+              "-s", "sw-ers:ers", "--no-fabric", "--migration-sheets",
+              "--csv", "--no-excel"]
+    snap = tmp_path / "snap.json"
+    main(common + ["-o", str(live), "--save-snapshot", str(snap)])
+    assert snap.is_file()
+
+    replay = tmp_path / "replay"
+    main(["-c", str(cfg), "--from-snapshot", str(snap), "-o", str(replay),
+          "--no-fabric", "--migration-sheets", "--csv", "--no-excel"])
+
+    live_csv = next(live.glob("csv-*"))
+    replay_csv = next(replay.glob("csv-*"))
+    produced = sorted(p.name for p in live_csv.glob("*.csv"))
+    assert "cabling.csv" in produced and "port_info.csv" in produced
+    for name in produced:
+        assert (live_csv / name).read_text() == (replay_csv / name).read_text(), name
+
+
+def _filled_sheet(path: Path, rows: list[dict]) -> Path:
+    """A cabling sheet as it comes back from the data centre."""
+    import csv
+    headers = ["Port ID", "Type", "End device / neighbor", "NEW switch",
+               "NEW port", "NEW MLT ID", "NEW MLT name", "Old switch",
+               "Old port", "MLT ID", "MLT name", "Port VLANs", "MAC addresses",
+               "Done by"]
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(headers)
+        for r in rows:
+            w.writerow([r.get(h, "") for h in headers])
+    return path
+
+
+def test_the_whole_migration_arc(tmp_path):
+    """Health check before, MLT blocks from the sheet, verification after -
+    driven through the real CLI the way a migration night would."""
+    import csv
+    import shutil
+    from switch_migrator.cli import main
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    shutil.copytree(FIXTURES / "voss", raw / "gx-01")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("core_switch_patterns: ['core-*', 'dvr-*']\n")
+    common = ["-c", str(cfg), "--offline", str(raw), "--no-fabric", "--no-excel"]
+
+    # 1) before the window: the fixture switch has MLTs with a down member,
+    #    so the health check must refuse to call it clean
+    code = main(common + ["-o", str(tmp_path / "pre"), "-s", "gx-01:voss",
+                          "--health-check"])
+    assert code == 1, "a degraded MLT has to be a non-zero exit"
+
+    # 2) the sheet comes back filled in; generate the new switch's MLT blocks
+    sheet = _filled_sheet(tmp_path / "cabling.csv", [
+        {"Port ID": "P0001", "Type": "mlt", "Old switch": "gx-01",
+         "Old port": "1/1", "NEW switch": "gx-01", "NEW port": "1/1",
+         "MLT ID": "2", "MLT name": "MLT002", "NEW MLT ID": "42",
+         "NEW MLT name": "new-lag", "End device / neighbor": "core-01",
+         "Port VLANs": "100", "Done by": "TK"},
+        {"Port ID": "P0002", "Type": "mlt", "Old switch": "gx-01",
+         "Old port": "1/2", "NEW switch": "gx-01", "NEW port": "1/2",
+         "MLT ID": "2", "MLT name": "MLT002", "NEW MLT ID": "42",
+         "NEW MLT name": "new-lag", "Port VLANs": "100", "Done by": "TK"},
+        {"Port ID": "P0003", "Old switch": "gx-01", "Old port": "1/47"},
+    ])
+    out = tmp_path / "mlt"
+    assert main(["-c", str(cfg), "-o", str(out), "--generate-mlt",
+                 str(sheet)]) == 0
+    blocks = (out / "config" / "mlt-blocks.cfg").read_text()
+    assert 'mlt 42 enable name "new-lag"' in blocks
+    assert "mlt 42 member 1/1,1/2" in blocks
+    assert "interface mlt 42" in blocks and "smlt" in blocks
+
+    # 3) after the window: verify against the (replayed) new switch. The
+    #    switches to check come from the sheet itself.
+    code = main(["-c", str(cfg), "--offline", str(raw), "--no-fabric",
+                 "--no-excel", "-o", str(tmp_path / "post"), "--csv",
+                 "--verify-migration", str(sheet)])
+    verification = next((tmp_path / "post").glob("csv-*/verification.csv"))
+    rows = {r["Port ID"]: r for r in
+            csv.DictReader(verification.open())}
+    # 1/1 is up and its LLDP neighbor is the one the sheet recorded, but the
+    # port is still in the OLD MLT - exactly the half-done state a warn is for
+    assert rows["P0001"]["Result"] == "WARN"
+    assert "LLDP neighbor matches" in rows["P0001"]["Why"]
+    assert "sheet says MLT 42" in rows["P0001"]["Why"]
+    # 1/2 is down in the capture: a link that did not come back is a failure
+    assert rows["P0002"]["Result"] == "FAIL"
+    assert "DOWN" in rows["P0002"]["Why"]
+    # and the row nobody filled in is neither a pass nor a problem
+    assert rows["P0003"]["Result"] == "PENDING"
+    assert code == 1, "a failed link has to be a non-zero exit"
+
+    summary = next((tmp_path / "post").glob("csv-*/verification_summary.csv"))
+    text = summary.read_text()
+    assert "Unlisted ports up" in text     # 1/47 and 2/1/1 are up, unlisted

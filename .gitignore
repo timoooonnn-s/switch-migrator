@@ -8,10 +8,12 @@ dist/
 .venv/
 venv/
 
-# Tool output
+# Tool output - snapshots and manifests carry real device data
 output/
 *.xlsx
 *.log
+snapshot*.json
+manifest*.json
 
 # Local configs with real device data
 config.yaml

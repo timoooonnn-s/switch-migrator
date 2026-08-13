@@ -111,3 +111,44 @@ def test_ers_unsupported_commands_stay_out_of_the_report(tmp_path: Path, cfg: Co
     assert not [w for w in audit.warnings if "summary" in w]
     # block-form LLDP delivered neighbors on the first try
     assert any(p.lldp_neighbor for p in audit.ports)
+
+
+def test_media_column_is_filled_even_when_the_state_command_works(
+        tmp_path: Path, cfg: Config):
+    """`show ... state` carries ADMIN/OPER and the last-change DATE but has no
+    DESCRIPTION column, so on its own it leaves the migration sheets' Media
+    column blank. The `interface` variant must still be read and merged in."""
+    device = tmp_path / "gx-01"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_interfaces_gigabitethernet_interface.txt").write_text(
+        "                                      Port Interface\n"
+        "PORT                               LINK  PORT          PHYSICAL          STATUS\n"
+        "NUM      INDEX DESCRIPTION         TRAP  LOCK    MTU   ADDRESS           ADMIN  OPERATE\n"
+        "----------------------------------------------------------------------------------\n"
+        "1/1      192   10GbSR              true  false   1950  b0:ad:aa:41:b4:01 up     up\n"
+        "1/2      193   10GbLR              true  false   1950  b0:ad:aa:41:b4:02 up     down\n"
+    )
+    target = SwitchTarget("gx-01", "gx-01", Platform.VOSS)
+    audit = collect_switch(target, OfflineRunner("gx-01", tmp_path), cfg)
+    by_port = {p.port: p for p in audit.ports}
+    # state stays authoritative for the port list and the last-change date
+    assert set(by_port) >= {"1/1", "1/2", "1/47", "1/48"}
+    assert by_port["1/48"].last_change == "05/13/26 15:54:53"
+    # ... and the media type now comes across from the interface table
+    assert by_port["1/1"].media == "10GbSR"
+    assert by_port["1/2"].media == "10GbLR"
+    assert by_port["1/47"].media == ""       # not in the second table, no guess
+
+
+def test_missing_media_table_is_not_reported_as_a_failure(tmp_path: Path,
+                                                          cfg: Config):
+    """If `state` already delivered the ports, a release that rejects the
+    `interface` variant costs only the media column - not a report warning."""
+    device = tmp_path / "gx-02"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_interfaces_gigabitethernet_interface.txt").write_text(INVALID)
+    target = SwitchTarget("gx-02", "gx-02", Platform.VOSS)
+    audit = collect_switch(target, OfflineRunner("gx-02", tmp_path), cfg)
+    assert audit.ports
+    assert not any("gigabitEthernet interface" in w for w in audit.warnings)
+    assert not audit.errors

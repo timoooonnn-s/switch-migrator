@@ -13,10 +13,30 @@ from switch_migrator.parsers.common import (
     PORT_LIST_RE,
     PORT_RE,
     expand_port_list,
+    name_says_ist,
     parse_updown,
 )
 
 _UPDOWN_TOKEN = re.compile(r"^(up|down|testing)$", re.IGNORECASE)
+
+
+_MAC_TOKEN = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
+
+
+def _description(tokens: list[str]) -> str:
+    """DESCRIPTION column of the Port Interface table ('10GbSR', '1000BaseTX').
+
+    It is the third column, but it is blank on ports with no media, which
+    shifts every following column left - so the token is only taken when it
+    actually looks like a description and not like the LINK TRAP / MTU / MAC
+    columns that slide into its place.
+    """
+    if len(tokens) <= 2:
+        return ""
+    tok = tokens[2]
+    if tok.lower() in ("true", "false") or tok.isdigit() or _MAC_TOKEN.match(tok):
+        return ""
+    return tok
 
 
 def parse_ports(output: str) -> list[PortState]:
@@ -53,7 +73,7 @@ def parse_ports(output: str) -> list[PortState]:
         seen.add(tokens[0])
         ports.append(PortState(
             port=tokens[0],
-            description=tokens[2] if len(tokens) > 2 else "",
+            description=_description(tokens),
             admin_up=parse_updown(updown[-2]),
             oper_up=parse_updown(updown[-1]),
         ))
@@ -125,34 +145,53 @@ def parse_mlt(output: str) -> list[MltState]:
             members=members,
             vlans=vlans,
             in_datapath=datapath.get(mlt_id),
-            is_ist="ist" in name.lower() or "ist" in [s.lower() for s in states],
+            is_ist=name_says_ist(name) or "ist" in [s.lower() for s in states],
         )
         mlts.append(mlt)
         current = mlt
     return mlts
 
 
+def _is_header_line(line: str) -> bool:
+    """A column-title line: text, no leading id, not a rule or a footer."""
+    stripped = line.strip()
+    if not stripped or set(stripped) <= set("-=+ "):
+        return False
+    if "out of" in stripped.lower():
+        return False
+    return not stripped.split()[0].isdigit()
+
+
 def parse_mlt_lacp(output: str) -> dict[int, bool]:
     """Parse the LACP table of `show mlt` -> {mlt_id: lacp_admin_enabled}.
 
-    Second table of the plain `show mlt` output:
-        MLTID IFINDEX  DESIGNATED PORTS  LACP ADMIN  LACP OPER
-        197   6340     1/43              enable      up
-    Scoped to the section that follows a header carrying 'LACP', and rows are
-    only accepted when they hold an enable/disable token - so the Mlt Info and
-    ENCAP tables (which also start with an id) can never be misread.
+    Second table of the plain `show mlt` output, whose header spans two lines:
+                     DESIGNATED   LACP      LACP
+        MLTID IFINDEX  PORTS      ADMIN     OPER
+        197   6340     1/43       enable    up
+
+    The table is identified by looking BACKWARDS from the 'MLTID' line over the
+    title lines directly above it - never by remembering that the word 'LACP'
+    appeared somewhere earlier. That distinction matters: an MLT *named*
+    something with LACP in it appears as a data row in the Mlt Info and
+    data-path tables, and a forward-looking latch would then mistake the next
+    table (ENCAP DOT1Q, whose column is also enable/disable) for this one and
+    silently record the DOT1Q state as the LACP state.
     """
+    lines = output.splitlines()
     result: dict[int, bool] = {}
     in_section = False
-    saw_lacp = False           # the real header spans TWO lines:
-    for line in output.splitlines():          # '... LACP  LACP' then 'MLTID ...'
+    for i, line in enumerate(lines):
         upper = line.upper()
-        if "MLTID" in upper:
-            in_section = "LACP" in upper or saw_lacp
-            saw_lacp = False
-            continue
-        if "LACP" in upper and not in_section:
-            saw_lacp = True
+        if "MLTID" in upper and _is_header_line(line):
+            header = upper
+            for j in range(i - 1, max(i - 4, -1), -1):
+                if not _is_header_line(lines[j]):
+                    break
+                header = lines[j].upper() + " " + header
+            # both words are needed: the Mlt Info header also carries ADMIN,
+            # the data-path header neither
+            in_section = "LACP" in header and "ADMIN" in header
             continue
         if not in_section:
             continue
@@ -219,8 +258,18 @@ def parse_port_state(output: str) -> list[PortState]:
         if admin is None or oper is None:
             continue
         reason = tokens[3] if len(tokens) > 3 and tokens[3] != "--" else ""
+        # trailing DATE column = when the port last changed state. Free, and
+        # the single best evidence for "is this port actually used": down since
+        # May is decommissioned, down since 10 minutes ago is a link flap.
+        last_change = ""
+        for i, t in enumerate(tokens[3:], start=3):
+            if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", t):
+                last_change = t + (f" {tokens[i + 1]}" if i + 1 < len(tokens)
+                                   and re.fullmatch(r"\d{1,2}:\d{2}:\d{2}",
+                                                    tokens[i + 1]) else "")
+                break
         ports.append(PortState(port=tokens[0], admin_up=admin, oper_up=oper,
-                               state_reason=reason))
+                               state_reason=reason, last_change=last_change))
     return ports
 
 
@@ -318,11 +367,18 @@ def parse_vlan_members(output: str) -> dict[int, list[str]]:
 def parse_vlan_basic(output: str) -> dict[int, str]:
     """`show vlan basic` -> {vlan_id: name}. Used to fill in VLAN names.
 
-    Lines: <vlan-id> <name> <type> ...
+    Lines: <vlan-id> <name> <type> <mstp-inst> ...
+
+    The 'N out of M Total Num of Vlans displayed' footer has exactly the same
+    shape as a data row when a release prints it without the leading 'All'
+    ('39 out of 39 ...' would otherwise become VLAN 39 named 'out'), so footers
+    are excluded explicitly and the MSTP instance column must be numeric.
     """
     result: dict[int, str] = {}
     for line in output.splitlines():
-        m = re.match(r"^\s*(\d{1,4})\s+(\S+)\s+\S+", line)
+        if re.search(r"\bout of\b", line, re.IGNORECASE):
+            continue
+        m = re.match(r"^\s*(\d{1,4})\s+(\S+)\s+(\S+)\s+(\d+)\b", line)
         if m and 1 <= int(m.group(1)) <= 4094:
             result[int(m.group(1))] = m.group(2)
     return result

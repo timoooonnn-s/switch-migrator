@@ -28,9 +28,18 @@ PORT_LIST_RE = re.compile(r"^\d+(?:/\d+){0,2}(?:[,\-]\d+(?:/\d+){0,2})*$")
 
 _UPDOWN = {"up": True, "down": False, "testing": False}
 
+# 'ist' / 'vist' as a whole word, not as three letters inside another one -
+# 'dist-uplink', 'twist', 'sister' are ordinary MLT names, not IST peer links.
+_IST_NAME_RE = re.compile(r"(?:^|[^a-z0-9])v?ist(?:$|[^a-z0-9])", re.IGNORECASE)
+
 
 def parse_updown(token: str) -> bool | None:
     return _UPDOWN.get(token.strip().lower())
+
+
+def name_says_ist(name: str) -> bool:
+    """Does this MLT name identify it as the IST/vIST peer link?"""
+    return bool(_IST_NAME_RE.search(name or ""))
 
 
 def expand_port_list(raw: str) -> list[str]:

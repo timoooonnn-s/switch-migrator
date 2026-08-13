@@ -16,6 +16,8 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from switch_migrator.config import Credentials, SshSettings
@@ -57,8 +59,7 @@ _legacy_lock = threading.Lock()
 
 # consecutive transport failures (timeouts, socket errors) after which a
 # device session is abandoned instead of burning read_timeout on every
-# remaining command
-_MAX_TRANSPORT_FAILURES = 2
+# remaining command. Configurable as ssh.max_transport_failures.
 
 
 def enable_legacy_ssh_algorithms() -> list[str]:
@@ -132,14 +133,48 @@ def looks_like_error(output: str) -> bool:
     return False
 
 
+@dataclass
+class CommandRecord:
+    """One command as it was actually sent - the raw material for the run
+    manifest and for the progress display."""
+    command: str
+    ok: bool
+    attempts: int = 1
+    duration_ms: int = 0
+    error: str = ""
+
+
 class BaseRunner:
     setup_warnings: list[str]
+    name: str = ""
+    # every command this runner sent, in order
+    command_log: list[CommandRecord]
+    # optional progress hook, called as on_command(device, command, index)
+    # BEFORE the command is sent. The runner is the single choke point for all
+    # device traffic, so this is the one place that sees every command without
+    # threading a callback through every collector.
+    on_command: "Callable[[str, str, int], None] | None" = None
 
     def run(self, command: str) -> str:
         raise NotImplementedError
 
     def close(self) -> None:
         pass
+
+    def _log_start(self, command: str) -> float:
+        if self.on_command is not None:
+            try:
+                self.on_command(self.name, command, len(self.command_log) + 1)
+            except Exception:  # noqa: BLE001 - a broken progress bar is not fatal
+                pass
+        return time.monotonic()
+
+    def _log_end(self, command: str, started: float, ok: bool,
+                 attempts: int = 1, error: str = "") -> None:
+        self.command_log.append(CommandRecord(
+            command=command, ok=ok, attempts=attempts,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error=error[:200]))
 
 
 # paging left active stalls long outputs at --More-- and the stuck pager
@@ -241,6 +276,7 @@ class SshRunner(BaseRunner):
         self.ssh = ssh
         self.raw_dir = raw_dir
         self.setup_warnings: list[str] = []
+        self.command_log: list[CommandRecord] = []
         self._transport_failures = 0
         self._dead = False
         # captures the login/banner bytes so a connect failure can show what the
@@ -420,35 +456,59 @@ class SshRunner(BaseRunner):
                 return f"{exc.__class__.__name__}: {line.strip()}"
         return exc.__class__.__name__
 
+    def _recover_channel(self) -> None:
+        """A ReadTimeout is typically a stuck --More-- pager: quit it and drain
+        the channel so the NEXT command isn't swallowed by it."""
+        try:
+            self._conn.write_channel("q\n")
+            time.sleep(0.5)
+            self._conn.clear_buffer()
+        except Exception:  # noqa: BLE001 - purely best-effort recovery
+            pass
+
     def run(self, command: str) -> str:
         if self._dead:
             raise CommandError(
                 command, "(skipped: session abandoned after repeated transport failures)")
-        log.debug("[%s] %s", self.name, command)
-        try:
-            output = self._conn.send_command(command, read_timeout=self.ssh.read_timeout)
-        except Exception as exc:  # netmiko ReadTimeout, socket errors, ...
-            self._transport_failures += 1
-            # a ReadTimeout is typically a stuck --More-- pager: quit it and
-            # drain the channel so the NEXT command isn't swallowed by it
+        started = self._log_start(command)
+        attempts = 0
+        # Transport failures get a second chance: one dropped read or one stuck
+        # pager should not cost a whole column of the report. A command the
+        # DEVICE rejected is a different thing entirely - that answer will not
+        # change on a re-send, so it is never retried.
+        for attempt in range(self.ssh.command_retries + 1):
+            attempts = attempt + 1
+            log.debug("[%s] %s%s", self.name, command,
+                      f" (retry {attempt})" if attempt else "")
             try:
-                self._conn.write_channel("q\n")
-                time.sleep(0.5)
-                self._conn.clear_buffer()
-            except Exception:  # noqa: BLE001 - purely best-effort recovery
-                pass
-            if self._transport_failures >= _MAX_TRANSPORT_FAILURES:
-                self._dead = True
-                log.error("[%s] abandoning session after %d consecutive "
-                          "transport failures", self.name, self._transport_failures)
-            raise CommandError(
-                command, f"(transport {exc.__class__.__name__}) {exc}") from exc
+                output = self._conn.send_command(
+                    command, read_timeout=self.ssh.read_timeout)
+            except Exception as exc:  # netmiko ReadTimeout, socket errors, ...
+                self._recover_channel()
+                if attempt < self.ssh.command_retries and not self._dead:
+                    log.info("[%s] '%s' failed (%s) - retrying",
+                             self.name, command, exc.__class__.__name__)
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                self._transport_failures += 1
+                if self._transport_failures >= self.ssh.max_transport_failures:
+                    self._dead = True
+                    log.error("[%s] abandoning session after %d consecutive "
+                              "transport failures", self.name,
+                              self._transport_failures)
+                err = CommandError(
+                    command, f"(transport {exc.__class__.__name__}) {exc}")
+                self._log_end(command, started, False, attempts, str(exc))
+                raise err from exc
+            break
         self._transport_failures = 0
         if self.raw_dir is not None:
             self.raw_dir.mkdir(parents=True, exist_ok=True)
             (self.raw_dir / f"{command_slug(command)}.txt").write_text(output)
         if looks_like_error(output):
+            self._log_end(command, started, False, attempts, "device rejected")
             raise CommandError(command, output)
+        self._log_end(command, started, True, attempts)
         return output
 
     def close(self) -> None:
@@ -464,15 +524,45 @@ class OfflineRunner(BaseRunner):
     def __init__(self, name: str, raw_root: Path):
         self.name = name
         self.setup_warnings: list[str] = []
+        self.command_log: list[CommandRecord] = []
         self.device_dir = raw_root / name
         if not self.device_dir.is_dir():
             raise ConnectionFailed(f"{name}: no raw capture directory at {self.device_dir}")
 
     def run(self, command: str) -> str:
+        started = self._log_start(command)
         path = self.device_dir / f"{command_slug(command)}.txt"
         if not path.is_file():
+            self._log_end(command, started, False, error="no capture file")
             raise CommandError(command, f"(offline) no capture file {path}")
         output = path.read_text()
         if looks_like_error(output):
+            self._log_end(command, started, False, error="device rejected")
             raise CommandError(command, output)
+        self._log_end(command, started, True)
         return output
+
+
+class DryRunRunner(BaseRunner):
+    """Records what WOULD be sent and connects to nothing.
+
+    Every command comes back empty, which walks the collectors down all of
+    their fallback chains - so the recorded list is the full set of commands
+    the tool could send to this device, not just the ones a particular release
+    happens to accept. That is the honest answer to 'prove this tool is
+    read-only', and because it is produced by the real collection code path it
+    cannot drift away from what the tool actually does.
+    """
+
+    def __init__(self, name: str, platform: Platform):
+        self.name = name
+        self.platform = platform
+        self.setup_warnings: list[str] = []
+        self.command_log: list[CommandRecord] = []
+        self.commands: list[str] = list(_PAGING_DISABLE[platform][:1])
+
+    def run(self, command: str) -> str:
+        started = self._log_start(command)
+        self.commands.append(command)
+        self._log_end(command, started, True)
+        return ""

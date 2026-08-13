@@ -8,7 +8,9 @@ old switches consolidate onto fewer new ones.
 
 from __future__ import annotations
 
+from switch_migrator import location, usage
 from switch_migrator.config_extract import extract_voss_config
+from switch_migrator.location import LocationRules
 from switch_migrator.models import Platform, PortState, SwitchAudit
 from switch_migrator.report.tables import Table
 
@@ -27,8 +29,21 @@ def assign_port_uids(audits: list[SwitchAudit], prefix: str = "P") -> None:
 
 
 def _connected(p: PortState) -> bool:
-    """A port the DC techs actually have to re-patch."""
+    """A port the DC techs actually have to re-patch.
+
+    Not just 'link is up right now': a momentarily-down member of a still
+    forwarding MLT, or a port that has passed traffic but is down at this
+    instant, is very much still cabled. When the usage classification ran it is
+    authoritative; otherwise fall back to the live signals.
+    """
+    if p.usage:
+        return p.usage not in (usage.LIKELY_UNUSED, usage.UNUSED)
     return bool(p.oper_up or p.lldp_neighbor or p.lldp_neighbor_ip or p.macs)
+
+
+def _usage_rank(p: PortState) -> int:
+    """Sort key: in-use first, dead ports last."""
+    return usage.ORDER.get(p.usage, 2)
 
 
 def _macs_cell(p: PortState) -> str:
@@ -54,7 +69,10 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
         "Port ID", "Switch", "Port", "Device on port", "Neighbor IP",
         "MAC addresses", "Tagging", "VLAN IDs", "I-SIDs", "Admin", "Oper",
         "LACP", "MLT ID", "MLT name", "Transceiver", "Media", "Uplink",
+        "Usage", "Why",
     ])
+    t.console_columns = ["Port ID", "Switch", "Port", "Device on port",
+                         "VLAN IDs", "Oper", "MLT ID", "Usage"]
     for audit in sorted(audits, key=lambda a: a.name):
         for p in audit.ports:
             t.add([
@@ -67,8 +85,32 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
                 p.mlt_id if p.mlt_id is not None else "",
                 p.mlt_name, p.transceiver, p.media,
                 "yes" if p.is_uplink else "",
-            ], "warn" if p.is_uplink and not p.oper_up else None)
+                p.usage, p.usage_evidence,
+            ], "warn" if (p.usage == usage.DEGRADED
+                          or (p.is_uplink and not p.oper_up)) else None)
     return t
+
+
+def build_cabling_by_location(audits: list[SwitchAudit],
+                              rules: LocationRules) -> list[Table]:
+    """One cabling worksheet per location group.
+
+    Deliberately NOT accompanied by a combined sheet. This is a document people
+    write into by hand: if the same link appeared on both a per-site tab and an
+    all-sites tab, two technicians could fill in two copies of the same row and
+    one set of answers would be lost. Each link belongs to exactly one sheet.
+
+    The split keys on the OLD switch name, which is the only thing that exists
+    when the sheet is written - the NEW columns are what gets filled in.
+    """
+    groups = location.split([a.name for a in audits], rules)
+    by_name = {a.name: a for a in audits}
+    tables = []
+    for group, names in groups.items():
+        table = build_cabling([by_name[n] for n in names])
+        table.title = f"Cabling {group}"
+        tables.append(table)
+    return tables
 
 
 def build_cabling(audits: list[SwitchAudit]) -> Table:
@@ -87,12 +129,16 @@ def build_cabling(audits: list[SwitchAudit]) -> Table:
         "Old switch", "Old port",
         "MLT ID", "MLT name", "MLT VLANs", "MLT I-SIDs",
         "Port VLANs", "Port I-SIDs",
-        "MAC addresses", "Media",
+        "MAC addresses", "Media", "Usage", "Why",
     ])
+    t.console_columns = ["VLAN", "Type", "Port ID", "End device / neighbor",
+                         "Old switch", "Old port", "MLT ID", "Usage"]
     for audit in sorted(audits, key=lambda a: a.name):
         mlt_by_id = {m.mlt_id: m for m in audit.mlts}
-        for p in audit.ports:
-            if not _connected(p):
+        # in-use ports first so the techs work top-down; likely-dead ports stay
+        # on the sheet (never silently dropped) but sort to the bottom
+        for p in sorted(audit.ports, key=lambda x: (_usage_rank(x), x.port)):
+            if not _connected(p) and not p.usage:
                 continue
             first_vlan = p.vlans[0] if p.vlans else ""
             kind = "uplink" if p.is_uplink else ("mlt" if p.mlt_id is not None
@@ -111,8 +157,8 @@ def build_cabling(audits: list[SwitchAudit]) -> Table:
                 ",".join(map(str, mlt.vlans)) if mlt else "",
                 ",".join(map(str, mlt.isids)) if mlt else "",
                 ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
-                _macs_cell(p), p.media,
-            ])
+                _macs_cell(p), p.media, p.usage, p.usage_evidence,
+            ], "warn" if p.usage == usage.DEGRADED else None)
     return t
 
 

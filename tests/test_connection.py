@@ -1,3 +1,7 @@
+import io
+import re
+from pathlib import Path
+
 import paramiko
 import pytest
 from paramiko.transport import Transport
@@ -19,6 +23,16 @@ BANNER = (
     "                Command Execution Time: Thu Jul 16 13:42:31 2026 CEST\n"
     + "*" * 84 + "\n"
 )
+
+# The ERS login handler is a subclass of a netmiko class, so it only exists
+# when netmiko is installed. Under an interpreter that has not installed the
+# project's requirements the tests below have nothing to exercise - skip them
+# with that reason instead of failing on a None class, which reads like a bug
+# in the tool when it is really a bug in the environment.
+_ERS_CLASS = connection._patient_ers_class()
+needs_ers_class = pytest.mark.skipif(
+    _ERS_CLASS is None,
+    reason="netmiko not installed - run the suite against the project venv")
 
 
 def test_looks_like_error_plain():
@@ -83,6 +97,8 @@ def _make_runner(conn: _FakeConn) -> SshRunner:
     runner.ssh = SshSettings()
     runner.raw_dir = None
     runner.setup_warnings = []
+    runner.command_log = []
+    runner.on_command = None
     runner._transport_failures = 0
     runner._dead = False
     runner._conn = conn
@@ -148,6 +164,7 @@ def test_paging_disable_rejection_is_surfaced():
 def test_stuck_pager_is_quit_after_transport_failure():
     conn = _FakeConn(TimeoutError("Pattern not detected"))
     runner = _make_runner(conn)
+    runner.ssh = SshSettings(command_retries=0)
     with pytest.raises(CommandError):
         runner.run("show interfaces gigabitEthernet state")
     # recovery: 'q' sent to kill a possible --More-- pager
@@ -157,6 +174,7 @@ def test_stuck_pager_is_quit_after_transport_failure():
 def test_circuit_breaker_abandons_dead_session():
     conn = _FakeConn(OSError("socket closed"))
     runner = _make_runner(conn)
+    runner.ssh = SshSettings(command_retries=0)
     for _ in range(2):
         with pytest.raises(CommandError):
             runner.run("show mlt")
@@ -171,6 +189,7 @@ def test_circuit_breaker_abandons_dead_session():
 def test_circuit_breaker_resets_on_success():
     conn = _FakeConn(OSError("hiccup"))
     runner = _make_runner(conn)
+    runner.ssh = SshSettings(command_retries=0)
     with pytest.raises(CommandError):
         runner.run("show mlt")
     conn.exc = None
@@ -182,6 +201,13 @@ def test_circuit_breaker_resets_on_success():
 @pytest.fixture(autouse=True)
 def reset_legacy_flag(monkeypatch):
     monkeypatch.setattr(connection, "_legacy_enabled", False)
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    # the retry/recovery backoffs are real seconds on a device and pure waiting
+    # in a test
+    monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
 
 
 def test_enable_legacy_ssh_algorithms():
@@ -215,16 +241,31 @@ def test_enable_legacy_is_idempotent():
     assert len(Transport._preferred_kex) == len(set(Transport._preferred_kex))
 
 
-def test_paramiko_supports_ers_host_keys():
-    # the requirements pin paramiko<4 precisely because 4.x dropped ssh-dss;
-    # this guards against an accidental future upgrade breaking old ERS gear
-    assert int(paramiko.__version__.split(".")[0]) < 4
+def test_paramiko_pin_still_excludes_the_release_that_dropped_ssh_dss():
+    """paramiko 4.x removed ssh-dss, which old ERS/BOSS boxes still present.
+
+    Asserted against the declared requirement rather than whatever happens to
+    be importable, so the guard against an accidental version bump holds in
+    every environment - including one where the suite is run outside the venv.
+    """
+    for name in ("requirements.txt", "pyproject.toml"):
+        text = (Path(__file__).parent.parent / name).read_text()
+        # the requirement line, not the comment above it explaining the pin
+        specs = re.findall(r"paramiko\s*([><=!~][^\"\n]*)", text)
+        assert specs, f"paramiko requirement missing from {name}"
+        assert all("<4" in s for s in specs), \
+            f"{name} no longer excludes paramiko 4.x: {specs}"
+
+
+def test_installed_paramiko_supports_ers_host_keys():
+    major = int(paramiko.__version__.split(".")[0])
+    if major >= 4:
+        pytest.skip(f"paramiko {paramiko.__version__} installed, but the "
+                    f"project pins <4 - run the suite against the project venv")
     assert "ssh-dss" in Transport._key_info
 
 
-import io
-
-
+@needs_ers_class
 def test_patient_ers_class_retries_then_succeeds(monkeypatch):
     monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
     cls = connection._patient_ers_class()
@@ -247,6 +288,7 @@ def test_patient_ers_class_retries_then_succeeds(monkeypatch):
     assert calls["n"] == 3
 
 
+@needs_ers_class
 def test_patient_ers_class_gives_up_and_reraises(monkeypatch):
     monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
     cls = connection._patient_ers_class()
@@ -294,6 +336,7 @@ def test_clean_reason_takes_only_the_first_line():
     assert reason == "ValueError: boom"
 
 
+@needs_ers_class
 def test_patient_ers_special_login_presses_ctrl_y(monkeypatch):
     monkeypatch.setattr(connection.time, "sleep", lambda *_: None)
     cls = connection._patient_ers_class()

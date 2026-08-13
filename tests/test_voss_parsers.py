@@ -1,5 +1,5 @@
 from switch_migrator.parsers import voss_parsers
-from switch_migrator.parsers.common import parse_lldp_neighbors
+from switch_migrator.parsers.common import name_says_ist, parse_lldp_neighbors
 
 
 def test_parse_ports(fixture):
@@ -233,3 +233,110 @@ def test_parse_vlan_members(fixture):
     assert m[4000] == ["1/47", "1/48"]
     # the 'N out of N Total' footer must not become a phantom VLAN
     assert 5 not in m or m[5] != []
+
+
+# ---------------------------------------------------------------------------
+# table-identification regressions in `show mlt`
+# ---------------------------------------------------------------------------
+
+# same shape as the field capture, but MLT 1 is NAMED with 'LACP' in it and the
+# uplink is named 'dist-uplink' - two ordinary names that used to poison the
+# parse
+_MLT_TRICKY_NAMES = """\
+====================================================================================================
+                                    Mlt Info
+====================================================================================================
+                        PORT    MLT   MLT        PORT         VLAN
+MLTID IFINDEX NAME      TYPE   ADMIN CURRENT    MEMBERS       IDS
+-----------------------------------------------------------------------------------------------------------
+1   6144  LACP-esx01   trunk   norm   norm     1/8,1/16          4051 4052
+196 6339  dist-uplink  trunk   smlt   smlt     1/10              735
+
+All 2 out of 2 Total Num of mlt displayed
+
+               DESIGNATED   LACP      LACP
+MLTID IFINDEX  PORTS        ADMIN     OPER
+-----------------------------------------------------------------------------------------------------------
+1      6144    1/8           disable   down
+196    6339    1/10          enable      up
+
+All 2 out of 2 Total Num of mlt displayed
+
+                                                            WHICH PORTS
+             WHERE      LOCAL             REMOTE            PROGRAMMED
+MLTID NAME   CREATED    PORT MEMBERS      PORT MEMBERS      IN DATA PATH
+-----------------------------------------------------------------------------------------------------------
+1    LACP-esx01 LOC & REM  1/8,1/16          1/8,1/16          LOCAL
+196  dist-uplink LOC & REM  1/10             1/10              LOCAL & REMOTE
+
+All 2 out of 2 Total Num of mlt displayed
+
+               ENCAP                          PVLAN        VID
+MLTID IFINDEX  DOT1Q     LOSSLESS   PVLAN     TYPE         TYPE         FLEX-UNI
+-----------------------------------------------------------------------------------------------------------
+1     6144     enable    disable    disable   -            -            disable
+196   6339     disable   disable    disable   -            -            disable
+
+All 2 out of 2 Total Num of mlt displayed
+"""
+
+
+def test_mlt_name_containing_lacp_does_not_make_the_encap_table_the_lacp_table():
+    """An MLT *named* '...LACP...' appears as a data row in the Mlt Info and
+    data-path tables. Remembering that the word appeared made the parser read
+    the NEXT header (ENCAP DOT1Q, also enable/disable) as the LACP table, so
+    the DOT1Q state was recorded as the LACP state - here exactly inverted."""
+    lacp = voss_parsers.parse_mlt_lacp(_MLT_TRICKY_NAMES)
+    assert lacp == {1: False, 196: True}
+
+
+def test_mlt_name_containing_ist_is_not_an_ist_peer_link():
+    mlts = {m.mlt_id: m for m in voss_parsers.parse_mlt(_MLT_TRICKY_NAMES)}
+    assert mlts[196].name == "dist-uplink"
+    assert not mlts[196].is_ist          # 'dist' is not 'ist'
+    assert not mlts[1].is_ist
+
+
+def test_real_ist_names_are_still_recognised():
+    for name in ("vIST", "MLT-IST", "ist", "ist-peer", "core_vist_1"):
+        assert name_says_ist(name), name
+    for name in ("dist-uplink", "twist", "sister", "distribution", ""):
+        assert not name_says_ist(name), name
+
+
+# ---------------------------------------------------------------------------
+# `show vlan basic` footer
+# ---------------------------------------------------------------------------
+
+def test_vlan_basic_footer_without_leading_all_is_not_a_vlan():
+    out = """\
+VLAN                                MSTP
+ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR
+------------------------------------------------------------------------
+1     Default          byPort       0       none         N/A
+99    quarantine       byPort       0       none         N/A
+4051  BVLAN-1          spbm-bvlan   62      none         N/A
+
+39 out of 39 Total Num of Vlans displayed
+"""
+    names = voss_parsers.parse_vlan_basic(out)
+    assert names == {1: "Default", 99: "quarantine", 4051: "BVLAN-1"}
+    assert 39 not in names          # was VLAN 39 named 'out'
+
+
+# ---------------------------------------------------------------------------
+# the DESCRIPTION column of the Port Interface table
+# ---------------------------------------------------------------------------
+
+def test_port_interface_description_is_media_or_empty_never_a_shifted_column():
+    out = """\
+                                      Port Interface
+PORT                               LINK  PORT           PHYSICAL          STATUS
+NUM      INDEX DESCRIPTION         TRAP  LOCK     MTU   ADDRESS           ADMIN  OPERATE
+------------------------------------------------------------------------------------------
+1/1      192   10GbSR              true  false    1950  b0:ad:aa:41:b4:01 up     up
+1/9      200                       true  false    1950  b0:ad:aa:41:b4:09 down   down
+"""
+    ports = {p.port: p for p in voss_parsers.parse_ports(out)}
+    assert ports["1/1"].description == "10GbSR"
+    assert ports["1/9"].description == ""     # blank media, not 'true'
