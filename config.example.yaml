@@ -84,6 +84,32 @@ excluded_vlans:
 # reported as a fault on a live cable.
 unused_after_days: 30
 
+# --- Locations ----------------------------------------------------------------
+# Switch names carry the site in their prefix, so the DC cabling sheet can be
+# split per location (--split-by-location) without maintaining a second list of
+# which box is where. Only the cabling sheet is split; everything else stays
+# whole.
+locations:
+  # Switch-name glob -> location name, in order; the FIRST match wins. The name
+  # is what the worksheet tab is called, so use what your technicians say.
+  patterns:
+    "gx-11-*": "Frankfurt DC1"
+    "gx-12-*": "Frankfurt DC2"
+    "mu-*": "Munich"
+
+  # When no pattern matches, the location is the first N '-' segments of the
+  # name (gx-11-s72-p1 -> gx-11). A site nobody has configured yet still groups
+  # sensibly instead of landing in a bucket called "other".
+  fallback_segments: 2
+
+  # Which locations share ONE worksheet. A location in no group gets its own
+  # sheet, so "separate everything" is what you get by writing nothing here.
+  # Location names or globs both work.
+  groups:
+    Frankfurt: ["Frankfurt DC1", "Frankfurt DC2"]
+  # Override for a single run without editing this file:
+  #   --location-group 'Frankfurt=Frankfurt DC*' --location-group 'South=Munich'
+
 # --- Learned MAC addresses ----------------------------------------------------
 # How many MACs to keep per port in the migration sheets. Raise it on
 # server-heavy access ports (a virtualization host shows dozens), lower it on

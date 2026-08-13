@@ -299,3 +299,94 @@ def test_progress_counts_devices_and_controllers():
         assert overall.completed == 2 and overall.total == 2
         assert fabric.completed == 1
         assert not p._tasks             # per-device rows are cleaned up
+
+
+# --------------------------- location split (CLI) ---------------------------
+
+def _location_env(tmp_path):
+    """Three switches at two sites, replayed offline."""
+    import shutil
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for name in ("gx-11-s72-p1", "gx-12-s01-p9", "mu-01-a"):
+        shutil.copytree(FIXTURES / "voss", raw / name)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "locations:\n"
+        "  patterns:\n"
+        "    'gx-11-*': Frankfurt DC1\n"
+        "    'gx-12-*': Frankfurt DC2\n"
+        "    'mu-*': Munich\n"
+        "  groups:\n"
+        "    Frankfurt: ['Frankfurt DC1', 'Frankfurt DC2']\n")
+    switches = []
+    for name in ("gx-11-s72-p1", "gx-12-s01-p9", "mu-01-a"):
+        switches += ["-s", f"{name}:voss"]
+    return path, raw, switches
+
+
+def test_split_by_location_writes_one_sheet_per_group(tmp_path):
+    cfg_path, raw, switches = _location_env(tmp_path)
+    out = tmp_path / "out"
+    main(["-c", str(cfg_path), "-o", str(out), "--offline", str(raw),
+          "--no-fabric", "--migration-sheets", "--csv", "--no-excel",
+          "--split-by-location"] + switches)
+    csv_dir = next(out.glob("csv-*"))
+    names = sorted(p.name for p in csv_dir.glob("cabling*.csv"))
+    assert names == ["cabling_frankfurt.csv", "cabling_munich.csv"]
+    # the combined sheet is gone: one link, one sheet to write it on
+    assert not (csv_dir / "cabling.csv").exists()
+    frankfurt = (csv_dir / "cabling_frankfurt.csv").read_text()
+    assert "gx-11-s72-p1" in frankfurt and "gx-12-s01-p9" in frankfurt
+    assert "mu-01-a" not in frankfurt
+
+
+def test_location_group_overrides_the_config_for_one_run(tmp_path):
+    cfg_path, raw, switches = _location_env(tmp_path)
+    out = tmp_path / "out"
+    main(["-c", str(cfg_path), "-o", str(out), "--offline", str(raw),
+          "--no-fabric", "--migration-sheets", "--csv", "--no-excel",
+          "--location-group", "Everything=Frankfurt DC*,Munich"] + switches)
+    csv_dir = next(out.glob("csv-*"))
+    assert sorted(p.name for p in csv_dir.glob("cabling*.csv")) == \
+        ["cabling_everything.csv"]
+
+
+def test_a_mistyped_location_group_stops_the_run(tmp_path):
+    cfg_path, raw, switches = _location_env(tmp_path)
+    code = main(["-c", str(cfg_path), "-o", str(tmp_path / "out"),
+                 "--offline", str(raw), "--no-fabric", "--migration-sheets",
+                 "--location-group", "Frankfurt gx-11"] + switches)
+    assert code == 2            # a config error, not a silently split sheet
+
+
+def test_without_the_flag_the_sheet_stays_combined(tmp_path):
+    cfg_path, raw, switches = _location_env(tmp_path)
+    out = tmp_path / "out"
+    main(["-c", str(cfg_path), "-o", str(out), "--offline", str(raw),
+          "--no-fabric", "--migration-sheets", "--csv", "--no-excel"] + switches)
+    csv_dir = next(out.glob("csv-*"))
+    assert (csv_dir / "cabling.csv").is_file()
+    assert not list(csv_dir.glob("cabling_*.csv"))
+
+
+def test_excel_tab_names_survive_long_and_illegal_location_names(tmp_path):
+    from openpyxl import load_workbook
+    from switch_migrator.report.excel import write_excel
+    from switch_migrator.report.tables import Table
+
+    tables = []
+    for title in ("Cabling Frankfurt/Main DC1 - the whole east campus",
+                  "Cabling Frankfurt/Main DC1 - the whole west campus",
+                  "Cabling Munich [south]"):
+        t = Table(title, ["Old switch", "Old port"])
+        t.add(["sw", "1/1"])
+        tables.append(t)
+    path = tmp_path / "sheets.xlsx"
+    write_excel(tables, path)
+    titles = load_workbook(path).sheetnames
+    assert len(titles) == 3, "a tab was lost to a name collision"
+    assert len(set(titles)) == 3
+    for title in titles:
+        assert len(title) <= 31
+        assert not set(title) & set("[]:*?/\\")

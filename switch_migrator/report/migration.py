@@ -8,8 +8,9 @@ old switches consolidate onto fewer new ones.
 
 from __future__ import annotations
 
-from switch_migrator import usage
+from switch_migrator import location, usage
 from switch_migrator.config_extract import extract_voss_config
+from switch_migrator.location import LocationRules
 from switch_migrator.models import Platform, PortState, SwitchAudit
 from switch_migrator.report.tables import Table
 
@@ -88,6 +89,28 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
             ], "warn" if (p.usage == usage.DEGRADED
                           or (p.is_uplink and not p.oper_up)) else None)
     return t
+
+
+def build_cabling_by_location(audits: list[SwitchAudit],
+                              rules: LocationRules) -> list[Table]:
+    """One cabling worksheet per location group.
+
+    Deliberately NOT accompanied by a combined sheet. This is a document people
+    write into by hand: if the same link appeared on both a per-site tab and an
+    all-sites tab, two technicians could fill in two copies of the same row and
+    one set of answers would be lost. Each link belongs to exactly one sheet.
+
+    The split keys on the OLD switch name, which is the only thing that exists
+    when the sheet is written - the NEW columns are what gets filled in.
+    """
+    groups = location.split([a.name for a in audits], rules)
+    by_name = {a.name: a for a in audits}
+    tables = []
+    for group, names in groups.items():
+        table = build_cabling([by_name[n] for n in names])
+        table.title = f"Cabling {group}"
+        tables.append(table)
+    return tables
 
 
 def build_cabling(audits: list[SwitchAudit]) -> Table:

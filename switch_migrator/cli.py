@@ -40,7 +40,8 @@ from switch_migrator.connection import (
     enable_legacy_ssh_algorithms,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
-from switch_migrator import cabling_sheet, health, manifest as manifest_mod
+from switch_migrator import cabling_sheet, health, location
+from switch_migrator import manifest as manifest_mod
 from switch_migrator import mlt_generate, snapshot as snapshot_mod, verify
 from switch_migrator.report import console as console_report
 from switch_migrator.report.migration_tables import (
@@ -53,6 +54,7 @@ from switch_migrator.report.progress import NullProgress, make_progress
 from switch_migrator.report.migration import (
     assign_port_uids,
     build_cabling,
+    build_cabling_by_location,
     build_commands,
     build_port_info,
 )
@@ -103,6 +105,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-switch", metavar="NAME", default="",
                         help="name of the target switch, used in the "
                              "--migration-sheets command file")
+    parser.add_argument("--split-by-location", action="store_true",
+                        help="give the cabling sheet one worksheet per "
+                             "location instead of one for everything, so each "
+                             "site's technicians get only their own links. "
+                             "The location comes from the switch name (see the "
+                             "'locations' section of the config).")
+    parser.add_argument("--location-group", action="append", default=[],
+                        metavar="NAME=LOC1,LOC2",
+                        help="for this run only, put these locations on one "
+                             "worksheet, e.g. --location-group "
+                             "'Frankfurt=gx-11,gx-12'. Repeatable; replaces "
+                             "the groups from the config. Implies "
+                             "--split-by-location.")
     parser.add_argument("--csv", action="store_true",
                         help="additionally export the tables as CSV files")
     parser.add_argument("--no-excel", action="store_true",
@@ -486,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
             targets.extend(load_inventory(args.inventory))
         for raw in args.switch:
             targets.append(parse_switch_arg(raw))
+        if args.location_group:
+            try:
+                location.parse_group_args(args.location_group)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from None
         if args.verify_migration and not targets:
             # the sheet already names the switches to check: the new ones the
             # links were moved onto. They are fabric leaves, hence VOSS.
@@ -589,6 +609,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.migration_sheets:
         assign_port_uids(audits)
         tables += [build_port_info(audits), build_cabling(audits)]
+
+    if args.migration_sheets and (args.split_by_location or args.location_group):
+        rules = cfg.locations
+        if args.location_group:
+            # a per-run scope replaces the config's groups, but keeps the
+            # name patterns - those describe the estate, not this window
+            rules = replace(rules, groups=location.parse_group_args(
+                args.location_group))
+        # the combined sheet is dropped, not kept alongside: this is a
+        # fill-in document, and one link on two sheets means one set of
+        # answers gets lost
+        tables = [t for t in tables if t.title != "Cabling"]
+        tables += build_cabling_by_location(audits, rules)
+        console.print("Cabling sheet split by location:")
+        for line in location.describe(rules, [a.name for a in audits]):
+            console.print(f"  {line}")
 
     health_report = None
     if args.health_check:

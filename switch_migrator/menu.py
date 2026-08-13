@@ -32,6 +32,7 @@ from switch_migrator.config import (
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator import health as health_mod
+from switch_migrator import location as location_mod
 from switch_migrator import manifest as manifest_mod
 from switch_migrator import snapshot as snapshot_mod
 from switch_migrator.report.progress import make_progress
@@ -49,6 +50,8 @@ class Session:
     offline_dir: Path | None = None
     save_raw: bool = False
     write_manifest: bool = False
+    split_by_location: bool = False
+    location_groups: dict = field(default_factory=dict)
     new_switch: str = ""
     # collected data
     audits: list[SwitchAudit] = field(default_factory=list)
@@ -65,6 +68,13 @@ class Session:
     def has_data(self) -> bool:
         return bool(self.audits)
 
+    def location_rules(self):
+        """Config rules, with this session's per-run grouping when set."""
+        from dataclasses import replace as _replace
+        if not self.location_groups:
+            return self.cfg.locations
+        return _replace(self.cfg.locations, groups=self.location_groups)
+
     def to_args(self, **over) -> argparse.Namespace:
         """A Namespace shaped like the CLI's, so the menu can reuse the exact
         same collection/report code paths as the flag interface."""
@@ -76,6 +86,7 @@ class Session:
             save_raw=self.save_raw, offline=self.offline_dir, verbose=False,
             debug=False, dry_run=False, save_snapshot=None, from_snapshot=None,
             manifest=self.write_manifest,
+            split_by_location=self.split_by_location, location_group=[],
         )
         base.update(over)
         return argparse.Namespace(**base)
@@ -291,7 +302,8 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     from switch_migrator.report import console as console_report
     from switch_migrator.report.excel import write_excel
     from switch_migrator.report.migration import (
-        assign_port_uids, build_cabling, build_commands, build_port_info)
+        assign_port_uids, build_cabling, build_cabling_by_location,
+        build_commands, build_port_info)
     from switch_migrator.report.tables import build_all
 
     fabric = s.fabric or FabricState()
@@ -300,7 +312,15 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     tables = build_all(s.audits, fabric, comparisons, no_fabric=no_fabric)
     if migration_sheets:
         assign_port_uids(s.audits)
-        tables += [build_port_info(s.audits), build_cabling(s.audits)]
+        tables.append(build_port_info(s.audits))
+        if s.split_by_location:
+            rules = s.location_rules()
+            tables += build_cabling_by_location(s.audits, rules)
+            console.print("[dim]Cabling split by location:[/dim]")
+            for line in location_mod.describe(rules, [a.name for a in s.audits]):
+                console.print(f"  [dim]{line}[/dim]")
+        else:
+            tables.append(build_cabling(s.audits))
 
     console_report.render(tables, console, verbose=False)
 
@@ -561,6 +581,21 @@ def action_settings(s: Session, console: Console) -> None:
     s.save_raw = _yes(console, "Save raw CLI output (--save-raw)?", s.save_raw)
     s.write_manifest = _yes(console, "Write a run manifest after collecting?",
                             s.write_manifest)
+    s.split_by_location = _yes(
+        console, "Split the cabling sheet into one worksheet per location?",
+        s.split_by_location)
+    if s.split_by_location:
+        current = "; ".join(f"{g}={','.join(m)}"
+                            for g, m in s.location_groups.items())
+        raw = _ask(console, "Groups for this session as NAME=loc1,loc2 "
+                            "(semicolon separated, blank = use the config)",
+                   current)
+        try:
+            s.location_groups = location_mod.parse_group_args(
+                [x for x in raw.split(";") if x.strip()])
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red] - keeping the config's groups")
+            s.location_groups = {}
     s.new_switch = _ask(console, "Name of the NEW switch", s.new_switch)
     console.print("[green]Settings updated.[/green]")
 

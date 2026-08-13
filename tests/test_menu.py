@@ -157,13 +157,35 @@ def test_config_extract_writes_when_running_config_present(env):
 def test_settings_update_session(env):
     tmp, cfg_path, inv, raw = env
     s = _session(env)
-    # output dir, offline replay?, save raw?, manifest?, new switch name
-    console = ScriptedConsole([str(tmp / "other"), "n", "n", "y", "new-99"])
+    # output dir, offline replay?, save raw?, manifest?, split by location?,
+    # groups, new switch name
+    console = ScriptedConsole([str(tmp / "other"), "n", "n", "y", "y",
+                               "Frankfurt=gx-11,gx-12; Munich=mu-01",
+                               "new-99"])
     M.action_settings(s, console)
     assert s.output_dir == tmp / "other"
     assert s.offline_dir is None              # answered "no" -> live SSH
     assert s.write_manifest
+    assert s.split_by_location
+    assert s.location_groups == {"Frankfurt": ["gx-11", "gx-12"],
+                                 "Munich": ["mu-01"]}
     assert s.new_switch == "new-99"
+
+
+def test_settings_keeps_the_config_groups_when_none_are_typed(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_settings(s, ScriptedConsole([str(tmp / "o"), "n", "n", "n", "y",
+                                          "", "new-1"]))
+    assert s.split_by_location and s.location_groups == {}
+
+
+def test_settings_rejects_a_mistyped_group_rather_than_scattering_ports(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_settings(s, ScriptedConsole([str(tmp / "o"), "n", "n", "n", "y",
+                                          "Frankfurt gx-11", "new-1"]))
+    assert s.location_groups == {}      # fell back to the config, not a half-group
 
 
 # ------------------------- snapshot & dry run -------------------------------

@@ -21,11 +21,36 @@ _HEADER_FILL = PatternFill("solid", start_color="4472C4")
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 
 
+# Excel worksheet titles: 31 characters, and these are illegal in them.
+# Location names come from the user's config ('Frankfurt DC1/DC2'), so both
+# limits are reachable in normal use.
+_ILLEGAL_TITLE = re.compile(r"[\[\]:*?/\\]")
+
+
+def _sheet_title(title: str, used: set[str]) -> str:
+    clean = _ILLEGAL_TITLE.sub("-", title).strip() or "Sheet"
+    clean = clean[:31]
+    if clean not in used:
+        used.add(clean)
+        return clean
+    # two long location names can collide once truncated; number them rather
+    # than letting openpyxl silently rename or raise
+    for n in range(2, 100):
+        suffix = f" ({n})"
+        candidate = clean[:31 - len(suffix)] + suffix
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+    used.add(clean)
+    return clean
+
+
 def write_excel(tables: list[Table], path: Path) -> None:
     wb = Workbook()
     wb.remove(wb.active)
+    used_titles: set[str] = set()
     for table in tables:
-        ws = wb.create_sheet(title=table.title[:31])
+        ws = wb.create_sheet(title=_sheet_title(table.title, used_titles))
         ws.append(table.headers)
         for cell in ws[1]:
             cell.fill = _HEADER_FILL

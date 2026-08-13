@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from switch_migrator.location import LocationRules
 from switch_migrator.models import Platform
 
 
@@ -75,6 +76,8 @@ class Config:
     # server-heavy access ports, lower it on busy uplinks - the full count is
     # always reported as '(+N more)' regardless.
     mac_cap: int = 10
+    # how switch names map to sites, and which sites share a cabling worksheet
+    locations: LocationRules = field(default_factory=LocationRules)
     ssh: SshSettings = field(default_factory=SshSettings)
 
 
@@ -144,6 +147,30 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
                 f"exclude VLANs by NAME (e.g. 'quarantaine') use the "
                 f"excluded_vlan_names list instead") from None
 
+    loc = data.get("locations") or {}
+    if not isinstance(loc, dict):
+        raise ConfigError(f"{path}: 'locations' must be a mapping with "
+                          f"'patterns', 'fallback_segments' and/or 'groups'")
+    patterns = loc.get("patterns") or {}
+    groups_raw = loc.get("groups") or {}
+    if not isinstance(patterns, dict) or not isinstance(groups_raw, dict):
+        raise ConfigError(f"{path}: locations.patterns and locations.groups "
+                          f"must both be mappings")
+    groups: dict[str, list[str]] = {}
+    for name, members in groups_raw.items():
+        if isinstance(members, str):
+            members = [members]
+        if not isinstance(members, list) or not members:
+            raise ConfigError(
+                f"{path}: locations.groups['{name}'] must be a non-empty list "
+                f"of location names, e.g. ['Frankfurt DC1', 'Frankfurt DC2']")
+        groups[str(name)] = [str(m) for m in members]
+    locations = LocationRules(
+        patterns={str(k): str(v) for k, v in patterns.items()},
+        fallback_segments=max(1, int(loc.get("fallback_segments", 2))),
+        groups=groups,
+    )
+
     return Config(
         dvr_controllers=dvrs,
         core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
@@ -153,6 +180,7 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         excluded_vlan_names=[str(p) for p in (data.get("excluded_vlan_names") or [])],
         unused_after_days=int(data.get("unused_after_days", 30)),
         mac_cap=max(1, int(data.get("mac_cap", 10))),
+        locations=locations,
         ssh=ssh,
     )
 

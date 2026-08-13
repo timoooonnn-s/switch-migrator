@@ -197,6 +197,9 @@ switch-migrator -i switches.yaml --extract-config
 switch-migrator -i switches.yaml --migration-sheets --new-switch new-sw-01 \
                 --extract-config
 
+# One cabling worksheet per site instead of one for everything
+switch-migrator -i switches.yaml --migration-sheets --split-by-location
+
 # Show a change board exactly which commands would be sent - connects to nothing
 switch-migrator -i switches.yaml --dry-run
 
@@ -423,6 +426,57 @@ command) is tried first, and releases that insist on a port argument fall back
 to querying only the ports that are operationally **up**. ERS/BOSS uses the
 classic `show mac-address-table`.
 
+### Splitting the cabling sheet by location (`--split-by-location`)
+
+Switch names carry the site in their prefix, so the cabling sheet can be split
+per location without anyone maintaining a second list of which box is where.
+Each site's technicians then get a worksheet with only their own links on it.
+
+Configure the sites once:
+
+```yaml
+locations:
+  patterns:                       # first match wins
+    "gx-11-*": "Frankfurt DC1"
+    "gx-12-*": "Frankfurt DC2"
+    "mu-*": "Munich"
+  fallback_segments: 2            # unmatched: gx-11-s72-p1 -> "gx-11"
+  groups:                         # which sites share one worksheet
+    Frankfurt: ["Frankfurt DC1", "Frankfurt DC2"]
+```
+
+then `--split-by-location` turns the single **Cabling** sheet into one per
+group:
+
+```
+Cabling sheet split by location:
+  Frankfurt: gx-11-s72-p1, gx-11-s74-wu, gx-12-s01-p9
+  Munich: mu-01-a
+```
+
+A location that is in **no** group gets its own worksheet, so *"separate
+everything"* is the behaviour you get by writing no groups at all. To scope one
+window differently without editing the config, `--location-group` replaces the
+groups for that run (repeatable):
+
+```bash
+switch-migrator -i switches.yaml --migration-sheets \
+    --location-group 'Frankfurt=Frankfurt DC*' --location-group 'South=Munich'
+```
+
+Two deliberate choices:
+
+* **No combined sheet is written alongside the split ones.** This is a document
+  people write into by hand — if a link appeared on both a per-site tab and an
+  all-sites tab, two technicians could fill in two copies of the same row and
+  one set of answers would be lost. Every link is on exactly one sheet.
+* **The split keys on the OLD switch name**, because that is the only thing
+  that exists when the sheet is written — the NEW columns are what gets filled
+  in afterwards.
+
+Only the cabling sheet is split. The port info sheet, the audit tables, the
+health check and the verification stay whole.
+
 ### Config extraction (`--extract-config`, VOSS)
 
 Pulls each VOSS switch's `show running-config` and writes a **neutralized,
@@ -621,6 +675,7 @@ switch_migrator/
 ├── isid.py             # per-VLAN I-SID resolution + decision worksheet
 ├── usage.py            # is this port actually in use? (evidence-based)
 ├── health.py           # pre-migration go/no-go, derived from collected state
+├── location.py         # switch name -> site, and which sites share a sheet
 ├── cabling_sheet.py    # read the filled-in cabling sheet back (.xlsx/.csv)
 ├── mlt_generate.py     # cabling sheet -> new switches' MLT config blocks
 ├── verify.py           # post-migration: did every link come back up?
