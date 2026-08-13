@@ -57,6 +57,7 @@ class CablingRow:
     kind: str = ""                   # access / mlt / uplink
     sheet_vlan: str = ""             # the sheet's leading VLAN column
     row_number: int = 0              # 1-based row in the file, for messages
+    sheet: str = ""                  # which worksheet the row came from
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -77,6 +78,7 @@ class CablingRow:
 class Sheet:
     rows: list[CablingRow] = field(default_factory=list)
     source: Path | None = None
+    sheets_read: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -196,12 +198,27 @@ def _build_row(mapping: dict[str, str], number: int) -> CablingRow:
     return row
 
 
-def _rows_from_csv(path: Path) -> list[list[str]]:
+def _rows_from_csv(path: Path) -> list[tuple[str, list[list]]]:
     with path.open(newline="") as fh:
-        return [row for row in csv.reader(fh)]
+        return [(path.name, [row for row in csv.reader(fh)])]
 
 
-def _rows_from_xlsx(path: Path, sheet_name: str | None) -> list[list[str]]:
+def _looks_like_cabling(rows: list[list]) -> bool:
+    for row in rows[:1]:
+        if any(_key(c) == "oldport" for c in row):
+            return True
+    return False
+
+
+def _rows_from_xlsx(path: Path,
+                    sheet_name: str | None) -> list[tuple[str, list[list]]]:
+    """Every worksheet that looks like a cabling sheet, in workbook order.
+
+    ALL of them, not just the first: --split-by-location writes one worksheet
+    per site ('Cabling Frankfurt', 'Cabling Munich'), and reading only the
+    first would verify one site and silently ignore the rest - a migration
+    would look complete while half of it was never checked.
+    """
     try:
         from openpyxl import load_workbook
     except ImportError:  # pragma: no cover - openpyxl is a hard dependency
@@ -212,44 +229,27 @@ def _rows_from_xlsx(path: Path, sheet_name: str | None) -> list[list[str]]:
             if sheet_name not in wb.sheetnames:
                 raise SheetError(f"{path}: no sheet named '{sheet_name}' "
                                  f"(found: {', '.join(wb.sheetnames)})")
-            ws = wb[sheet_name]
+            names = [sheet_name]
         else:
-            # the workbook holds several sheets; take the cabling one, and
-            # fall back to the first sheet that has an 'Old port' column
-            named = next((n for n in wb.sheetnames if _key(n) == "cabling"), None)
-            ws = wb[named] if named else _first_cabling_sheet(wb, path)
-        return [[c for c in row] for row in ws.iter_rows(values_only=True)]
+            names = list(wb.sheetnames)
+        out = []
+        for name in names:
+            rows = [list(row) for row in wb[name].iter_rows(values_only=True)]
+            if sheet_name or _looks_like_cabling(rows):
+                out.append((name, rows))
+        if not out:
+            raise SheetError(
+                f"{path}: no worksheet has an 'Old port' column - is this a "
+                f"cabling sheet? (sheets: {', '.join(wb.sheetnames)})")
+        return out
     finally:
         wb.close()
 
 
-def _first_cabling_sheet(wb, path: Path):
-    for name in wb.sheetnames:
-        ws = wb[name]
-        for row in ws.iter_rows(max_row=1, values_only=True):
-            if any(_key(c) == "oldport" for c in row):
-                return ws
-    raise SheetError(f"{path}: no sheet with an 'Old port' column - is this a "
-                     f"cabling sheet? (sheets: {', '.join(wb.sheetnames)})")
-
-
-def load(path: Path, sheet_name: str | None = None) -> Sheet:
-    """Read a filled-in cabling sheet (.xlsx or .csv)."""
-    if not path.is_file():
-        raise SheetError(f"cabling sheet not found: {path}")
-    suffix = path.suffix.lower()
-    if suffix in (".xlsx", ".xlsm"):
-        raw = _rows_from_xlsx(path, sheet_name)
-    elif suffix in (".csv", ".txt", ""):
-        raw = _rows_from_csv(path)
-    else:
-        raise SheetError(f"{path}: unsupported file type '{suffix}' - export "
-                         f"the sheet as .xlsx or .csv")
-
+def _parse_table(where: str, raw: list[list], sheet: Sheet, path: Path) -> None:
     raw = [row for row in raw if any(_cell(c) for c in row)]
     if not raw:
-        raise SheetError(f"{path}: the sheet is empty")
-
+        return
     headers = [_key(c) for c in raw[0]]
     index: dict[int, str] = {i: _COLUMNS[h] for i, h in enumerate(headers)
                              if h in _COLUMNS}
@@ -257,25 +257,48 @@ def load(path: Path, sheet_name: str | None = None) -> Sheet:
     if missing:
         pretty = ", ".join(_HEADER_NAMES[n] for n in missing)
         raise SheetError(
-            f"{path}: the header row is missing the {pretty} column(s). "
-            f"Use the sheet the tool wrote (--migration-sheets); columns may "
-            f"be reordered and extra ones added, but the original headers "
-            f"have to survive.")
+            f"{path} ({where}): the header row is missing the {pretty} "
+            f"column(s). Use the sheet the tool wrote (--migration-sheets); "
+            f"columns may be reordered and extra ones added, but the original "
+            f"headers have to survive.")
 
-    sheet = Sheet(source=path)
     for number, values in enumerate(raw[1:], start=2):
         mapping = {index[i]: values[i] for i in index if i < len(values)}
         row = _build_row(mapping, number)
         if not row.old_switch and not row.old_port:
             continue                    # a spacer or a stray note line
+        row.sheet = where
         sheet.rows.append(row)
-    if not sheet.rows:
-        raise SheetError(f"{path}: no data rows found below the header")
 
     unknown = [h for h in headers if h and h not in _COLUMNS]
     if unknown:
         # not a problem - people add their own columns - but worth saying once
         sheet.problems.append(
-            f"{len(unknown)} column(s) not written by this tool were kept and "
-            f"ignored")
+            f"{where}: {len(unknown)} column(s) not written by this tool were "
+            f"kept and ignored")
+
+
+def load(path: Path, sheet_name: str | None = None) -> Sheet:
+    """Read a filled-in cabling sheet (.xlsx or .csv).
+
+    In an .xlsx, every worksheet that carries an 'Old port' column is read, so
+    a workbook split per location comes back whole.
+    """
+    if not path.is_file():
+        raise SheetError(f"cabling sheet not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        tables = _rows_from_xlsx(path, sheet_name)
+    elif suffix in (".csv", ".txt", ""):
+        tables = _rows_from_csv(path)
+    else:
+        raise SheetError(f"{path}: unsupported file type '{suffix}' - export "
+                         f"the sheet as .xlsx or .csv")
+
+    sheet = Sheet(source=path)
+    for where, raw in tables:
+        _parse_table(where, raw, sheet, path)
+        sheet.sheets_read.append(where)
+    if not sheet.rows:
+        raise SheetError(f"{path}: no data rows found below the header")
     return sheet

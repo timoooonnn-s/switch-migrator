@@ -202,3 +202,44 @@ def test_xlsx_sheet_can_be_named(tmp_path):
     assert CS.load(path, sheet_name="Patching").rows[0].old_switch == "gx-01"
     with pytest.raises(CS.SheetError, match="no sheet named"):
         CS.load(path, sheet_name="Nope")
+
+
+def test_every_cabling_worksheet_is_read_not_just_the_first(tmp_path):
+    """--split-by-location writes one worksheet per site. Reading only the
+    first would verify one site and silently ignore the rest - the migration
+    would look complete while half of it was never checked."""
+    from switch_migrator.report.excel import write_excel
+    from switch_migrator.report.tables import Table
+
+    tables = [Table("Summary", ["Switch", "Ports up"])]
+    tables[0].add(["gx-11-s72-p1", "12/48"])          # not a cabling sheet
+    for site, switch in (("Frankfurt", "gx-11-s72-p1"), ("Munich", "mu-01-a")):
+        t = Table(f"Cabling {site}", HEADERS)
+        t.add(_row(**{"Port ID": f"P-{site}", "Old switch": switch,
+                      "Old port": "1/1", "NEW switch": "leaf-01",
+                      "NEW port": "1/1"}))
+        tables.append(t)
+    path = tmp_path / "sheets.xlsx"
+    write_excel(tables, path)
+
+    sheet = CS.load(path)
+    assert sheet.sheets_read == ["Cabling Frankfurt", "Cabling Munich"]
+    assert {r.old_switch for r in sheet.rows} == {"gx-11-s72-p1", "mu-01-a"}
+    # and each row remembers where it came from, for the error messages
+    assert {r.sheet for r in sheet.rows} == {"Cabling Frankfurt",
+                                             "Cabling Munich"}
+
+
+def test_one_worksheet_can_still_be_singled_out(tmp_path):
+    from switch_migrator.report.excel import write_excel
+    from switch_migrator.report.tables import Table
+
+    tables = []
+    for site, switch in (("Frankfurt", "gx-11-s72-p1"), ("Munich", "mu-01-a")):
+        t = Table(f"Cabling {site}", HEADERS)
+        t.add(_row(**{"Old switch": switch, "Old port": "1/1"}))
+        tables.append(t)
+    path = tmp_path / "sheets.xlsx"
+    write_excel(tables, path)
+    sheet = CS.load(path, sheet_name="Cabling Munich")
+    assert [r.old_switch for r in sheet.rows] == ["mu-01-a"]
