@@ -70,6 +70,8 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
         "LACP", "MLT ID", "MLT name", "Transceiver", "Media", "Uplink",
         "Usage", "Why",
     ])
+    t.console_columns = ["Port ID", "Switch", "Port", "Device on port",
+                         "VLAN IDs", "Oper", "MLT ID", "Usage"]
     for audit in sorted(audits, key=lambda a: a.name):
         for p in audit.ports:
             t.add([
@@ -106,6 +108,8 @@ def build_cabling(audits: list[SwitchAudit]) -> Table:
         "Port VLANs", "Port I-SIDs",
         "MAC addresses", "Media", "Usage", "Why",
     ])
+    t.console_columns = ["VLAN", "Type", "Port ID", "End device / neighbor",
+                         "Old switch", "Old port", "MLT ID", "Usage"]
     for audit in sorted(audits, key=lambda a: a.name):
         mlt_by_id = {m.mlt_id: m for m in audit.mlts}
         # in-use ports first so the techs work top-down; likely-dead ports stay

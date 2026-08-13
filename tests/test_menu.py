@@ -231,3 +231,56 @@ def test_manifest_is_written_when_enabled(env):
     data = json.loads(manifests[0].read_text())
     assert data["totals"]["switches"] == 2
     assert data["switches"][0]["commands"]["sent"] > 0
+
+
+# ------------------- health / MLT blocks / verification ---------------------
+
+def test_health_action_writes_a_report_and_needs_no_devices(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
+    s.offline_dir = None                        # nothing left to talk to
+    M.action_health(s, ScriptedConsole([]))
+    assert list((tmp / "out").glob("health-check-*.xlsx"))
+
+
+def test_generate_mlt_action_writes_blocks(env, tmp_path):
+    import csv
+    tmp, cfg_path, inv, raw = env
+    sheet = tmp / "cabling.csv"
+    with sheet.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Old switch", "Old port", "NEW switch", "NEW port",
+                    "MLT ID", "MLT name", "Type"])
+        w.writerow(["gx-01", "1/1", "leaf-01", "1/1", "35", "srv-lag", "mlt"])
+        w.writerow(["gx-01", "1/2", "leaf-01", "1/2", "35", "srv-lag", "mlt"])
+    s = _session(env)
+    M.action_generate_mlt(s, ScriptedConsole([str(sheet), "y"]))
+    out = (tmp / "out" / "config" / "mlt-blocks.cfg").read_text()
+    assert 'mlt 35 enable name "srv-lag"' in out
+    assert "mlt 35 member 1/1,1/2" in out
+    assert "smlt" in out
+
+
+def test_generate_mlt_action_reports_a_bad_sheet(env):
+    tmp, cfg_path, inv, raw = env
+    bad = tmp / "notasheet.csv"
+    bad.write_text("a,b\n1,2\n")
+    s = _session(env)
+    M.action_generate_mlt(s, ScriptedConsole([str(bad)]))
+    assert not (tmp / "out" / "config" / "mlt-blocks.cfg").exists()
+
+
+def test_verify_action_collects_the_switches_the_sheet_names(env):
+    import csv
+    tmp, cfg_path, inv, raw = env
+    sheet = tmp / "cabling.csv"
+    with sheet.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Old switch", "Old port", "NEW switch", "NEW port",
+                    "Port ID"])
+        # 'sw-voss' is the offline capture, so it stands in for the new switch
+        w.writerow(["old-01", "1/7", "sw-voss", "1/1", "P0001"])
+    s = _session(env)
+    M.action_verify(s, ScriptedConsole([str(sheet)]), _offline_creds)
+    assert list((tmp / "out").glob("verification-*.xlsx"))

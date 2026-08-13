@@ -152,6 +152,9 @@ switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
   7  Everything            run 3-6 in one go with the collected data
   8  Snapshot              save this session's data, or load an earlier one
   9  Dry run               list every command a collection would send
+  h  Health check          go/no-go before the window: what is already broken?
+  m  Generate MLT blocks   new switches' MLT config from a filled-in cabling sheet
+  v  Verify migration      after the window: check every re-patched link
   s  Settings              output directory, offline replay, manifest, target switch
   0  Quit
 ```
@@ -204,7 +207,113 @@ switch-migrator --from-snapshot output/snapshot-20260812-140311.json \
 
 # Write an audit trail of the run (every command sent and its outcome)
 switch-migrator -i switches.yaml --manifest
+
+# Go/no-go before the window opens
+switch-migrator -i switches.yaml --health-check
+
+# The sheet comes back filled in: generate the new switches' MLT blocks
+switch-migrator --generate-mlt cabling.xlsx
+
+# After the window: check every re-patched link on the new switches
+switch-migrator --verify-migration cabling.xlsx
 ```
+
+## The migration itself
+
+The audit tells you whether the configuration lines up. These three answer the
+questions asked on the night.
+
+### Before: health check (`--health-check`)
+
+A different and more urgent question than the audit's: **is anything already
+broken that the migration would make worse**, or that would hide behind the
+migration and get blamed on it afterwards?
+
+| Verdict | Meaning |
+|---|---|
+| `BLOCK` | do not start; fix this or re-plan the window |
+| `WARN` | start, but know about it |
+| `UNKNOWN` | the switch did not say enough to judge |
+| `OK` | nothing found |
+
+What blocks: an unreachable switch, no readable port state, a **degraded MLT**
+(running on one leg — the first cable you unplug is an outage, not a re-patch),
+a **down vIST** (the SMLT pair is not a pair right now), lost uplink
+redundancy, and VLANs with nowhere to land in the fabric. What warns: an MLT
+that is already fully down, ports the usage classification flagged as a fault
+on a live cable, session problems that make the collected data less
+trustworthy.
+
+Every check is derived from the state the normal collection already gathers —
+**no extra command is sent to any device** — so it costs nothing on top of the
+audit you were running anyway. A `BLOCK` sets exit code 1, so a change pipeline
+can gate on it.
+
+### During: MLT blocks (`--generate-mlt`)
+
+Reads the filled-in cabling sheet and emits the aggregations to create on the
+new switches, in the two sections a VOSS box prints in its own
+`show running-config`:
+
+```
+mlt 35 enable name "MLT035.srv"
+mlt 35 member 1/11,1/12
+
+interface mlt 35
+smlt
+lacp enable key 35
+flex-uni enable
+exit
+```
+
+The MLT id and name come from the sheet's **NEW MLT ID / NEW MLT name**
+columns when the planner filled them in, and are carried over from the old MLT
+when they didn't — so it produces something useful from a half-filled sheet and
+gets more precise as the sheet does. `--no-smlt` emits plain single-switch MLTs
+instead of SMLT pairs.
+
+It refuses to guess where guessing is dangerous. **No I-SID, c-vid or VLAN
+binding is ever emitted** — that is `--extract-config` and the I-SID decision
+worksheet's job, and they have their own rules about what may be assumed.
+Anything it only half understands is written into the file as a `# [!]` line
+rather than silently configured: an aggregation of one member, an id claimed
+twice on one switch, members facing three different neighbours, or an SMLT
+that ended up on only one of the two peers (a single point of failure wearing
+the costume of a redundant one). An uplink facing **two** neighbours is the
+normal SMLT-pair shape and is not flagged.
+
+### After: verification (`--verify-migration`)
+
+Reads the same sheet back, collects the **new** switches — it takes their names
+from the sheet, so no inventory is needed — and checks every link a technician
+recorded:
+
+| Result | Meaning |
+|---|---|
+| `PASS` | the port is up **and** at least one MAC the old port used to learn is now learned here (or the LLDP neighbour matches, when the old port had learned nothing). The same machine is talking on the new port. |
+| `WARN` | the port is up, but nothing else lines up yet — no expected MAC back, or the neighbour, VLANs or MLT membership differ from the sheet |
+| `FAIL` | the port is down, missing from the switch, or the switch could not be read |
+| `PENDING` | no NEW switch/port in the sheet yet — not migrated, not a problem |
+
+MACs age out in about five minutes and a machine that has not sent a frame
+since the cutover has no entry anywhere, so *"no MAC yet"* is a **warn with
+that explanation**, never a failure — re-run a few minutes later and most warns
+turn into passes on their own. A `FAIL` sets exit code 1.
+
+The summary sheet also lists **ports that are up on a new switch but appear in
+no sheet row** — the other direction: a link somebody patched without writing
+it down.
+
+### Reading the sheet back
+
+The cabling sheet has been through a data centre before it comes back, so
+reading it is deliberately forgiving: columns are matched **by name, not
+position** (add your own columns, reorder them, it does not matter), `.xlsx`
+and `.csv` both work, port ids are normalised (`Port 1/7`, `1 / 7`, `1/7`),
+rows nobody has filled in are *pending* rather than errors, and a cell it
+cannot make sense of becomes a note on that row instead of killing the file.
+The one thing it does complain about is a **half-filled row** — a NEW switch
+with no NEW port, or the reverse — because that looks migrated and isn't.
 
 ### Snapshots (`--save-snapshot` / `--from-snapshot`)
 
@@ -376,7 +485,8 @@ Output goes to `./output/` by default:
 * `switch-migrator.log`.
 
 **Exit codes** (scriptable): `0` = clean, `1` = errors found (unreachable
-device, DvR read failure, or any red comparison result), `2` = config error.
+device, DvR read failure, any red comparison result, a health-check `BLOCK`, or
+a failed link in the verification), `2` = config error.
 
 ### Reading the report
 
@@ -510,6 +620,10 @@ switch_migrator/
 ├── config_generate.py  # ERS L2 model -> VOSS flex-UNI draft
 ├── isid.py             # per-VLAN I-SID resolution + decision worksheet
 ├── usage.py            # is this port actually in use? (evidence-based)
+├── health.py           # pre-migration go/no-go, derived from collected state
+├── cabling_sheet.py    # read the filled-in cabling sheet back (.xlsx/.csv)
+├── mlt_generate.py     # cabling sheet -> new switches' MLT config blocks
+├── verify.py           # post-migration: did every link come back up?
 ├── snapshot.py         # save/load the whole collected state as JSON
 ├── manifest.py         # per-run audit trail: commands, outcomes, files
 ├── collectors/
@@ -522,6 +636,7 @@ switch_migrator/
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers
     ├── migration.py    # port info + cabling sheets, migration commands
+    ├── migration_tables.py  # health-check and verification tables
     ├── progress.py     # live per-device progress during collection
     └── excel.py        # xlsx + csv export; console.py renders to terminal
 ```

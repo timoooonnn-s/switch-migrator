@@ -40,9 +40,15 @@ from switch_migrator.connection import (
     enable_legacy_ssh_algorithms,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
-from switch_migrator import manifest as manifest_mod
-from switch_migrator import snapshot as snapshot_mod
+from switch_migrator import cabling_sheet, health, manifest as manifest_mod
+from switch_migrator import mlt_generate, snapshot as snapshot_mod, verify
 from switch_migrator.report import console as console_report
+from switch_migrator.report.migration_tables import (
+    build_health,
+    build_health_summary,
+    build_verification,
+    build_verification_summary,
+)
 from switch_migrator.report.progress import NullProgress, make_progress
 from switch_migrator.report.migration import (
     assign_port_uids,
@@ -128,6 +134,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "every command sent and its outcome, what failed, "
                              "which files were produced - an audit trail of the "
                              "pre-migration check")
+    parser.add_argument("--health-check", action="store_true",
+                        help="go/no-go check before the migration window: "
+                             "flags anything already broken that the migration "
+                             "would make worse (degraded MLTs, a down vIST, "
+                             "lost uplink redundancy, VLANs with nowhere to "
+                             "land). Sends no extra commands - it is derived "
+                             "from the same collection.")
+    parser.add_argument("--verify-migration", type=Path, metavar="SHEET",
+                        help="after the window: read the filled-in cabling "
+                             "sheet (.xlsx or .csv) and check every re-patched "
+                             "link on the NEW switches - link up, expected MACs "
+                             "back, LLDP neighbor, VLANs and MLT membership. "
+                             "The switches named here are the ones to collect.")
+    parser.add_argument("--sheet-name", metavar="NAME", default="",
+                        help="worksheet to read from the .xlsx given to "
+                             "--verify-migration / --generate-mlt (default: "
+                             "the 'Cabling' sheet)")
+    parser.add_argument("--generate-mlt", type=Path, metavar="SHEET",
+                        help="generate the VOSS MLT config blocks for the new "
+                             "switches from a filled-in cabling sheet, to "
+                             "<output>/config/mlt-blocks.cfg. Reads no device.")
+    parser.add_argument("--no-smlt", action="store_true",
+                        help="--generate-mlt: emit plain single-switch MLTs "
+                             "instead of SMLT pairs")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="also print the ports/MLTs/fabric tables to the console")
     parser.add_argument("--debug", action="store_true",
@@ -199,7 +229,10 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
             audit = collect_switch(
                 target, runner, cfg,
                 pull_config=args.extract_config,
-                pull_macs=getattr(args, "migration_sheets", False))
+                # verification needs the learned MACs on the NEW ports - they
+                # are the evidence that the right cable went into the right hole
+                pull_macs=bool(getattr(args, "migration_sheets", False)
+                               or getattr(args, "verify_migration", None)))
             return audit
         except Exception as exc:  # noqa: BLE001 - same: isolate per-device failures
             failed.errors.append(
@@ -355,6 +388,76 @@ def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
     return written
 
 
+def _load_sheet(path: Path, args: argparse.Namespace):
+    return cabling_sheet.load(path, sheet_name=args.sheet_name or None)
+
+
+def _targets_from_sheet(args: argparse.Namespace,
+                        console: Console) -> list[SwitchTarget]:
+    """The switches to verify are the ones the sheet says links moved to."""
+    try:
+        sheet = _load_sheet(args.verify_migration, args)
+    except cabling_sheet.SheetError as exc:
+        raise ConfigError(str(exc)) from None
+    names = sorted(sheet.by_new_switch())
+    if not names:
+        raise ConfigError(
+            f"{args.verify_migration}: no row has both a NEW switch and a NEW "
+            f"port yet, so there is nothing to verify")
+    console.print(f"Verifying against {len(names)} new switch(es) named in the "
+                  f"sheet: {', '.join(names)} [dim](assumed VOSS; use -s to "
+                  f"say otherwise)[/dim]")
+    return [SwitchTarget(name=n, host=n, platform=Platform.VOSS) for n in names]
+
+
+def _run_generate_mlt(args: argparse.Namespace, console: Console) -> int:
+    """--generate-mlt: cabling sheet in, MLT config blocks out. No device."""
+    try:
+        sheet = _load_sheet(args.generate_mlt, args)
+    except cabling_sheet.SheetError as exc:
+        console.print(f"[bold red]Cabling sheet:[/bold red] {exc}")
+        return 2
+    result = mlt_generate.plan(sheet, smlt=not args.no_smlt)
+    text = mlt_generate.render(result, source=str(args.generate_mlt))
+    path = args.output_dir / "config" / "mlt-blocks.cfg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+    for problem in sheet.problems:
+        console.print(f"[yellow]{problem}[/yellow]")
+    for problem in result.problems:
+        console.print(f"[bold yellow]![/bold yellow] {problem}")
+    per_switch = result.by_switch
+    console.print(f"[bold]{len(result.plans)} MLT(s)[/bold] across "
+                  f"{len(per_switch)} new switch(es) from "
+                  f"{len(sheet.migrated)} re-patched link(s)")
+    for switch, plans in sorted(per_switch.items()):
+        for p in plans:
+            flags = " ".join(f for f, on in (("smlt", p.smlt), ("lacp", p.lacp),
+                                             ("flex-uni", p.flex_uni)) if on)
+            console.print(f"  {switch}  MLT {p.mlt_id} \"{p.name}\"  "
+                          f"members {','.join(p.members)}  [dim]{flags}[/dim]")
+    console.print(f"Written: [bold]{path}[/bold]")
+    console.print("[dim]Review before pasting - LACP and the SMLT peer are "
+                  "the two things this cannot know from the sheet alone.[/dim]")
+    return 1 if result.problems else 0
+
+
+def _render_health(report: health.HealthReport, console: Console) -> None:
+    counts = report.counts()
+    verdict = report.verdict
+    color = {health.BLOCK: "bold red", health.WARN: "bold yellow",
+             health.OK: "bold green"}.get(verdict, "bold")
+    console.print(f"\n[{color}]Pre-migration health: {verdict}[/{color}] - "
+                  f"{counts[health.BLOCK]} switch(es) blocked, "
+                  f"{counts[health.WARN]} with warnings, "
+                  f"{counts[health.OK]} clean")
+    for f in report.blockers:
+        console.print(f"  [red]BLOCK[/red] {f.switch} {f.check}: {f.detail}")
+        if f.action:
+            console.print(f"        [dim]{f.action}[/dim]")
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     args = build_arg_parser().parse_args(argv)
@@ -372,21 +475,30 @@ def main(argv: list[str] | None = None) -> int:
     # touched - every sheet below is a pure function of the collected state.
     from_snapshot = getattr(args, "from_snapshot", None)
     try:
+        # generating MLT blocks reads a sheet, not a fabric; a snapshot run
+        # compares nothing. Neither needs the DvR/I-SID sections to be present.
         cfg = load_config(args.config,
-                          require_fabric=not args.no_fabric and not from_snapshot)
+                          require_fabric=(not args.no_fabric
+                                          and not from_snapshot
+                                          and not args.generate_mlt))
         targets: list[SwitchTarget] = []
         if args.inventory:
             targets.extend(load_inventory(args.inventory))
         for raw in args.switch:
             targets.append(parse_switch_arg(raw))
-        if not targets and not from_snapshot:
+        if args.verify_migration and not targets:
+            # the sheet already names the switches to check: the new ones the
+            # links were moved onto. They are fabric leaves, hence VOSS.
+            targets = _targets_from_sheet(args, console)
+        if not targets and not from_snapshot and not args.generate_mlt:
             raise ConfigError("no switches given: use -i inventory.yaml and/or "
                               "-s NAME:PLATFORM[:HOST]")
         dupes = {t.name for t in targets if [x.name for x in targets].count(t.name) > 1}
         if dupes:
             raise ConfigError(f"duplicate switch names: {', '.join(sorted(dupes))}")
 
-        if args.offline or args.dry_run or from_snapshot:
+        if (args.offline or args.dry_run or args.generate_mlt
+                or from_snapshot):
             creds = dvr_creds = Credentials("offline", "offline")
         else:
             creds = get_credentials("switches", "SM")
@@ -405,6 +517,10 @@ def main(argv: list[str] | None = None) -> int:
             targets, cfg, args,
             dvrs=[] if args.no_fabric else cfg.dvr_controllers), console)
         return 0
+
+    # generating the MLT blocks is pure paperwork: sheet in, config out
+    if args.generate_mlt:
+        return _run_generate_mlt(args, console)
 
     started = datetime.now()
     commands_by_device: dict[str, list[dict]] = {}
@@ -473,7 +589,43 @@ def main(argv: list[str] | None = None) -> int:
     if args.migration_sheets:
         assign_port_uids(audits)
         tables += [build_port_info(audits), build_cabling(audits)]
+
+    health_report = None
+    if args.health_check:
+        health_report = health.check(audits, comparisons, cfg)
+        tables += [build_health_summary(health_report),
+                   build_health(health_report)]
+
+    verify_report = None
+    if args.verify_migration:
+        try:
+            sheet = _load_sheet(args.verify_migration, args)
+        except cabling_sheet.SheetError as exc:
+            console.print(f"[bold red]Cabling sheet:[/bold red] {exc}")
+            return 2
+        verify_report = verify.verify(sheet, audits)
+        extra = verify.unexpected_ports(sheet, audits)
+        tables += [build_verification_summary(verify_report, extra),
+                   build_verification(verify_report)]
+
     console_report.render(tables, Console(), verbose=args.verbose)
+    if health_report is not None:
+        _render_health(health_report, console)
+    if verify_report is not None:
+        counts = verify_report.counts()
+        color = "bold red" if counts[verify.FAIL] else (
+            "bold yellow" if counts[verify.WARN] else "bold green")
+        console.print(f"\n[{color}]Migration verification:[/{color}] "
+                      f"{counts[verify.PASS]} pass, {counts[verify.WARN]} warn, "
+                      f"{counts[verify.FAIL]} fail, "
+                      f"{counts[verify.PENDING]} not migrated yet")
+        for problem in verify_report.problems:
+            console.print(f"  [yellow]{problem}[/yellow]")
+        for v in verify_report.verdicts:
+            if v.result == verify.FAIL:
+                console.print(f"  [red]FAIL[/red] {v.uid} {v.old_switch} "
+                              f"{v.old_port} -> {v.new_switch} {v.new_port}: "
+                              f"{v.why}")
 
     written: list[Path] = []
     stamp = started.strftime("%Y%m%d-%H%M%S")
@@ -507,6 +659,12 @@ def main(argv: list[str] | None = None) -> int:
     severities = [t for table in tables for t in table.severities]
     unreachable = [a for a in audits if not a.reachable]
     code = 1 if ("error" in severities or unreachable or fabric.dvr_errors) else 0
+    # a health BLOCK or a failed link is exactly the case a script must catch,
+    # even when the audit itself found nothing else wrong
+    if health_report is not None and health_report.verdict == health.BLOCK:
+        code = 1
+    if verify_report is not None and not verify_report.ok:
+        code = 1
 
     if args.manifest:
         path = manifest_mod.write(

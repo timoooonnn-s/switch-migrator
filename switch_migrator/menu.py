@@ -31,6 +31,7 @@ from switch_migrator.config import (
     parse_switch_arg,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
+from switch_migrator import health as health_mod
 from switch_migrator import manifest as manifest_mod
 from switch_migrator import snapshot as snapshot_mod
 from switch_migrator.report.progress import make_progress
@@ -123,7 +124,7 @@ def _status_panel(s: Session) -> Panel:
     return Panel("\n".join(lines), title="switch-migrator", title_align="left")
 
 
-_NEEDS_DATA = ("3", "4", "5", "6", "7")
+_NEEDS_DATA = ("3", "4", "5", "6", "7", "h")
 
 _ENTRIES = [
     ("1", "Select switches", "pick targets from the inventory or add them by hand"),
@@ -135,6 +136,9 @@ _ENTRIES = [
     ("7", "Everything", "run 3-6 in one go with the collected data"),
     ("8", "Snapshot", "save this session's data, or load an earlier one"),
     ("9", "Dry run", "list every command a collection would send - connects to nothing"),
+    ("h", "Health check", "go/no-go before the window: what is already broken?"),
+    ("m", "Generate MLT blocks", "new switches' MLT config from a filled-in cabling sheet"),
+    ("v", "Verify migration", "after the window: check every re-patched link"),
     ("s", "Settings", "output directory, offline replay, manifest, target switch"),
     ("0", "Quit", ""),
 ]
@@ -430,6 +434,118 @@ def action_dry_run(s: Session, console: Console) -> None:
                                     dvrs=s.cfg.dvr_controllers), console)
 
 
+def action_health(s: Session, console: Console) -> None:
+    """Go/no-go on the collected data. Sends nothing to any device."""
+    from switch_migrator.compare import compare_switch
+    from switch_migrator.report import console as console_report
+    from switch_migrator.report.excel import write_excel
+    from switch_migrator.report.migration_tables import (
+        build_health, build_health_summary)
+
+    fabric = s.fabric or FabricState()
+    comparisons = {} if not s.collected_fabric else {
+        a.name: compare_switch(a, fabric, s.cfg) for a in s.audits if a.reachable}
+    report = health_mod.check(s.audits, comparisons, s.cfg)
+    tables = [build_health_summary(report), build_health(report)]
+    console_report.render(tables, console, verbose=False)
+
+    counts = report.counts()
+    color = {health_mod.BLOCK: "bold red", health_mod.WARN: "bold yellow",
+             health_mod.OK: "bold green"}.get(report.verdict, "bold")
+    console.print(f"[{color}]Pre-migration health: {report.verdict}[/{color}] - "
+                  f"{counts[health_mod.BLOCK]} blocked, "
+                  f"{counts[health_mod.WARN]} with warnings, "
+                  f"{counts[health_mod.OK]} clean")
+    if not s.collected_fabric:
+        console.print("[dim]No fabric data in this session - VLANs that have "
+                      "nowhere to land in the fabric were not checked.[/dim]")
+    s.output_dir.mkdir(parents=True, exist_ok=True)
+    path = s.output_dir / f"health-check-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+    write_excel(tables, path)
+    console.print(f"[green]Written:[/green] {path}")
+
+
+def action_generate_mlt(s: Session, console: Console) -> None:
+    """Cabling sheet in, MLT config blocks out. Touches no device."""
+    from switch_migrator import cabling_sheet, mlt_generate
+
+    path = Path(_ask(console, "Filled-in cabling sheet (.xlsx or .csv)"))
+    if not str(path) or str(path) == ".":
+        return
+    try:
+        sheet = cabling_sheet.load(path)
+    except cabling_sheet.SheetError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    smlt = _yes(console, "SMLT pairs (same MLT id on both vIST peers)?", True)
+    result = mlt_generate.plan(sheet, smlt=smlt)
+    for problem in result.problems:
+        console.print(f"[yellow]![/yellow] {problem}")
+    out = s.output_dir / "config" / "mlt-blocks.cfg"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(mlt_generate.render(result, source=str(path)))
+    console.print(f"[green]{len(result.plans)} MLT(s)[/green] from "
+                  f"{len(sheet.migrated)} re-patched link(s)")
+    for plan in result.plans:
+        console.print(f"  {plan.switch}  MLT {plan.mlt_id} \"{plan.name}\"  "
+                      f"members {','.join(plan.members)}")
+    console.print(f"[green]Written:[/green] {out}")
+
+
+def action_verify(s: Session, console: Console, creds_fn) -> None:
+    """Read the filled-in sheet, collect the NEW switches, check every link."""
+    from switch_migrator import cabling_sheet, verify
+    from switch_migrator.cli import run_collection
+    from switch_migrator.report import console as console_report
+    from switch_migrator.report.excel import write_excel
+    from switch_migrator.report.migration_tables import (
+        build_verification, build_verification_summary)
+
+    path = Path(_ask(console, "Filled-in cabling sheet (.xlsx or .csv)"))
+    if not str(path) or str(path) == ".":
+        return
+    try:
+        sheet = cabling_sheet.load(path)
+    except cabling_sheet.SheetError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    names = sorted(sheet.by_new_switch())
+    if not names:
+        console.print("[yellow]No row has both a NEW switch and a NEW port "
+                      "yet - nothing to verify.[/yellow]")
+        return
+    console.print(f"The sheet names {len(names)} new switch(es): "
+                  f"{', '.join(names)}")
+    targets = [SwitchTarget(name=n, host=n, platform=Platform.VOSS)
+               for n in names]
+
+    creds, _ = creds_fn(s, console)
+    if creds is None:
+        return
+    # the MACs on the new ports are the evidence, so collect them
+    args = s.to_args(no_fabric=True, migration_sheets=True)
+    with make_progress(console, len(targets)) as prog:
+        audits = run_collection(targets, creds, s.cfg, args, prog, {})
+
+    report = verify.verify(sheet, audits)
+    extra = verify.unexpected_ports(sheet, audits)
+    tables = [build_verification_summary(report, extra),
+              build_verification(report)]
+    console_report.render(tables, console, verbose=False)
+    counts = report.counts()
+    color = "bold red" if counts[verify.FAIL] else (
+        "bold yellow" if counts[verify.WARN] else "bold green")
+    console.print(f"[{color}]Verification:[/{color}] {counts[verify.PASS]} pass, "
+                  f"{counts[verify.WARN]} warn, {counts[verify.FAIL]} fail, "
+                  f"{counts[verify.PENDING]} not migrated yet")
+    for problem in report.problems:
+        console.print(f"  [yellow]{problem}[/yellow]")
+    s.output_dir.mkdir(parents=True, exist_ok=True)
+    out = s.output_dir / f"verification-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+    write_excel(tables, out)
+    console.print(f"[green]Written:[/green] {out}")
+
+
 def action_settings(s: Session, console: Console) -> None:
     out = _ask(console, "Output directory", str(s.output_dir))
     s.output_dir = Path(out)
@@ -505,6 +621,9 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         "7": lambda: action_everything(s, console),
         "8": lambda: action_snapshot(s, console),
         "9": lambda: action_dry_run(s, console),
+        "h": lambda: action_health(s, console),
+        "m": lambda: action_generate_mlt(s, console),
+        "v": lambda: action_verify(s, console, creds_fn),
         "s": lambda: action_settings(s, console),
     }
     while True:
