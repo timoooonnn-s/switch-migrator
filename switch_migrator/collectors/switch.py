@@ -282,6 +282,7 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
     # On a flex-UNI box the VLANs are not platform-VLAN members but per-port
     # I-SID bindings, so `show vlan members` yields nothing - use the port
     # bindings already collected as the second source (no extra command).
+    tags_a_cvid: set[str] = set()
     for row in audit.port_isid_rows:
         port = by_port.get(row["port"])
         if port is None:
@@ -290,14 +291,25 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
             port.vlans.append(row["vlan"])
         if row["isid"] not in port.isids:
             port.isids.append(row["isid"])
+        if row.get("cvid") is not None:
+            tags_a_cvid.add(row["port"])
     for port in audit.ports:
         port.vlans.sort()
         port.isids.sort()
-        # a port carrying several VLANs must be tagged; a single VLAN is
-        # normally the untagged/native one. Left blank when unknown.
-        if len(port.vlans) > 1:
+        if port.port in tags_a_cvid:
+            # A c-vid IS the tag the host puts on the wire, so this is settled
+            # rather than guessed - and it has to win over the count rule
+            # below, which would call a flex-UNI port carrying exactly one
+            # c-vid 'untagged' and have somebody configure the new port that
+            # way.
+            port.tagging = "tagged"
+        elif len(port.vlans) > 1:
+            # several VLANs on one port can only be a trunk
             port.tagging = "tagged"
         elif len(port.vlans) == 1:
+            # traditional `vlan i-sid` model: one platform VLAN and nothing
+            # that distinguishes tagged from untagged, so this stays the
+            # inference it always was - usually the native VLAN
             port.tagging = "untagged"
 
     if not pull_macs:

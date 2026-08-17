@@ -277,8 +277,20 @@ def parse_port_isid(output: str) -> list[dict]:
     """`show interfaces gigabitEthernet i-sid`
 
     Data lines: <port> <ifindex> <isid> <vlanid|N/A> <c-vid|N/A> <type> ...
-    Returns [{"port": str, "isid": int, "vlan": int|None}, ...]; the VLAN is
-    taken from VLANID, falling back to C-VID for switched-UNI rows.
+
+    Returns [{"port": str, "isid": int, "vlan": int|None, "cvid": int|None,
+              "platform_vlan": int|None}, ...].
+
+    The VLAN is the **C-VID** whenever the row has one. That is the VLAN the
+    end device actually puts on the wire, and therefore the one that has to
+    exist on the new switch. The VLANID column is the *platform* VLAN the
+    switch uses internally to realise the service; on a flex-UNI leaf the two
+    are different numbers and taking VLANID puts a VLAN on the cabling sheet
+    that no host has ever tagged.
+
+    VLANID is the fallback, not the preference: on the traditional
+    `vlan i-sid` model the C-VID column is N/A and the platform VLAN *is* the
+    customer VLAN, so that case still resolves correctly.
     """
     rows: list[dict] = []
     for line in output.splitlines():
@@ -286,12 +298,19 @@ def parse_port_isid(output: str) -> list[dict]:
         if len(tokens) < 5 or not PORT_RE.match(tokens[0]) \
                 or not tokens[1].isdigit() or not tokens[2].isdigit():
             continue
-        vlan = None
-        for candidate in (tokens[3], tokens[4]):
-            if candidate.isdigit() and 1 <= int(candidate) <= 4094:
-                vlan = int(candidate)
-                break
-        rows.append({"port": tokens[0], "isid": int(tokens[2]), "vlan": vlan})
+
+        def _vlan(token: str) -> int | None:
+            return (int(token) if token.isdigit() and 1 <= int(token) <= 4094
+                    else None)
+
+        platform_vlan, cvid = _vlan(tokens[3]), _vlan(tokens[4])
+        rows.append({
+            "port": tokens[0],
+            "isid": int(tokens[2]),
+            "vlan": cvid if cvid is not None else platform_vlan,
+            "cvid": cvid,
+            "platform_vlan": platform_vlan,
+        })
     return rows
 
 
@@ -387,15 +406,25 @@ def parse_vlan_basic(output: str) -> dict[int, str]:
 def parse_isid_local(output: str) -> dict[int, dict]:
     """`show i-sid` on a DvR controller/BEB.
 
-    Returns {isid: {"cvids": set[int], "name": str}}. Rows are anchored on a
-    numeric first token (the I-SID id) followed by a non-numeric TYPE column,
-    so any TYPE value works (ELAN, ELAN_TR, CVLAN, future ones) - an unknown
-    type can never cause endpoints to be attributed to the previous I-SID.
-    C-VIDs come from 'c<vid>:<endpoint>' markers (incl. wrapped continuation
-    lines) and from the VLANID column newer releases insert after TYPE.
+    Returns {isid: {"cvids": set[int], "untagged": set[str], "name": str}}.
+    Rows are anchored on a numeric first token (the I-SID id) followed by a
+    non-numeric TYPE column, so any TYPE value works (ELAN, ELAN_TR, CVLAN,
+    future ones) - an unknown type can never cause endpoints to be attributed
+    to the previous I-SID.
+
+    Endpoints are the markers the device's own legend explains:
+
+        c: customer vid   u: untagged-traffic
+
+    so `c695:1/10` is port 1/10 carrying customer VLAN 695 into the service,
+    and `u:1/36` is port 1/36 put into the service untagged. An untagged
+    endpoint has NO customer VLAN by definition - the host tags nothing - so
+    it contributes a port to 'untagged', never a number to 'cvids'. Both are
+    read, including from wrapped continuation lines.
+
     Footer lines ('N out of M Total Num ...') are ignored. I-SID names may be
     arbitrary words ('quarantaine', 'cvlan-x') - only structural tokens
-    (CONFIG/DISCOVER/-/N/A, ports, numbers, c<vid>: markers) are excluded.
+    (CONFIG/DISCOVER/-/N/A, ports, numbers, endpoint markers) are excluded.
     """
     result: dict[int, dict] = {}
     current: int | None = None
@@ -409,19 +438,22 @@ def parse_isid_local(output: str) -> dict[int, dict]:
                 current = None  # 'N out of M Total Num ...' footer
                 continue
             current = int(tokens[0])
-            entry = result.setdefault(current, {"cvids": set(), "name": ""})
+            entry = result.setdefault(
+                current, {"cvids": set(), "untagged": set(), "name": ""})
             if len(tokens) >= 3 and tokens[2].isdigit() \
                     and 1 <= int(tokens[2]) <= 4094:
                 entry["cvids"].add(int(tokens[2]))  # VLANID column
             tail = tokens[-1]
             if len(tokens) > 2 and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
-                    and not re.match(r"^c\d{1,4}:", tail) \
+                    and not re.match(r"^[cu]\d{0,4}:", tail) \
                     and not PORT_RE.match(tail) and not tail.isdigit():
                 entry["name"] = tail
         if current is None:
             continue
         for m in re.finditer(r"\bc(\d{1,4}):", line):
             result[current]["cvids"].add(int(m.group(1)))
+        for m in re.finditer(r"(?<![\w:])u:(\d+(?:/\d+){0,2})", line):
+            result[current]["untagged"].add(m.group(1))
     return result
 
 

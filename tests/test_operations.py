@@ -390,3 +390,51 @@ def test_excel_tab_names_survive_long_and_illegal_location_names(tmp_path):
     for title in titles:
         assert len(title) <= 31
         assert not set(title) & set("[]:*?/\\")
+
+
+# ------------------- c-vid vs platform VLAN (flex-UNI) ----------------------
+
+def _isid_capture(rows: str) -> str:
+    return ("PORTNUM IFINDEX ID       VLANID C-VID  TYPE   ORIGIN    NAME\n"
+            "------------------------------------------------------------\n"
+            + rows)
+
+
+def test_the_sheets_carry_the_cvid_not_the_platform_vlan(tmp_path, cfg):
+    """A flex-UNI port's c-vid is what the host tags and what has to exist on
+    the new switch; the VLANID column is an internal number no host ever
+    sends. Putting the wrong one on the sheet makes a technician recreate a
+    VLAN that carries nothing."""
+    device = tmp_path / "gx-01"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_interfaces_gigabitethernet_i_sid.txt").write_text(
+        _isid_capture("1/1     192     2500695  4048   695    ELAN   C  ---   svc\n"))
+    audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
+                           OfflineRunner("gx-01", tmp_path), cfg)
+    port = next(p for p in audit.ports if p.port == "1/1")
+    assert 695 in port.vlans
+    assert 4048 not in port.vlans
+    assert 2500695 in port.isids
+
+
+def test_a_single_cvid_port_is_tagged_not_untagged(tmp_path, cfg):
+    """The count rule alone calls one VLAN 'untagged'. A c-vid is a tag."""
+    device = tmp_path / "gx-01"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_interfaces_gigabitethernet_i_sid.txt").write_text(
+        _isid_capture("1/1     192     2500695  4048   695    ELAN   C  ---   svc\n"))
+    audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
+                           OfflineRunner("gx-01", tmp_path), cfg)
+    assert next(p for p in audit.ports if p.port == "1/1").tagging == "tagged"
+
+
+def test_the_traditional_model_is_unchanged(tmp_path, cfg):
+    """No C-VID column value means the platform VLAN IS the customer VLAN -
+    that case has to keep working exactly as before."""
+    device = tmp_path / "gx-01"
+    shutil.copytree(FIXTURES / "voss", device)
+    audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
+                           OfflineRunner("gx-01", tmp_path), cfg)
+    port = next(p for p in audit.ports if p.port == "1/1")
+    assert port.vlans == [100] and port.isids == [10100]
+    assert port.tagging == "untagged"

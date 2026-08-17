@@ -69,13 +69,40 @@ def test_parse_port_state(fixture):
 
 
 def test_parse_port_isid(fixture):
+    """Traditional `vlan i-sid` model: C-VID is N/A, so the platform VLAN IS
+    the customer VLAN and stays the answer."""
     rows = voss_parsers.parse_port_isid(
         fixture("voss", "show_interfaces_gigabitethernet_i_sid.txt"))
-    assert rows == [
-        {"port": "1/1", "isid": 10100, "vlan": 100},
-        {"port": "1/2", "isid": 10200, "vlan": 200},
-        {"port": "2/1/1", "isid": 77777, "vlan": 300},  # CVLAN row
+    assert [(r["port"], r["isid"], r["vlan"]) for r in rows] == [
+        ("1/1", 10100, 100),
+        ("1/2", 10200, 200),
+        ("2/1/1", 77777, 300),          # CVLAN row
     ]
+    assert all(r["cvid"] is None for r in rows)
+    assert [r["platform_vlan"] for r in rows] == [100, 200, 300]
+
+
+def test_the_cvid_is_the_vlan_not_the_platform_vlan():
+    """The one the end device actually tags is the one that has to exist on
+    the new switch. On a flex-UNI leaf the platform VLAN is an internal number
+    no host has ever sent, and putting it on the cabling sheet makes a
+    technician recreate the wrong VLAN."""
+    out = (
+        "PORTNUM IFINDEX ID       VLANID C-VID  TYPE     ORIGIN     NAME\n"
+        "-------------------------------------------------------------\n"
+        "1/4     195     2500695  4048   695    ELAN     C  ---      svc-695\n"
+    )
+    row = voss_parsers.parse_port_isid(out)[0]
+    assert row["vlan"] == 695           # what the host tags
+    assert row["cvid"] == 695
+    assert row["platform_vlan"] == 4048  # kept, but never the answer
+
+
+def test_port_isid_row_without_either_vlan_has_none():
+    out = ("PORTNUM IFINDEX ID      VLANID C-VID TYPE   ORIGIN\n"
+           "1/9     200     2500695 N/A    N/A   ELAN   C  ---\n")
+    row = voss_parsers.parse_port_isid(out)[0]
+    assert row["vlan"] is None and row["isid"] == 2500695
 
 
 def test_parse_virtual_ist(fixture):
@@ -340,3 +367,43 @@ NUM      INDEX DESCRIPTION         TRAP  LOCK     MTU   ADDRESS           ADMIN 
     ports = {p.port: p for p in voss_parsers.parse_ports(out)}
     assert ports["1/1"].description == "10GbSR"
     assert ports["1/9"].description == ""     # blank media, not 'true'
+
+
+# ---------------- endpoints in `show i-sid`: c<vid> and u ------------------
+
+_ISID_WITH_UNTAGGED = """\
+ISID                PORT               MLT
+ID       TYPE       INTERFACES         INTERFACES         ORIGIN     ISID NAME
+------------------------------------------------------------------------------
+2500695  ELAN       c695:1/10,u:1/36   c695:2             CONFIG     svc-695
+2510735  ELAN       u:1/12             -                  CONFIG     svc-735
+2502201  CVLAN      c2201:1/36         -                  CONFIG     quarantaine
+
+c: customer vid   u: untagged-traffic
+
+3 out of 3 Total Num of i-sids displayed
+"""
+
+
+def test_untagged_endpoints_are_read_not_ignored():
+    """The device's own legend says 'u: untagged-traffic'. A port put into a
+    service untagged used to contribute nothing at all, so the service looked
+    like it had no endpoint there."""
+    result = voss_parsers.parse_isid_local(_ISID_WITH_UNTAGGED)
+    assert result[2500695]["untagged"] == {"1/36"}
+    assert result[2510735]["untagged"] == {"1/12"}
+    assert result[2502201]["untagged"] == set()
+
+
+def test_an_untagged_endpoint_contributes_no_customer_vlan():
+    """Untagged means the host tags nothing - there is no c-vid to record.
+    Inventing one would put a VLAN on the sheet that is not on the wire."""
+    result = voss_parsers.parse_isid_local(_ISID_WITH_UNTAGGED)
+    assert result[2500695]["cvids"] == {695}      # from c695:, not from u:
+    assert result[2510735]["cvids"] == set()      # untagged only
+
+
+def test_the_legend_line_is_not_read_as_data():
+    result = voss_parsers.parse_isid_local(_ISID_WITH_UNTAGGED)
+    assert set(result) == {2500695, 2510735, 2502201}
+    assert result[2500695]["name"] == "svc-695"
