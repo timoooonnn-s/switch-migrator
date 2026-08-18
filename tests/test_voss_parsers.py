@@ -82,20 +82,50 @@ def test_parse_port_isid(fixture):
     assert [r["platform_vlan"] for r in rows] == [100, 200, 300]
 
 
+_PORT_ISID_HEAD = (
+    "PORTNUM IFINDEX ID       VLANID C-VID  TYPE     ORIGIN     NAME\n"
+    "-------------------------------------------------------------\n")
+
+
 def test_the_cvid_is_the_vlan_not_the_platform_vlan():
     """The one the end device actually tags is the one that has to exist on
     the new switch. On a flex-UNI leaf the platform VLAN is an internal number
     no host has ever sent, and putting it on the cabling sheet makes a
     technician recreate the wrong VLAN."""
-    out = (
-        "PORTNUM IFINDEX ID       VLANID C-VID  TYPE     ORIGIN     NAME\n"
-        "-------------------------------------------------------------\n"
-        "1/4     195     2500695  4048   695    ELAN     C  ---      svc-695\n"
-    )
-    row = voss_parsers.parse_port_isid(out)[0]
-    assert row["vlan"] == 695           # what the host tags
+    row = voss_parsers.parse_port_isid(
+        _PORT_ISID_HEAD +
+        "1/4     195     2500695  4048   c695   ELAN     C  ---      svc-695\n"
+    )[0]
+    assert row["vlan"] == 695            # what the host tags
     assert row["cvid"] == 695
+    assert row["untagged"] is False
     assert row["platform_vlan"] == 4048  # kept, but never the answer
+
+
+def test_an_untagged_port_reports_no_vlan_at_all():
+    """'u' means the port is added untagged - nothing is tagged on the wire,
+    so naming a VLAN would put one on the sheet that is not on the link. The
+    platform VLAN in particular must not leak out as if it were one."""
+    row = voss_parsers.parse_port_isid(
+        _PORT_ISID_HEAD +
+        "1/5     196     2510735  4049   u      ELAN     C  ---      svc-735\n"
+    )[0]
+    assert row["untagged"] is True
+    assert row["vlan"] is None and row["cvid"] is None
+    assert row["isid"] == 2510735        # the service is still known
+    assert row["platform_vlan"] == 4049
+
+
+def test_the_cvid_cell_is_read_in_every_shape_the_releases_print():
+    rows = voss_parsers.parse_port_isid(
+        _PORT_ISID_HEAD +
+        "1/4     195     2500695  4048   c695     ELAN   C  ---      a\n"
+        "1/6     197     2500696  4050   c696:1/6 ELAN   C  ---      b\n"
+        "1/7     198     2500697  N/A    697      ELAN   C  ---      c\n"
+        "1/8     199     2500698  N/A    N/A      ELAN   C  ---      d\n")
+    assert [r["cvid"] for r in rows] == [695, 696, 697, None]
+    assert [r["vlan"] for r in rows] == [695, 696, 697, None]
+    assert not any(r["untagged"] for r in rows)
 
 
 def test_port_isid_row_without_either_vlan_has_none():

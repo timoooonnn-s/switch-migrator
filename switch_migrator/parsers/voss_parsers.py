@@ -279,18 +279,29 @@ def parse_port_isid(output: str) -> list[dict]:
     Data lines: <port> <ifindex> <isid> <vlanid|N/A> <c-vid|N/A> <type> ...
 
     Returns [{"port": str, "isid": int, "vlan": int|None, "cvid": int|None,
-              "platform_vlan": int|None}, ...].
+              "untagged": bool, "platform_vlan": int|None}, ...].
 
-    The VLAN is the **C-VID** whenever the row has one. That is the VLAN the
-    end device actually puts on the wire, and therefore the one that has to
-    exist on the new switch. The VLANID column is the *platform* VLAN the
-    switch uses internally to realise the service; on a flex-UNI leaf the two
-    are different numbers and taking VLANID puts a VLAN on the cabling sheet
-    that no host has ever tagged.
+    The C-VID cell says how the port joins the service, in the same notation
+    the `show i-sid` legend explains ("c: customer vid   u: untagged-traffic"):
 
-    VLANID is the fallback, not the preference: on the traditional
-    `vlan i-sid` model the C-VID column is N/A and the platform VLAN *is* the
+        c695     the host tags VLAN 695 into the service   -> tagged, VLAN 695
+        u        the port is added untagged                -> untagged, no VLAN
+        N/A      traditional `vlan i-sid` model            -> use VLANID
+
+    A bare number is accepted for the releases that print one, and a marker
+    that carries its endpoint (`c695:1/10`) is read the same way.
+
+    Which number ends up as the port's VLAN matters on the migration sheets.
+    The C-VID is what the end device actually puts on the wire and therefore
+    what has to exist on the new switch; VLANID is the *platform* VLAN the
+    switch uses internally to realise the service, and on a flex-UNI leaf they
+    are different numbers. VLANID is the fallback, never the preference - on
+    the traditional model the C-VID cell is N/A and the platform VLAN IS the
     customer VLAN, so that case still resolves correctly.
+
+    An untagged port reports NO VLAN at all: nothing is tagged on the wire, so
+    naming a number there would put a VLAN on the cabling sheet that does not
+    exist on the link. The I-SID and the untagged flag carry that case.
     """
     rows: list[dict] = []
     for line in output.splitlines():
@@ -298,20 +309,44 @@ def parse_port_isid(output: str) -> list[dict]:
         if len(tokens) < 5 or not PORT_RE.match(tokens[0]) \
                 or not tokens[1].isdigit() or not tokens[2].isdigit():
             continue
-
-        def _vlan(token: str) -> int | None:
-            return (int(token) if token.isdigit() and 1 <= int(token) <= 4094
-                    else None)
-
-        platform_vlan, cvid = _vlan(tokens[3]), _vlan(tokens[4])
+        platform_vlan = _vlan_id(tokens[3])
+        cvid, untagged = _parse_cvid_cell(tokens[4])
         rows.append({
             "port": tokens[0],
             "isid": int(tokens[2]),
-            "vlan": cvid if cvid is not None else platform_vlan,
+            "vlan": cvid if cvid is not None
+                    else (None if untagged else platform_vlan),
             "cvid": cvid,
+            "untagged": untagged,
             "platform_vlan": platform_vlan,
         })
     return rows
+
+
+def _vlan_id(token: str) -> int | None:
+    return int(token) if token.isdigit() and 1 <= int(token) <= 4094 else None
+
+
+_CVID_CELL_RE = re.compile(r"^(?P<kind>[cu])(?P<vid>\d{1,4})?(?::\S*)?$",
+                           re.IGNORECASE)
+
+
+def _parse_cvid_cell(token: str) -> tuple[int | None, bool]:
+    """The C-VID cell -> (customer VLAN, is the port untagged).
+
+    Handles 'c695', 'u', 'c695:1/10', a bare '695', and 'N/A'/'-'.
+    """
+    text = token.strip()
+    if not text or text.upper() in ("N/A", "-", "--"):
+        return None, False
+    if text.isdigit():
+        return _vlan_id(text), False        # release that prints a bare c-vid
+    m = _CVID_CELL_RE.match(text)
+    if not m:
+        return None, False
+    if m.group("kind").lower() == "u":
+        return None, True                   # untagged: nothing on the wire
+    return _vlan_id(m.group("vid") or ""), False
 
 
 def parse_virtual_ist(output: str) -> IstState | None:

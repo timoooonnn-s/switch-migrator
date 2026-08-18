@@ -283,6 +283,7 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
     # I-SID bindings, so `show vlan members` yields nothing - use the port
     # bindings already collected as the second source (no extra command).
     tags_a_cvid: set[str] = set()
+    joins_untagged: set[str] = set()
     for row in audit.port_isid_rows:
         port = by_port.get(row["port"])
         if port is None:
@@ -293,16 +294,25 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
             port.isids.append(row["isid"])
         if row.get("cvid") is not None:
             tags_a_cvid.add(row["port"])
+        if row.get("untagged"):
+            joins_untagged.add(row["port"])
     for port in audit.ports:
         port.vlans.sort()
         port.isids.sort()
-        if port.port in tags_a_cvid:
-            # A c-vid IS the tag the host puts on the wire, so this is settled
-            # rather than guessed - and it has to win over the count rule
-            # below, which would call a flex-UNI port carrying exactly one
-            # c-vid 'untagged' and have somebody configure the new port that
-            # way.
+        # The C-VID cell states how the port joins the service, so where it
+        # said something this is settled rather than inferred. A port can be
+        # both (tagged c-vids plus untagged-traffic), and 'mixed' is what a
+        # technician has to reproduce on the new switch.
+        if port.port in tags_a_cvid and port.port in joins_untagged:
+            port.tagging = "mixed"
+        elif port.port in tags_a_cvid:
+            # a c-vid IS the tag the host puts on the wire - this has to win
+            # over the count rule below, which would call a flex-UNI port
+            # carrying exactly one c-vid 'untagged' and have somebody
+            # configure the new port that way
             port.tagging = "tagged"
+        elif port.port in joins_untagged:
+            port.tagging = "untagged"
         elif len(port.vlans) > 1:
             # several VLANs on one port can only be a trunk
             port.tagging = "tagged"

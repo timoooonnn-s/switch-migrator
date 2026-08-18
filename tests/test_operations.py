@@ -408,7 +408,7 @@ def test_the_sheets_carry_the_cvid_not_the_platform_vlan(tmp_path, cfg):
     device = tmp_path / "gx-01"
     shutil.copytree(FIXTURES / "voss", device)
     (device / "show_interfaces_gigabitethernet_i_sid.txt").write_text(
-        _isid_capture("1/1     192     2500695  4048   695    ELAN   C  ---   svc\n"))
+        _isid_capture("1/1     192     2500695  4048   c695   ELAN   C  ---   svc\n"))
     audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
                            OfflineRunner("gx-01", tmp_path), cfg)
     port = next(p for p in audit.ports if p.port == "1/1")
@@ -422,10 +422,42 @@ def test_a_single_cvid_port_is_tagged_not_untagged(tmp_path, cfg):
     device = tmp_path / "gx-01"
     shutil.copytree(FIXTURES / "voss", device)
     (device / "show_interfaces_gigabitethernet_i_sid.txt").write_text(
-        _isid_capture("1/1     192     2500695  4048   695    ELAN   C  ---   svc\n"))
+        _isid_capture("1/1     192     2500695  4048   c695   ELAN   C  ---   svc\n"))
     audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
                            OfflineRunner("gx-01", tmp_path), cfg)
     assert next(p for p in audit.ports if p.port == "1/1").tagging == "tagged"
+
+
+def test_an_untagged_flexuni_port_says_untagged_and_shows_no_vlan(tmp_path, cfg):
+    """'u' in the C-VID cell is the device stating the port is added untagged.
+    The platform VLAN must not surface as if the host tagged it."""
+    device = tmp_path / "gx-01"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_interfaces_gigabitethernet_i_sid.txt").write_text(
+        _isid_capture("1/1     192     2510735  4049   u      ELAN   C  ---   svc\n"))
+    audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
+                           OfflineRunner("gx-01", tmp_path), cfg)
+    port = next(p for p in audit.ports if p.port == "1/1")
+    assert port.tagging == "untagged"
+    # the platform VLAN must not surface as a VLAN on the wire
+    assert 4049 not in port.vlans
+    assert 2510735 in port.isids         # the service is still on the sheet
+
+
+def test_a_port_both_tagged_and_untagged_is_reported_as_mixed(tmp_path, cfg):
+    device = tmp_path / "gx-01"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_interfaces_gigabitethernet_i_sid.txt").write_text(
+        _isid_capture(
+            "1/1     192     2500695  4048   c695   ELAN   C  ---   a\n"
+            "1/1     192     2510735  4049   u      ELAN   C  ---   b\n"))
+    audit = collect_switch(SwitchTarget("gx-01", "gx-01", Platform.VOSS),
+                           OfflineRunner("gx-01", tmp_path), cfg)
+    port = next(p for p in audit.ports if p.port == "1/1")
+    assert port.tagging == "mixed"
+    assert 695 in port.vlans             # the tagged c-vid is on the wire
+    assert 4048 not in port.vlans and 4049 not in port.vlans
+    assert {2500695, 2510735} <= set(port.isids)
 
 
 def test_the_traditional_model_is_unchanged(tmp_path, cfg):
