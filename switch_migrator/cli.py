@@ -558,14 +558,29 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     args = build_arg_parser().parse_args(argv)
     console = Console(stderr=True)
+
+    # The profile can set output_dir, and the log file lives inside it - so it
+    # has to be applied BEFORE logging is set up, or the reports go to the
+    # profile's directory and their log to ./output.
+    if args.profile:
+        try:
+            _apply_cli_profile(args, console)
+        except ConfigError as exc:
+            console.print(f"[bold red]Config error:[/bold red] {exc}")
+            return 2
     setup_logging(args.output_dir, args.debug)
 
     # No arguments at all (or an explicit --menu): open the interactive toolkit
     # menu. Every flag keeps working exactly as before.
     if args.menu or not raw_argv:
         from switch_migrator.menu import run_menu
+        # the profile is handed on by name: the menu session carries settings
+        # the CLI namespace has no place for (location groups, auto-snapshot),
+        # and applying it there sets all of them
         return run_menu(config_path=args.config, inventory_path=args.inventory,
-                        output_dir=args.output_dir)
+                        output_dir=args.output_dir,
+                        profile=args.profile,
+                        profiles_file=args.profiles_file)
 
     # Reporting from a saved snapshot: no config, no credentials, no device is
     # touched - every sheet below is a pure function of the collected state.
@@ -573,8 +588,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # generating MLT blocks reads a sheet, not a fabric; a snapshot run
         # compares nothing. Neither needs the DvR/I-SID sections to be present.
-        if args.profile:
-            _apply_cli_profile(args, console)
         cfg = load_config(args.config,
                           require_fabric=(not args.no_fabric
                                           and not from_snapshot

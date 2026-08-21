@@ -145,7 +145,8 @@ different account than the switches, set `SM_CONSOLE_USERNAME` /
 A profile bundles what one recurring scenario always needs - inventory, output
 directory, collection settings, target switch - so "scenario A" is one load
 instead of six prompts. Menu option `p` loads or saves them; on the command
-line, `--profile NAME` applies one (explicit flags always win). Profiles never
+line, `--profile NAME` applies one (explicit flags always win), including with
+`--menu`, where the whole profile is applied to the session. Profiles never
 hold credentials.
 
 ```yaml
@@ -254,7 +255,8 @@ A few behaviors worth knowing:
 
 * **`x` aborts anything.** At any prompt, `x` (or Ctrl-C) abandons the current
   action and falls back to the menu. A stray Enter at the menu re-shows it —
-  quitting is an explicit `0`/`q`.
+  quitting is an explicit `0`/`q`, or **Ctrl-C at the menu itself**, where
+  there is no action left to abandon.
 * **Tab completes paths.** Every file/directory prompt has readline tab
   completion.
 * **Default inventory.** With no `-i`, the config's `inventory:` key (or a

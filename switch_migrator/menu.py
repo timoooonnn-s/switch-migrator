@@ -105,7 +105,17 @@ class Session:
 class Abort(Exception):
     """The user typed 'x' (or pressed Ctrl-C) at a prompt: abandon the current
     action immediately and fall back to the main menu. Every prompt honours
-    it, so any process can be aborted at any state."""
+    it, so any process can be aborted at any state.
+
+    `interrupt` distinguishes Ctrl-C from a typed 'x'. Inside an action both
+    mean the same thing - drop it and go back. At the main menu itself there is
+    no action to drop, and Ctrl-C there means what it means in every other
+    terminal program: quit.
+    """
+
+    def __init__(self, interrupt: bool = False):
+        super().__init__()
+        self.interrupt = interrupt
 
 
 @contextmanager
@@ -154,7 +164,7 @@ def _ask(console: Console, prompt: str, default: str = "",
     except EOFError:
         return ""
     except KeyboardInterrupt:
-        raise Abort() from None
+        raise Abort(interrupt=True) from None
     if raw.lower() == "x":
         raise Abort()
     return raw or default
@@ -998,7 +1008,9 @@ def _default_creds(s: Session, console: Console):
 def run_menu(config_path: Path, inventory_path: Path | None = None,
              output_dir: Path = Path("output"),
              console: Console | None = None,
-             creds_fn=_default_creds) -> int:
+             creds_fn=_default_creds,
+             profile: str = "",
+             profiles_file: Path | None = None) -> int:
     """The interactive toolkit menu. Returns a process exit code."""
     console = console or Console()
     try:
@@ -1022,6 +1034,24 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
             s.selected = list(s.all_targets)
         except ConfigError as exc:
             console.print(f"[yellow]{exc}[/yellow]")
+
+    if profile:
+        # `--menu --profile X` used to ignore the profile entirely. The session
+        # carries settings the CLI namespace has no place for, so it is applied
+        # here in full - and a bad name is said out loud rather than silently
+        # leaving the menu on its defaults.
+        if profiles_file is not None:
+            s.profiles_path = profiles_file
+        try:
+            found = profiles_mod.load_profiles(s.profiles_path).get(profile)
+        except profiles_mod.ProfileError as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
+            found = None
+        if found is None:
+            console.print(f"[yellow]No profile '{profile}' in "
+                          f"{s.profiles_path} - starting on the defaults.[/yellow]")
+        else:
+            _apply_profile(s, profile, found, console)
 
     actions = {
         "1": lambda: action_select(s, console),
@@ -1049,7 +1079,12 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
                       "0/q quits.[/dim]")
         try:
             choice = _ask(console, "Choose").lower()
-        except Abort:
+        except Abort as abort:
+            if abort.interrupt:
+                # Ctrl-C at the menu itself: nothing to abandon, so it quits.
+                # Continuing here left no way out of the loop at all.
+                console.print("[dim]Bye.[/dim]")
+                return 0
             continue
         if choice in ("0", "q", "quit", "exit"):
             console.print("[dim]Bye.[/dim]")

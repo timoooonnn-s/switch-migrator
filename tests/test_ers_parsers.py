@@ -133,3 +133,33 @@ def test_unwrapped_member_list_is_not_extended_by_the_next_line():
     vlans = {v.vlan_id: v.members for v in ers_parsers.parse_vlans(out)}
     assert vlans[100] == ["1", "2", "3"]
     assert vlans[99] == ["7"]
+
+
+def test_mlt_row_with_an_empty_name_column_is_still_parsed():
+    """A release that leaves NAME empty shifts every column one left, putting
+    STATUS at index 4. Requiring index 5 dropped the row - a configured MLT
+    silently missing from the report."""
+    out = ("Id Name Members Bpdu Mode Status Type\n"
+           "-- ---- ------- ---- ---- ------ ----\n"
+           "1       49-50   All  Basic Enabled Trunk\n")
+    mlts = ers_parsers.parse_mlt(out)
+    assert len(mlts) == 1
+    assert mlts[0].mlt_id == 1
+    assert mlts[0].name == ""
+    assert mlts[0].members == ["49", "50"]
+
+
+def test_empty_name_row_with_no_members_is_still_parsed():
+    out = ("Id Name Members Bpdu Mode Status Type\n"
+           "1       NONE    All  Basic Enabled Trunk\n")
+    mlts = ers_parsers.parse_mlt(out)
+    assert len(mlts) == 1 and mlts[0].members == []
+
+
+def test_a_bare_number_at_index_four_is_still_refused():
+    """Accepting index 4 must not undo the digit-shaped-name guard: '7' there
+    could be a single member port OR a trunk named 7, and guessing wrong puts
+    a phantom port on the sheet."""
+    out = ("Id Name Bpdu Mode Status Type\n"
+           "4  7    All  Basic Enabled Trunk\n")
+    assert ers_parsers.parse_mlt(out) == []

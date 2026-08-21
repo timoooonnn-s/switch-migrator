@@ -722,6 +722,17 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
     """
     import paramiko
 
+    # The real run negotiates with the legacy algorithms appended and any
+    # pinned-out ones excluded. Without the same treatment here the pre-flight
+    # fails on exactly the old ERS/BOSS gear those settings exist for - and a
+    # non-auth failure is reported as "could not check", so every run against
+    # that estate would open with a needless "continue anyway?".
+    if ssh.legacy_algorithms:
+        enable_legacy_ssh_algorithms()
+    params: dict = {}
+    if ssh.disabled_algorithms:
+        params["disabled_algorithms"] = ssh.disabled_algorithms
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -729,7 +740,7 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
                        timeout=ssh.conn_timeout,
                        banner_timeout=max(15, ssh.conn_timeout),
                        auth_timeout=max(15, ssh.conn_timeout),
-                       allow_agent=False, look_for_keys=False)
+                       allow_agent=False, look_for_keys=False, **params)
         return None
     except paramiko.AuthenticationException:
         return "auth"

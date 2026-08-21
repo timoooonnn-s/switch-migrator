@@ -7,7 +7,7 @@ import pytest
 from paramiko.transport import Transport
 
 from switch_migrator import connection
-from switch_migrator.config import SshSettings
+from switch_migrator.config import Credentials, SshSettings
 from switch_migrator.connection import (
     _LEGACY_CIPHERS,
     _LEGACY_KEX,
@@ -489,3 +489,53 @@ def test_raw_capture_skips_what_the_run_is_going_to_discard(tmp_path):
     runner.run("show mlt")
     written = sorted(p.name for p in (tmp_path / "raw").glob("*"))
     assert written == ["show_mlt.txt"]
+
+
+def test_quick_auth_check_enables_the_legacy_algorithms(monkeypatch):
+    """The pre-flight must negotiate like the real run. Without this it fails
+    on exactly the old ERS/BOSS gear the legacy settings exist for, and every
+    run against that estate opens with a needless 'continue anyway?'."""
+    calls = {"legacy": 0, "params": None}
+    monkeypatch.setattr(connection, "enable_legacy_ssh_algorithms",
+                        lambda: calls.__setitem__("legacy", calls["legacy"] + 1))
+
+    class _Client:
+        def set_missing_host_key_policy(self, _policy):
+            pass
+
+        def connect(self, _host, **kw):
+            calls["params"] = kw
+
+        def close(self):
+            pass
+
+    import paramiko
+    monkeypatch.setattr(paramiko, "SSHClient", _Client)
+
+    ssh = SshSettings(legacy_algorithms=True,
+                      disabled_algorithms={"pubkeys": ["rsa-sha2-256"]})
+    assert connection.quick_auth_check("host", Credentials("u", "p"), ssh) is None
+    assert calls["legacy"] == 1
+    assert calls["params"]["disabled_algorithms"] == {"pubkeys": ["rsa-sha2-256"]}
+
+
+def test_quick_auth_check_leaves_the_algorithms_alone_when_disabled(monkeypatch):
+    calls = {"legacy": 0}
+    monkeypatch.setattr(connection, "enable_legacy_ssh_algorithms",
+                        lambda: calls.__setitem__("legacy", calls["legacy"] + 1))
+
+    class _Client:
+        def set_missing_host_key_policy(self, _policy):
+            pass
+
+        def connect(self, _host, **kw):
+            assert "disabled_algorithms" not in kw
+
+        def close(self):
+            pass
+
+    import paramiko
+    monkeypatch.setattr(paramiko, "SSHClient", _Client)
+    connection.quick_auth_check("host", Credentials("u", "p"),
+                                SshSettings(legacy_algorithms=False))
+    assert calls["legacy"] == 0

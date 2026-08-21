@@ -118,14 +118,23 @@ def parse_mlt(output: str) -> list[MltState]:
             continue
         status_idx = next((i for i in range(len(tokens) - 1, 0, -1)
                            if tokens[i].lower() in ("enabled", "disabled")), None)
-        # need at least <name> <members> <bpdu> <mode> between the id and
-        # STATUS, i.e. STATUS at index 5 or later - at 4 the token three back
-        # would be the NAME column, and a digit-shaped name would be read as
-        # the members list
-        if status_idx is None or status_idx < 5:
+        # With a NAME present there are four columns between the id and STATUS
+        # (<name> <members> <bpdu> <mode>), putting STATUS at index 5 or later.
+        # A release that leaves NAME empty shifts everything one left, and
+        # requiring 5 dropped those rows entirely - a configured MLT vanishing
+        # from the report. Index 4 is accepted, but only when the token three
+        # back is UNAMBIGUOUSLY a port list: with an empty name it is the
+        # members column, while on a normal row it would be a NAME, and a
+        # digit-shaped name ('Trunk 7' named '7') must never be read as a
+        # member. 'NONE' or a list carrying a separator can only be members;
+        # a bare number could be either, so it is still refused.
+        if status_idx is None or status_idx < 4:
             continue
         members_tok = tokens[status_idx - 3]
         if members_tok.upper() != "NONE" and not re.match(r"^[\d/,\-]+$", members_tok):
+            continue
+        if status_idx == 4 and members_tok.upper() != "NONE" \
+                and not re.search(r"[/,\-]", members_tok):
             continue
         status = tokens[status_idx]
         members = expand_port_list(members_tok)
