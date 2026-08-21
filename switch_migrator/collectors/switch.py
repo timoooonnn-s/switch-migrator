@@ -7,8 +7,15 @@ import logging
 
 from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
-from switch_migrator.models import Platform, PortState, SwitchAudit, VlanInfo
-from switch_migrator.parsers import ers_parsers, voss_parsers
+from switch_migrator.models import (
+    Platform,
+    PortState,
+    SwitchAudit,
+    VlanBinding,
+    VlanInfo,
+    tagging_summary,
+)
+from switch_migrator.parsers import ers_config, ers_parsers, voss_config, voss_parsers
 from switch_migrator.usage import classify_audit, parse_uptime_days
 from switch_migrator.parsers.common import (
     PORT_RE,
@@ -30,7 +37,8 @@ def _is_core_neighbor(sysname: str, patterns: list[str]) -> bool:
 
 def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
                    pull_config: bool = False,
-                   pull_macs: bool = False) -> SwitchAudit:
+                   pull_macs: bool = False,
+                   keep_config: bool = True) -> SwitchAudit:
     audit = SwitchAudit(name=target.name, host=target.host,
                         platform=target.platform, reachable=True)
     # session-setup problems (e.g. paging disable rejected) must be visible
@@ -39,12 +47,20 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
         _collect_voss(audit, runner)
     else:
         _collect_ers(audit, runner)
-    _enrich(audit, runner, cfg, pull_macs=pull_macs)
-    # running-config is only pulled for the --extract-config feature (VOSS:
-    # filter+neutralize; ERS: translate to VOSS flex-UNI)
+    # The running-config feeds --extract-config (VOSS: filter+neutralize; ERS:
+    # translate to VOSS flex-UNI) AND is the only source that knows tagged from
+    # untagged, so it has to be read before the per-port bindings are built.
     if pull_config:
         out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
         audit.running_config = out or ""
+    _enrich(audit, runner, cfg, pull_macs=pull_macs)
+    if not keep_config:
+        # The config was read for the tagging it carries, which is now in the
+        # bindings. The text itself holds RADIUS keys, SNMP users and the SPB
+        # identity, and it would otherwise travel on into the snapshot - a file
+        # meant to be handed to a colleague. Only --extract-config, which
+        # exists to produce a neutralized version of it, keeps the original.
+        audit.running_config = ""
     if pull_macs:
         # switch uptime tells us how long the interface counters have been
         # accumulating - '0 packets' only means something on a long-running box
@@ -244,6 +260,191 @@ def _collect_fdb(audit: SwitchAudit, runner: BaseRunner
     return table
 
 
+
+def _merge_bindings(target: list[VlanBinding], new: list[VlanBinding]) -> None:
+    """Fold one source's bindings into a port's or MLT's list.
+
+    A binding is the same binding when it names the same VLAN (or, for
+    untagged traffic that has no c-vid of its own, the same I-SID). Merging
+    only ever fills gaps: whichever source spoke first keeps what it said, and
+    a later source can add the I-SID or the tagging it did not know. Sources
+    are accumulated so the sheet can show where a cell came from.
+    """
+    for incoming in new:
+        match = None
+        for existing in target:
+            if incoming.vlan is not None and existing.vlan == incoming.vlan:
+                match = existing
+                break
+            if incoming.vlan is None and existing.vlan is None \
+                    and existing.isid == incoming.isid:
+                match = existing
+                break
+        if match is None:
+            target.append(incoming)
+            continue
+        if match.isid is None and incoming.isid is not None:
+            match.isid, match.isid_note = incoming.isid, ""
+        if not match.tagging and incoming.tagging:
+            match.tagging = incoming.tagging
+        if incoming.source and incoming.source not in match.source.split(","):
+            match.source = ",".join(filter(None, [match.source, incoming.source]))
+
+
+def _sync_flat_lists(holder) -> None:
+    """Keep the flat vlans/isids lists in step with the bindings.
+
+    Both stay: the pairs are what a human reads, the flat lists are what
+    filtering and sorting in the workbook use.
+    """
+    holder.bindings.sort(key=lambda b: (b.vlan is None, b.vlan or 0, b.isid or 0))
+    holder.vlans = sorted({b.vlan for b in holder.bindings if b.vlan is not None})
+    holder.isids = sorted({b.isid for b in holder.bindings if b.isid is not None})
+
+
+def _config_bindings(audit: SwitchAudit,
+                     _cache: dict | None = None) -> tuple[dict, dict, dict]:
+    """Per-port and per-MLT bindings, and the VLANs, from the running-config.
+
+    This is the only source that knows tagged from untagged, so it is read
+    first and the show-command sources fill in around it. Returns
+    (port bindings, MLT bindings, {vlan_id: (name, local I-SID or None)}).
+    """
+    if not audit.running_config:
+        return {}, {}, {}
+    if _cache is not None and "bindings" in _cache:
+        return _cache["bindings"]
+    try:
+        if audit.platform is Platform.VOSS:
+            model = voss_config.parse_voss_config(audit.running_config)
+            ports, mlts = (voss_config.port_bindings(model),
+                           voss_config.mlt_bindings(model))
+            vlans = {vid: (model.vlan_names.get(vid, ""), model.vlan_isid.get(vid))
+                     for vid in set(model.vlan_members) | set(model.vlan_names)
+                     | set(model.vlan_isid)}
+        else:
+            model = ers_config.parse_ers_config(audit.running_config)
+            ports, mlts = ers_config.port_bindings(model), {}
+            vlans = {vid: (v.name, None) for vid, v in model.vlans.items()}
+    except Exception as exc:                       # never lose a run to a config
+        audit.warnings.append(f"running-config not usable as a VLAN source: {exc}")
+        audit.record_source("running-config", False, str(exc)[:120])
+        return {}, {}, {}
+    audit.record_source("running-config", True,
+                        f"{len(ports)} port(s) with VLAN bindings")
+    result = (ports, mlts, vlans)
+    if _cache is not None:
+        _cache["bindings"] = result
+    return result
+
+
+def _add_config_only_vlans(audit: SwitchAudit, config_vlans: dict) -> None:
+    """Adopt VLANs the config configures but `show vlan` never reported.
+
+    A VLAN that exists in the running-config exists on the box. Leaving it out
+    of `audit.vlans` would keep it out of the fabric comparison too, and every
+    binding for it would then reach the sheet as an unresolved '?'.
+    """
+    known = {v.vlan_id for v in audit.vlans}
+    added = []
+    for vid, (name, isid) in sorted(config_vlans.items()):
+        if vid in known:
+            continue
+        audit.vlans.append(VlanInfo(vlan_id=vid, name=name, isid=isid))
+        added.append(vid)
+    if added:
+        log.info("[%s] %d VLAN(s) taken from the running-config that "
+                 "'show vlan' did not list: %s", audit.name, len(added),
+                 ",".join(map(str, added)))
+
+
+def _build_port_bindings(audit: SwitchAudit, by_port: dict,
+                         cfg_cache: dict | None = None) -> None:
+    """Assemble each port's VLAN<->I-SID pairs from every source that has them.
+
+    Three sources, most authoritative first:
+      running-config   - membership AND tagged/untagged (the only one with it)
+      show vlan members - platform-VLAN membership, no tagging
+      show interfaces gigabitEthernet i-sid - per-port bindings on a flex-UNI
+                         box, where platform VLANs have no members at all
+    """
+    config_ports, _, config_vlans = _config_bindings(audit, cfg_cache)
+    _add_config_only_vlans(audit, config_vlans)
+    for port_name, bindings in config_ports.items():
+        port = by_port.get(port_name)
+        if port is not None:
+            _merge_bindings(port.bindings, bindings)
+
+    isid_of = {v.vlan_id: v.isid for v in audit.vlans}
+    members_seen = False
+    for vlan in audit.vlans:
+        for member in vlan.members:
+            port = by_port.get(member)
+            if port is None:
+                continue
+            members_seen = True
+            _merge_bindings(port.bindings, [VlanBinding(
+                vlan=vlan.vlan_id, isid=isid_of.get(vlan.vlan_id),
+                source="vlan-members")])
+    audit.record_source("vlan membership", members_seen,
+                        "" if members_seen else "no VLAN carried member ports")
+
+    for row in audit.port_isid_rows:
+        port = by_port.get(row["port"])
+        if port is None:
+            continue
+        _merge_bindings(port.bindings, [VlanBinding(
+            vlan=row["vlan"], isid=row["isid"], source="port-i-sid")])
+
+    for port in audit.ports:
+        _sync_flat_lists(port)
+        port.tagging = tagging_summary(port.bindings)
+
+
+def _build_mlt_bindings(audit: SwitchAudit, by_port: dict,
+                        cfg_cache: dict | None = None) -> None:
+    """An MLT carries the union of what its member ports carry.
+
+    VOSS prints a VLAN IDS column in `show mlt`; ERS prints nothing at all, so
+    every ERS aggregation used to reach the cabling sheet with empty VLAN and
+    I-SID columns - including the uplink MLT. Deriving from the members works
+    on both platforms, and where `show mlt` does have an opinion the two are
+    cross-checked rather than one silently winning.
+    """
+    _, config_mlts, _cfg_vlans = _config_bindings(audit, cfg_cache)
+    isid_of = {v.vlan_id: v.isid for v in audit.vlans}
+    for mlt in audit.mlts:
+        from_column = list(mlt.vlans)
+        mlt.bindings = []
+        _merge_bindings(mlt.bindings, config_mlts.get(mlt.mlt_id, []))
+        for member in mlt.members:
+            port = by_port.get(member)
+            if port is None:
+                continue
+            _merge_bindings(mlt.bindings, [VlanBinding(
+                vlan=b.vlan, isid=b.isid, tagging=b.tagging,
+                source=f"member {member}" if not b.source else b.source,
+                isid_note=b.isid_note) for b in port.bindings])
+        # compare BEFORE the column is merged in - afterwards every VLAN it
+        # named is in mlt.vlans by construction and the check can never fire
+        from_members = {b.vlan for b in mlt.bindings if b.vlan is not None}
+        # ...and only when the members had something to say. A box that rejects
+        # every 'show interfaces' variant contributes no member bindings at
+        # all, and every VLAN in the column would look unaccounted for.
+        missing = ([v for v in from_column if v not in from_members]
+                   if from_members else [])
+        _merge_bindings(mlt.bindings, [
+            VlanBinding(vlan=v, isid=isid_of.get(v), source="show mlt")
+            for v in from_column])
+        _sync_flat_lists(mlt)
+        # the column and the members disagreeing is worth knowing about: one of
+        # them is describing an aggregation that is not the one on the wire
+        if missing:
+            audit.warnings.append(
+                f"MLT {mlt.mlt_id}: 'show mlt' lists VLAN(s) "
+                f"{','.join(map(str, missing))} that no member port carries")
+
+
 def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
                              pull_macs: bool = False,
                              mac_cap: int = MAC_CAP) -> None:
@@ -255,11 +456,7 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
     by_port = {p.port: p for p in audit.ports}
 
     # --- MLT membership (+ LACP, parsed earlier from the same show mlt output)
-    isid_of_vlan = {v.vlan_id: v.isid for v in audit.vlans}
     for mlt in audit.mlts:
-        # the MLT's own VLAN IDS list (from show mlt) mapped to I-SIDs
-        mlt.isids = sorted({isid_of_vlan[v] for v in mlt.vlans
-                            if isid_of_vlan.get(v) is not None})
         for member in mlt.members:
             port = by_port.get(member)
             if port is None:
@@ -267,38 +464,9 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
             port.mlt_id, port.mlt_name = mlt.mlt_id, mlt.name
             port.lacp = mlt.lacp
 
-    # --- VLANs / I-SIDs per port (reverse of the VLAN member lists)
-    isid_of = {v.vlan_id: v.isid for v in audit.vlans}
-    for vlan in audit.vlans:
-        for member in vlan.members:
-            port = by_port.get(member)
-            if port is None:
-                continue
-            if vlan.vlan_id not in port.vlans:
-                port.vlans.append(vlan.vlan_id)
-            isid = isid_of.get(vlan.vlan_id)
-            if isid is not None and isid not in port.isids:
-                port.isids.append(isid)
-    # On a flex-UNI box the VLANs are not platform-VLAN members but per-port
-    # I-SID bindings, so `show vlan members` yields nothing - use the port
-    # bindings already collected as the second source (no extra command).
-    for row in audit.port_isid_rows:
-        port = by_port.get(row["port"])
-        if port is None:
-            continue
-        if row["vlan"] is not None and row["vlan"] not in port.vlans:
-            port.vlans.append(row["vlan"])
-        if row["isid"] not in port.isids:
-            port.isids.append(row["isid"])
-    for port in audit.ports:
-        port.vlans.sort()
-        port.isids.sort()
-        # a port carrying several VLANs must be tagged; a single VLAN is
-        # normally the untagged/native one. Left blank when unknown.
-        if len(port.vlans) > 1:
-            port.tagging = "tagged"
-        elif len(port.vlans) == 1:
-            port.tagging = "untagged"
+    cfg_cache: dict = {}
+    _build_port_bindings(audit, by_port, cfg_cache)
+    _build_mlt_bindings(audit, by_port, cfg_cache)
 
     if not pull_macs:
         return

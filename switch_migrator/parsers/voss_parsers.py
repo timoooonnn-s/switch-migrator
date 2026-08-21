@@ -10,9 +10,9 @@ import re
 
 from switch_migrator.models import IstState, MltState, PortState, VlanInfo
 from switch_migrator.parsers.common import (
-    PORT_LIST_RE,
     PORT_RE,
     expand_port_list,
+    is_port_list,
     name_says_ist,
     parse_updown,
 )
@@ -123,7 +123,7 @@ def parse_mlt(output: str) -> list[MltState]:
         members: list[str] = []
         members_at = None
         for i, t in enumerate(rest[1:], start=1):
-            if "/" in t and PORT_LIST_RE.match(t):
+            if "/" in t and is_port_list(t):
                 members = expand_port_list(t)
                 members_at = i
                 break
@@ -345,18 +345,37 @@ def parse_vlan_members(output: str) -> dict[int, list[str]]:
     'NONE' (or no port token) means the VLAN has no ports. Anchored on tokens,
     not offsets, and only rows that actually carry a port-list or an explicit
     NONE are recorded - so the 'N out of M Total' footer is ignored.
+
+    A long PORT MEMBER list wraps onto continuation lines, broken after a
+    comma. The open list is therefore carried across lines while it still ends
+    in one: PORT MEMBER is the leftmost port column, so its continuation is the
+    first port-list token of the next line, whatever the other columns do. A
+    VLAN whose members wrapped used to be truncated at the break - on a
+    48-port box with wide VLANs that silently dropped ports from the sheets.
     """
     result: dict[int, list[str]] = {}
+    open_vid: int | None = None   # row whose PORT MEMBER list is still open
+    raw = ""
     for line in output.splitlines():
         tokens = line.split()
+        if (open_vid is not None and tokens
+                and "/" in tokens[0] and is_port_list(tokens[0])):
+            raw += tokens[0]
+            result[open_vid] = expand_port_list(raw)
+            if not raw.endswith(","):
+                open_vid, raw = None, ""
+            continue
+        open_vid, raw = None, ""
         if len(tokens) < 2 or not tokens[0].isdigit():
             continue
         vid = int(tokens[0])
         if not 1 <= vid <= 4094:
             continue
         for t in tokens[1:]:
-            if "/" in t and PORT_LIST_RE.match(t):
+            if "/" in t and is_port_list(t):
                 result[vid] = expand_port_list(t)
+                if t.endswith(","):
+                    open_vid, raw = vid, t
                 break
             if t.upper() == "NONE":
                 result[vid] = []

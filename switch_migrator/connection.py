@@ -282,17 +282,27 @@ def _patient_ers_class():
 
 
 class SshRunner(BaseRunner):
+    # class-level default so a runner built without __init__ (the tests do)
+    # still has one, and the raw-capture branch never raises on a missing attr
+    raw_skip: tuple[str, ...] = ()
+
     def __init__(self, name: str, host: str, platform: Platform,
                  creds: Credentials, ssh: SshSettings,
                  raw_dir: Path | None = None,
                  command_overrides: dict[str, str] | None = None,
                  console: str = "",
-                 console_server: ConsoleServerSettings | None = None):
+                 console_server: ConsoleServerSettings | None = None,
+                 raw_skip: tuple[str, ...] = ()):
         self.name = name
         self.host = host
         self.platform = platform
         self.ssh = ssh
         self.raw_dir = raw_dir
+        # commands whose OUTPUT must not be written to the raw capture. The
+        # migration sheets read the running-config for its tagging and then
+        # drop the text; writing it to disk here would keep the RADIUS keys and
+        # SNMP users the caller just decided not to keep.
+        self.raw_skip = tuple(raw_skip)
         self.command_overrides = dict(command_overrides or {})
         self.console = console
         self.console_server = console_server
@@ -615,7 +625,7 @@ class SshRunner(BaseRunner):
                 raise err from exc
             break
         self._transport_failures = 0
-        if self.raw_dir is not None:
+        if self.raw_dir is not None and command not in self.raw_skip:
             # explicit encoding: the default is locale-dependent, and a
             # UnicodeEncodeError here is not a CommandError - it would escalate
             # to 'collection crashed' for the whole device
@@ -712,6 +722,17 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
     """
     import paramiko
 
+    # The real run negotiates with the legacy algorithms appended and any
+    # pinned-out ones excluded. Without the same treatment here the pre-flight
+    # fails on exactly the old ERS/BOSS gear those settings exist for - and a
+    # non-auth failure is reported as "could not check", so every run against
+    # that estate would open with a needless "continue anyway?".
+    if ssh.legacy_algorithms:
+        enable_legacy_ssh_algorithms()
+    params: dict = {}
+    if ssh.disabled_algorithms:
+        params["disabled_algorithms"] = ssh.disabled_algorithms
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -719,7 +740,7 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
                        timeout=ssh.conn_timeout,
                        banner_timeout=max(15, ssh.conn_timeout),
                        auth_timeout=max(15, ssh.conn_timeout),
-                       allow_agent=False, look_for_keys=False)
+                       allow_agent=False, look_for_keys=False, **params)
         return None
     except paramiko.AuthenticationException:
         return "auth"

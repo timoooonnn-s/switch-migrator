@@ -34,6 +34,7 @@ from switch_migrator.config import (
     parse_switch_arg,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
+from switch_migrator import handover as handover_mod
 from switch_migrator import health as health_mod
 from switch_migrator import location as location_mod
 from switch_migrator import manifest as manifest_mod
@@ -104,7 +105,17 @@ class Session:
 class Abort(Exception):
     """The user typed 'x' (or pressed Ctrl-C) at a prompt: abandon the current
     action immediately and fall back to the main menu. Every prompt honours
-    it, so any process can be aborted at any state."""
+    it, so any process can be aborted at any state.
+
+    `interrupt` distinguishes Ctrl-C from a typed 'x'. Inside an action both
+    mean the same thing - drop it and go back. At the main menu itself there is
+    no action to drop, and Ctrl-C there means what it means in every other
+    terminal program: quit.
+    """
+
+    def __init__(self, interrupt: bool = False):
+        super().__init__()
+        self.interrupt = interrupt
 
 
 @contextmanager
@@ -153,7 +164,7 @@ def _ask(console: Console, prompt: str, default: str = "",
     except EOFError:
         return ""
     except KeyboardInterrupt:
-        raise Abort() from None
+        raise Abort(interrupt=True) from None
     if raw.lower() == "x":
         raise Abort()
     return raw or default
@@ -193,7 +204,7 @@ def _status_panel(s: Session) -> Panel:
     return Panel("\n".join(lines), title="switch-migrator", title_align="left")
 
 
-_NEEDS_DATA = ("3", "4", "5", "6", "7", "h")
+_NEEDS_DATA = ("3", "4", "5", "6", "7", "h", "b")
 
 _ENTRIES = [
     ("1", "Select switches", "pick targets from the inventory or add them by hand"),
@@ -208,6 +219,7 @@ _ENTRIES = [
     ("h", "Health check", "go/no-go before the window: what is already broken?"),
     ("m", "Generate MLT blocks", "new switches' MLT config from a filled-in cabling sheet"),
     ("v", "Verify migration", "after the window: check every re-patched link"),
+    ("b", "Handover bundle", "one folder with every output and an index to hand over"),
     ("p", "Profiles", "load or save a named scenario (inventory + settings)"),
     ("s", "Settings", "change one setting at a time; nothing else is touched"),
     ("0", "Quit", ""),
@@ -341,7 +353,8 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     want_fabric = bool(s.cfg.dvr_controllers) and _yes(
         console, f"Collect fabric state from {len(s.cfg.dvr_controllers)} DvR "
                  f"controller(s)? (needed for the audit comparison)")
-    want_config = _yes(console, "Also pull running-config? (needed for config extract)")
+    want_config = _yes(console, "Also pull running-config? (needed for config "
+                                "extract; also gives the sheets tagged/untagged)")
     want_macs = _yes(console, "Also collect MAC tables? (needed for migration sheets)")
 
     creds, dvr_creds = creds_fn(s, console)
@@ -384,6 +397,10 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     s.audits, s.fabric = audits, fabric
     s.collected_at = datetime.now()
     s.collected_fabric = want_fabric
+    # The migration-sheet collection reads the running-config too, for the
+    # tagging - but drops the text again unless it was asked for. So what is
+    # RETAINED, which is what the config extract and the snapshot need, is
+    # still exactly what the user said yes to here.
     s.collected_config = want_config
     s.collected_macs = want_macs
     s.loaded_from = None
@@ -419,29 +436,33 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
                    title: str) -> None:
     """Build the tables for one use case and write the report files."""
     from switch_migrator.cli import _write_config_extracts
-    from switch_migrator.compare import compare_switch
+    from switch_migrator.compare import compare_switch, resolve_binding_isids
     from switch_migrator.report import console as console_report
     from switch_migrator.report.excel import write_excel
     from switch_migrator.report.migration import (
         assign_port_uids, build_cabling, build_cabling_by_location,
-        build_commands, build_port_info)
+        build_commands, build_port_info, new_switch_names)
     from switch_migrator.report.tables import build_all
 
     fabric = s.fabric or FabricState()
     comparisons = {} if no_fabric else {
         a.name: compare_switch(a, fabric, s.cfg) for a in s.audits if a.reachable}
+    resolve_binding_isids(s.audits, comparisons,
+                          fabric_checked=not no_fabric)
     tables = build_all(s.audits, fabric, comparisons, no_fabric=no_fabric)
     if migration_sheets:
         assign_port_uids(s.audits)
         tables.append(build_port_info(s.audits))
         if s.split_by_location:
             rules = s.location_rules()
-            tables += build_cabling_by_location(s.audits, rules)
+            tables += build_cabling_by_location(
+                s.audits, rules, new_switch_names(s.new_switch))
             console.print("[dim]Cabling split by location:[/dim]")
             for line in location_mod.describe(rules, [a.name for a in s.audits]):
                 console.print(f"  [dim]{line}[/dim]")
         else:
-            tables.append(build_cabling(s.audits))
+            tables.append(
+                build_cabling(s.audits, new_switch_names(s.new_switch)))
 
     console_report.render(tables, console, verbose=False)
 
@@ -874,6 +895,37 @@ def _session_profile(s: Session) -> dict:
     return prof
 
 
+def action_handover(s: Session, console: Console) -> None:
+    """Everything this session produced, in one folder with an index page.
+
+    Reuses whatever is already in the output directory rather than re-running
+    anything: the bundle is a way to hand work over, not a way to do it again.
+    """
+    from switch_migrator.compare import compare_switch, resolve_binding_isids
+    from switch_migrator.report.tables import build_all
+
+    fabric = s.fabric or FabricState()
+    comparisons = {} if not s.collected_fabric else {
+        a.name: compare_switch(a, fabric, s.cfg) for a in s.audits if a.reachable}
+    resolve_binding_isids(s.audits, comparisons,
+                          fabric_checked=s.collected_fabric)
+    tables = build_all(s.audits, fabric, comparisons,
+                       no_fabric=not s.collected_fabric)
+
+    files = sorted(p for p in s.output_dir.glob("*")
+                   if p.is_file() and not p.name.startswith("switch-migrator"))
+    if not files:
+        console.print("[yellow]Nothing in the output directory yet - produce a "
+                      "report first (options 3-7).[/yellow]")
+        return
+    bundle = handover_mod.build(
+        s.output_dir, files, tables, s.audits,
+        meta={"switches": ", ".join(a.name for a in s.audits),
+              "config": str(s.config_path) if s.config_path else ""})
+    console.print(f"[green]Handover bundle:[/green] {bundle}")
+    console.print(f"  open [bold]{bundle / 'index.html'}[/bold]")
+
+
 def action_profiles(s: Session, console: Console) -> None:
     """Named scenarios: 'scenario A always needs inventory X and settings Y'
     becomes one load. Profiles never hold credentials."""
@@ -956,7 +1008,9 @@ def _default_creds(s: Session, console: Console):
 def run_menu(config_path: Path, inventory_path: Path | None = None,
              output_dir: Path = Path("output"),
              console: Console | None = None,
-             creds_fn=_default_creds) -> int:
+             creds_fn=_default_creds,
+             profile: str = "",
+             profiles_file: Path | None = None) -> int:
     """The interactive toolkit menu. Returns a process exit code."""
     console = console or Console()
     try:
@@ -981,6 +1035,24 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         except ConfigError as exc:
             console.print(f"[yellow]{exc}[/yellow]")
 
+    if profile:
+        # `--menu --profile X` used to ignore the profile entirely. The session
+        # carries settings the CLI namespace has no place for, so it is applied
+        # here in full - and a bad name is said out loud rather than silently
+        # leaving the menu on its defaults.
+        if profiles_file is not None:
+            s.profiles_path = profiles_file
+        try:
+            found = profiles_mod.load_profiles(s.profiles_path).get(profile)
+        except profiles_mod.ProfileError as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
+            found = None
+        if found is None:
+            console.print(f"[yellow]No profile '{profile}' in "
+                          f"{s.profiles_path} - starting on the defaults.[/yellow]")
+        else:
+            _apply_profile(s, profile, found, console)
+
     actions = {
         "1": lambda: action_select(s, console),
         "2": lambda: action_collect(s, console, creds_fn),
@@ -994,6 +1066,7 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         "h": lambda: action_health(s, console),
         "m": lambda: action_generate_mlt(s, console),
         "v": lambda: action_verify(s, console, creds_fn),
+        "b": lambda: action_handover(s, console),
         "p": lambda: action_profiles(s, console),
         "s": lambda: action_settings(s, console),
     }
@@ -1006,7 +1079,12 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
                       "0/q quits.[/dim]")
         try:
             choice = _ask(console, "Choose").lower()
-        except Abort:
+        except Abort as abort:
+            if abort.interrupt:
+                # Ctrl-C at the menu itself: nothing to abandon, so it quits.
+                # Continuing here left no way out of the loop at all.
+                console.print("[dim]Bye.[/dim]")
+                return 0
             continue
         if choice in ("0", "q", "quit", "exit"):
             console.print("[dim]Bye.[/dim]")

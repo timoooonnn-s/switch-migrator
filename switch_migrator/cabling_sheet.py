@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from switch_migrator.report.excel import SHEET_SCHEMA, STAMP_SHEET
+
 
 class SheetError(Exception):
     pass
@@ -42,6 +44,9 @@ class CablingRow:
     new_mlt_id: int | None = None
     new_mlt_name: str = ""
     new_vlan: int | None = None
+    # written by hand: no switch knows which rack it lives in
+    rack_old: str = ""
+    rack_new: str = ""
     # what the port carried before the move - the expectations to verify
     neighbor: str = ""
     macs: list[str] = field(default_factory=list)
@@ -55,6 +60,7 @@ class CablingRow:
     usage: str = ""
     usage_why: str = ""
     kind: str = ""                   # access / mlt / uplink
+    tagging: str = ""                # tagged / untagged / mixed, as written
     sheet_vlan: str = ""             # the sheet's leading VLAN column
     row_number: int = 0              # 1-based row in the file, for messages
     sheet: str = ""                  # which worksheet the row came from
@@ -80,6 +86,9 @@ class Sheet:
     source: Path | None = None
     sheets_read: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    # what the hidden stamp sheet said about the build that wrote this file
+    written_by: str = ""
+    schema: int | None = None
 
     @property
     def migrated(self) -> list[CablingRow]:
@@ -108,6 +117,9 @@ _COLUMNS = {
     "newmltid": "new_mlt_id",
     "newmltname": "new_mlt_name",
     "newvlan": "new_vlan",
+    "rackold": "rack_old",
+    "racknew": "rack_new",
+    "tagging": "tagging",
     "enddeviceneighbor": "neighbor",
     "macaddresses": "macs",
     "portvlans": "port_vlans",
@@ -121,6 +133,8 @@ _COLUMNS = {
     "why": "usage_why",
     "type": "kind",
     "vlan": "sheet_vlan",
+    "vlanuntagged": "sheet_vlan",
+    "untaggedvlan": "sheet_vlan",
 }
 _INT_FIELDS = {"new_mlt_id", "new_vlan", "mlt_id"}
 _LIST_INT_FIELDS = {"port_vlans", "port_isids", "mlt_vlans", "mlt_isids"}
@@ -213,8 +227,25 @@ def _looks_like_cabling(rows: list[list]) -> bool:
     return False
 
 
+def _read_stamp(wb) -> dict[str, str]:
+    """The hidden stamp sheet the writer leaves behind, as a plain dict.
+
+    Absent on a .csv export and on any workbook an older build wrote, which is
+    not an error - it just means the read-back cannot tell whether the columns
+    are the ones it expects.
+    """
+    if STAMP_SHEET not in wb.sheetnames:
+        return {}
+    stamp: dict[str, str] = {}
+    for row in wb[STAMP_SHEET].iter_rows(values_only=True):
+        if row and len(row) >= 2 and row[0]:
+            stamp[str(row[0])] = _cell(row[1])
+    return stamp
+
+
 def _rows_from_xlsx(path: Path,
-                    sheet_name: str | None) -> list[tuple[str, list[list]]]:
+                    sheet_name: str | None) -> tuple[list[tuple[str, list[list]]],
+                                                     dict[str, str]]:
     """Every worksheet that looks like a cabling sheet, in workbook order.
 
     ALL of them, not just the first: --split-by-location writes one worksheet
@@ -228,6 +259,7 @@ def _rows_from_xlsx(path: Path,
         raise SheetError("openpyxl is required to read .xlsx sheets") from None
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
+        stamp = _read_stamp(wb)
         if sheet_name:
             if sheet_name not in wb.sheetnames:
                 raise SheetError(f"{path}: no sheet named '{sheet_name}' "
@@ -237,6 +269,8 @@ def _rows_from_xlsx(path: Path,
             names = list(wb.sheetnames)
         out = []
         for name in names:
+            if name == STAMP_SHEET:
+                continue
             rows = [list(row) for row in wb[name].iter_rows(values_only=True)]
             if sheet_name or _looks_like_cabling(rows):
                 out.append((name, rows))
@@ -244,7 +278,7 @@ def _rows_from_xlsx(path: Path,
             raise SheetError(
                 f"{path}: no worksheet has an 'Old port' column - is this a "
                 f"cabling sheet? (sheets: {', '.join(wb.sheetnames)})")
-        return out
+        return out, stamp
     finally:
         wb.close()
 
@@ -281,6 +315,27 @@ def _parse_table(where: str, raw: list[list], sheet: Sheet, path: Path) -> None:
             f"kept and ignored")
 
 
+def _apply_stamp(sheet: Sheet, stamp: dict[str, str]) -> None:
+    """Record which build wrote the sheet, and say so if it was not this one.
+
+    Column matching is by name and tolerant, so version skew is rarely fatal -
+    but a sheet written by a build whose columns have since changed is exactly
+    the case where 'tolerant' quietly means 'reading the wrong thing', and that
+    is worth one line in the problems list.
+    """
+    if not stamp:
+        return
+    sheet.written_by = stamp.get("tool_version", "")
+    raw = stamp.get("schema", "")
+    sheet.schema = int(raw) if str(raw).isdigit() else None
+    if sheet.schema is not None and sheet.schema != SHEET_SCHEMA:
+        sheet.problems.append(
+            f"this sheet was written by switch-migrator "
+            f"{sheet.written_by or 'an older build'} (sheet schema "
+            f"{sheet.schema}, this build writes {SHEET_SCHEMA}) - columns are "
+            f"matched by name, so check anything that looks wrong")
+
+
 def load(path: Path, sheet_name: str | None = None) -> Sheet:
     """Read a filled-in cabling sheet (.xlsx or .csv).
 
@@ -290,8 +345,9 @@ def load(path: Path, sheet_name: str | None = None) -> Sheet:
     if not path.is_file():
         raise SheetError(f"cabling sheet not found: {path}")
     suffix = path.suffix.lower()
+    stamp: dict[str, str] = {}
     if suffix in (".xlsx", ".xlsm"):
-        tables = _rows_from_xlsx(path, sheet_name)
+        tables, stamp = _rows_from_xlsx(path, sheet_name)
     elif suffix in (".csv", ".txt", ""):
         tables = _rows_from_csv(path)
     else:
@@ -299,6 +355,7 @@ def load(path: Path, sheet_name: str | None = None) -> Sheet:
                          f"the sheet as .xlsx or .csv")
 
     sheet = Sheet(source=path)
+    _apply_stamp(sheet, stamp)
     for where, raw in tables:
         _parse_table(where, raw, sheet, path)
         sheet.sheets_read.append(where)
