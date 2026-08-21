@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures as cf
 import logging
 import sys
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from switch_migrator.config import (
     ConfigError,
     Credentials,
     SwitchTarget,
+    default_inventory,
     get_credentials,
     load_config,
     load_inventory,
@@ -173,6 +175,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-smlt", action="store_true",
                         help="--generate-mlt: emit plain single-switch MLTs "
                              "instead of SMLT pairs")
+    parser.add_argument("--profile", metavar="NAME",
+                        help="apply a named profile from the profiles file: "
+                             "inventory, output dir, new switch, save-raw, "
+                             "manifest, offline replay, location groups. Any "
+                             "flag given explicitly on the command line wins "
+                             "over the profile's value.")
+    parser.add_argument("--profiles-file", type=Path,
+                        default=Path("profiles.yaml"),
+                        help="where the named profiles live "
+                             "(default: profiles.yaml)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="also print the ports/MLTs/fabric tables to the console")
     parser.add_argument("--debug", action="store_true",
@@ -205,14 +217,19 @@ def setup_logging(output_dir: Path, debug: bool) -> None:
 
 
 def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
-                cfg: Config, args: argparse.Namespace) -> BaseRunner:
+                cfg: Config, args: argparse.Namespace,
+                console: str = "") -> BaseRunner:
     if getattr(args, "dry_run", False):
-        return DryRunRunner(name, platform)
+        return DryRunRunner(name, platform,
+                            command_overrides=cfg.command_overrides)
     if args.offline:
-        return OfflineRunner(name, args.offline)
+        return OfflineRunner(name, args.offline,
+                             command_overrides=cfg.command_overrides)
     raw_dir = (args.output_dir / "raw" / name) if args.save_raw else None
     return SshRunner(name=name, host=host, platform=platform, creds=creds,
-                     ssh=cfg.ssh, raw_dir=raw_dir)
+                     ssh=cfg.ssh, raw_dir=raw_dir,
+                     command_overrides=cfg.command_overrides,
+                     console=console, console_server=cfg.console_server)
 
 
 def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
@@ -229,7 +246,8 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
     try:
         try:
             runner = make_runner(target.name, target.host, target.platform,
-                                 creds, cfg, args)
+                                 creds, cfg, args,
+                                 console=getattr(target, "console", ""))
         except ConnectionFailed as exc:
             failed.errors.append(str(exc))
             log.error("%s", exc)
@@ -294,7 +312,8 @@ def preview_commands(targets: list[SwitchTarget], cfg: Config,
     """
     preview: dict[str, list[str]] = {}
     for target in targets:
-        runner = DryRunRunner(target.name, target.platform)
+        runner = DryRunRunner(target.name, target.platform,
+                              command_overrides=cfg.command_overrides)
         try:
             collect_switch(target, runner, cfg,
                            pull_config=args.extract_config,
@@ -303,7 +322,8 @@ def preview_commands(targets: list[SwitchTarget], cfg: Config,
             log.exception("[%s] dry-run preview incomplete", target.name)
         preview[target.name] = runner.commands
     for dvr in (dvrs or []):
-        runner = DryRunRunner(dvr.name, Platform.VOSS)
+        runner = DryRunRunner(dvr.name, Platform.VOSS,
+                              command_overrides=cfg.command_overrides)
         try:
             collect_dvr(dvr.name, runner, FabricState())
         except Exception:  # noqa: BLE001 - same
@@ -324,8 +344,9 @@ def render_dry_run(preview: dict[str, list[str]], console: Console) -> None:
             console.print(f"    {command}")
         console.print("")
     console.print(f"[dim]{total} command(s) in total. Every one of them is a "
-                  f"'show' or a terminal-paging setting - the tool never "
-                  f"configures anything. On releases that reject the bare "
+                  f"'show', the 'enable' privilege mode switch, or a "
+                  f"terminal-paging setting - the tool never configures "
+                  f"anything. On releases that reject the bare "
                   f"'show interfaces gigabitEthernet fdb-entry', each "
                   f"operationally up port adds one more of that same read-only "
                   f"command.[/dim]")
@@ -386,7 +407,7 @@ def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
         if a.platform is Platform.VOSS:
             text = extract_voss_config(a.running_config, device_name=a.name).text
             path = out_dir / f"{a.name}.cfg"
-            path.write_text(text)
+            path.write_text(text, encoding="utf-8")
             written.append(path)
         else:  # ERS -> VOSS flex-UNI (generated draft) + I-SID worksheet
             matched = {c.vlan_id: c.matched_isid
@@ -395,10 +416,11 @@ def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
             res = generate_voss_from_ers(model, cfg, matched_by_vlan=matched,
                                          device_name=a.name)
             path = out_dir / f"{a.name}.cfg"
-            path.write_text(res.text)
+            path.write_text(res.text, encoding="utf-8")
             written.append(path)
             wpath = out_dir / f"{a.name}.isid-decisions.txt"
-            wpath.write_text(build_worksheet(res.decisions, device_name=a.name))
+            wpath.write_text(build_worksheet(res.decisions, device_name=a.name),
+                             encoding="utf-8")
             written.append(wpath)
     return written
 
@@ -436,7 +458,7 @@ def _run_generate_mlt(args: argparse.Namespace, console: Console) -> int:
     text = mlt_generate.render(result, source=str(args.generate_mlt))
     path = args.output_dir / "config" / "mlt-blocks.cfg"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8")
 
     for problem in sheet.problems:
         console.print(f"[yellow]{problem}[/yellow]")
@@ -473,6 +495,42 @@ def _render_health(report: health.HealthReport, console: Console) -> None:
             console.print(f"        [dim]{f.action}[/dim]")
 
 
+def _apply_cli_profile(args: argparse.Namespace, console: Console) -> None:
+    """--profile NAME: fill in run values from the named profile, but only
+    where the command line kept the parser default - an explicit flag always
+    wins over the profile."""
+    from switch_migrator import profiles as profiles_mod
+
+    try:
+        profiles = profiles_mod.load_profiles(args.profiles_file)
+    except profiles_mod.ProfileError as exc:
+        raise ConfigError(str(exc)) from None
+    prof = profiles.get(args.profile)
+    if prof is None:
+        known = ", ".join(sorted(profiles)) or "(none)"
+        raise ConfigError(f"no profile '{args.profile}' in "
+                          f"{args.profiles_file} - known: {known}")
+    if "inventory" in prof and args.inventory is None:
+        args.inventory = prof["inventory"]
+    if "output_dir" in prof and args.output_dir == Path("output"):
+        args.output_dir = prof["output_dir"]
+    if "offline" in prof and args.offline is None:
+        args.offline = prof["offline"]
+    if "new_switch" in prof and not args.new_switch:
+        args.new_switch = prof["new_switch"]
+    for key, attr in (("save_raw", "save_raw"), ("manifest", "manifest"),
+                      ("split_by_location", "split_by_location")):
+        if prof.get(key) and not getattr(args, attr):
+            setattr(args, attr, True)
+    if prof.get("auto_snapshot") and args.save_snapshot is None:
+        args.save_snapshot = ""        # the default-name sentinel
+    if prof.get("location_groups") and not args.location_group:
+        args.location_group = [f"{g}={','.join(m)}"
+                               for g, m in prof["location_groups"].items()]
+    console.print(f"[dim]Profile '{args.profile}' applied from "
+                  f"{args.profiles_file}.[/dim]")
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     args = build_arg_parser().parse_args(argv)
@@ -492,10 +550,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # generating MLT blocks reads a sheet, not a fabric; a snapshot run
         # compares nothing. Neither needs the DvR/I-SID sections to be present.
+        if args.profile:
+            _apply_cli_profile(args, console)
         cfg = load_config(args.config,
                           require_fabric=(not args.no_fabric
                                           and not from_snapshot
                                           and not args.generate_mlt))
+        if not args.inventory and not args.switch and not from_snapshot \
+                and not args.generate_mlt and not args.verify_migration:
+            # no switches named anywhere: fall back to the config's default
+            # inventory (or a ./switches.yaml), so routine runs need no -i
+            fallback = default_inventory(cfg)
+            if fallback is not None:
+                args.inventory = fallback
+                console.print(f"[dim]Using default inventory: {fallback}[/dim]")
         targets: list[SwitchTarget] = []
         if args.inventory:
             targets.extend(load_inventory(args.inventory))
@@ -513,9 +581,15 @@ def main(argv: list[str] | None = None) -> int:
         if not targets and not from_snapshot and not args.generate_mlt:
             raise ConfigError("no switches given: use -i inventory.yaml and/or "
                               "-s NAME:PLATFORM[:HOST]")
-        dupes = {t.name for t in targets if [x.name for x in targets].count(t.name) > 1}
+        counts = Counter(t.name for t in targets)
+        dupes = {name for name, n in counts.items() if n > 1}
         if dupes:
             raise ConfigError(f"duplicate switch names: {', '.join(sorted(dupes))}")
+        if ((args.split_by_location or args.location_group)
+                and not args.migration_sheets):
+            console.print("[yellow]--split-by-location/--location-group only "
+                          "affect the cabling sheet - add --migration-sheets "
+                          "for them to have any effect.[/yellow]")
 
         if (args.offline or args.dry_run or args.generate_mlt
                 or from_snapshot):
@@ -676,7 +750,8 @@ def main(argv: list[str] | None = None) -> int:
             audits, args.output_dir, comparisons, cfg, console))
     if args.migration_sheets:
         cmd_path = args.output_dir / f"migration-commands-{stamp}.txt"
-        cmd_path.write_text(build_commands(audits, new_switch=args.new_switch))
+        cmd_path.write_text(build_commands(audits, new_switch=args.new_switch),
+                            encoding="utf-8")
         written.append(cmd_path)
     if args.save_snapshot is not None and not from_snapshot:
         # '--save-snapshot' on its own carries the empty sentinel -> default

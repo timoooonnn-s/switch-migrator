@@ -85,9 +85,15 @@ def build_worksheet(decisions: list[IsidDecision], device_name: str = "") -> str
             "  explicit:",
         ]
         for d in sorted(need, key=lambda d: d.vlan_id):
-            first = d.candidates[0] if d.candidates else 0
-            out.append(f"    {d.vlan_id}: {first}    # candidates: "
-                       f"{', '.join(map(str, d.candidates))}")
+            if d.candidates:
+                out.append(f"    {d.vlan_id}: {d.candidates[0]}    # candidates: "
+                           f"{', '.join(map(str, d.candidates))}")
+            else:
+                # nothing is ever guessed: with no offsets there is no
+                # candidate, so leave the value to the human instead of
+                # pre-filling a fake '0'
+                out.append(f"    # {d.vlan_id}: <ISID>    # no offsets "
+                           f"configured - fill in the I-SID")
     else:
         out.append("# No decisions needed - every VLAN resolved.")
     out.append("#")

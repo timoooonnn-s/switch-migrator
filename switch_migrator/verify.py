@@ -61,7 +61,9 @@ class PortVerdict:
     mlt_found: int | None = None
 
     @property
-    def severity(self) -> str:
+    def severity(self) -> str | None:
+        # None for PENDING - the neutral 'no style' key the console renderer
+        # uses; the annotation says so instead of promising a str
         return {FAIL: "error", WARN: "warn", PASS: "ok"}.get(self.result)
 
     @property

@@ -4,6 +4,8 @@
 #   name:     display name used in the report
 #   host:     IP or DNS name for SSH (optional - defaults to `name`)
 #   platform: voss | ers
+#   console:  console-server line for a switch WITHOUT a management IP
+#             (optional; needs the console_server section in config.yaml)
 #
 switches:
   - name: old-access-01
@@ -15,3 +17,6 @@ switches:
   - name: old-agg-01
     host: 10.1.1.20
     platform: voss
+  # - name: new-leaf-01        # no mgmt IP yet: reached via the console server
+  #   platform: voss
+  #   console: "03"

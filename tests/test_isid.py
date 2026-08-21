@@ -53,3 +53,10 @@ def test_worksheet_lists_decisions_and_paste_snippet():
     # resolved ones are summarized, not asked about
     assert "VLAN 735: 2510735 (from explicit)" in text
     assert "VLAN 99: excluded" in text
+
+
+def test_worksheet_without_offsets_never_prefills_a_fake_isid():
+    decisions = [resolve(695, "svc-a", _cfg(isid_offsets=[]))]
+    text = build_worksheet(decisions, device_name="ers-01")
+    assert "695: 0" not in text                 # nothing is ever guessed
+    assert "no offsets configured" in text

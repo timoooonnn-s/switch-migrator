@@ -205,8 +205,8 @@ def _collect_ers(audit: SwitchAudit, runner: BaseRunner) -> None:
         audit.vlans = ers_parsers.parse_vlans(out)
 
 
-def _collect_fdb(audit: SwitchAudit, runner: BaseRunner,
-                 by_port: dict) -> dict[str, list[tuple[str, int | None]]]:
+def _collect_fdb(audit: SwitchAudit, runner: BaseRunner
+                 ) -> dict[str, list[tuple[str, int | None]]]:
     """Learned MAC addresses per port.
 
     VOSS has no `show mac-address-table`; the forwarding database is read per
@@ -304,7 +304,7 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
         return
 
     # --- learned MACs (capped per port; MLT entries fan out to their members)
-    table = _collect_fdb(audit, runner, by_port)
+    table = _collect_fdb(audit, runner)
     if table:
         by_mlt = {m.mlt_id: m for m in audit.mlts}
         by_mlt_name = {m.name: m for m in audit.mlts if m.name}
@@ -371,7 +371,11 @@ def _enrich_migration_fields(audit: SwitchAudit, runner: BaseRunner,
                     continue
                 counters = [int(t) for t in tokens[1:] if t.isdigit()]
                 if counters:
-                    port.has_traffic = any(c > 0 for c in counters)
+                    # OR across rows: the output has several sections (packets,
+                    # errors, ...) and one port appears in each - an all-zero
+                    # error row must not overwrite a non-zero traffic row
+                    port.has_traffic = bool(port.has_traffic) or \
+                        any(c > 0 for c in counters)
 
 
 def _enrich(audit: SwitchAudit, runner: BaseRunner, cfg: Config,

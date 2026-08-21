@@ -154,17 +154,21 @@ def test_config_extract_writes_when_running_config_present(env):
     assert (s.output_dir / "config" / "sw-voss.cfg").is_file()
 
 
-def test_settings_update_session(env):
+def test_settings_change_one_at_a_time(env):
+    """The settings menu changes exactly the setting that was picked - a
+    crash (or an abort) mid-way can no longer lose every other answer."""
     tmp, cfg_path, inv, raw = env
     s = _session(env)
-    # output dir, offline replay?, save raw?, manifest?, split by location?,
-    # groups, new switch name
-    console = ScriptedConsole([str(tmp / "other"), "n", "n", "y", "y",
-                               "Frankfurt=gx-11,gx-12; Munich=mu-01",
-                               "new-99"])
+    console = ScriptedConsole([
+        "1", str(tmp / "other"),                        # output dir
+        "4", "y",                                       # manifest on
+        "6", "y", "Frankfurt=gx-11,gx-12; Munich=mu-01",  # split + groups
+        "8", "new-99",                                  # new switch
+        "",                                             # back to the menu
+    ])
     M.action_settings(s, console)
     assert s.output_dir == tmp / "other"
-    assert s.offline_dir is None              # answered "no" -> live SSH
+    assert s.offline_dir == raw               # untouched: still the replay dir
     assert s.write_manifest
     assert s.split_by_location
     assert s.location_groups == {"Frankfurt": ["gx-11", "gx-12"],
@@ -175,17 +179,34 @@ def test_settings_update_session(env):
 def test_settings_keeps_the_config_groups_when_none_are_typed(env):
     tmp, cfg_path, inv, raw = env
     s = _session(env)
-    M.action_settings(s, ScriptedConsole([str(tmp / "o"), "n", "n", "n", "y",
-                                          "", "new-1"]))
+    M.action_settings(s, ScriptedConsole(["6", "y", "", ""]))
     assert s.split_by_location and s.location_groups == {}
 
 
 def test_settings_rejects_a_mistyped_group_rather_than_scattering_ports(env):
     tmp, cfg_path, inv, raw = env
     s = _session(env)
-    M.action_settings(s, ScriptedConsole([str(tmp / "o"), "n", "n", "n", "y",
-                                          "Frankfurt gx-11", "new-1"]))
+    M.action_settings(s, ScriptedConsole(["6", "y", "Frankfurt gx-11", ""]))
     assert s.location_groups == {}      # fell back to the config, not a half-group
+
+
+def test_x_aborts_an_action_at_any_prompt(env):
+    import pytest as _pytest
+    s = _session(env)
+    with _pytest.raises(M.Abort):
+        M.action_settings(s, ScriptedConsole(["1", "x"]))
+    with _pytest.raises(M.Abort):
+        M.action_generate_mlt(s, ScriptedConsole(["x"]))
+
+
+def test_blank_at_the_main_menu_redisplays_instead_of_quitting(env):
+    tmp, cfg_path, inv, raw = env
+    console = ScriptedConsole(["", "", "0"])   # two stray Enters, then quit
+    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
+                    creds_fn=_offline_creds)
+    assert rc == 0
+    # all three answers were consumed: blank never quit the menu early
+    assert not console._answers
 
 
 # ------------------------- snapshot & dry run -------------------------------
@@ -306,3 +327,98 @@ def test_verify_action_collects_the_switches_the_sheet_names(env):
     s = _session(env)
     M.action_verify(s, ScriptedConsole([str(sheet)]), _offline_creds)
     assert list((tmp / "out").glob("verification-*.xlsx"))
+
+
+# ------------------- auto-snapshot, pre-flight, profiles ---------------------
+
+def test_collect_auto_saves_a_snapshot(env):
+    """Crash insurance: the expensive collection lands on disk immediately,
+    timestamped, without being asked for."""
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
+    snaps = list((tmp / "out" / "snapshots").glob("snapshot-*.json"))
+    assert len(snaps) == 1
+
+
+def test_snapshot_can_be_loaded_by_number(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
+    fresh = _session(env)
+    assert not fresh.has_data
+    # option 8 lists the auto-saved snapshot; '1' picks the newest
+    M.action_snapshot(fresh, ScriptedConsole(["1"]))
+    assert fresh.has_data
+    assert fresh.collected_macs
+
+
+def test_auto_snapshot_can_be_turned_off(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    s.auto_snapshot = False
+    M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
+    assert not (tmp / "out" / "snapshots").exists()
+
+
+def test_preflight_offline_session_skips_the_check(env, monkeypatch):
+    from switch_migrator import connection as C
+    s = _session(env)                              # offline_dir is set
+
+    def boom(*a, **k):
+        raise AssertionError("must not be called offline")
+
+    monkeypatch.setattr(C, "quick_auth_check", boom)
+    creds = Credentials("u", "p")
+    assert M._preflight_credentials(s, ScriptedConsole([]), creds) is creds
+
+
+def test_preflight_lets_wrong_credentials_be_corrected(env, monkeypatch):
+    from switch_migrator import connection as C
+    s = _session(env)
+    s.offline_dir = None                           # live SSH session
+    results = iter(["auth", None])                 # refused, then accepted
+    seen = []
+
+    def fake_check(host, creds, ssh):
+        seen.append((host, creds.username, creds.password))
+        return next(results)
+
+    monkeypatch.setattr(C, "quick_auth_check", fake_check)
+    console = ScriptedConsole(["admin2", "pw2"])   # corrected username + password
+    out = M._preflight_credentials(s, console, Credentials("admin", "pw"))
+    assert out == Credentials("admin2", "pw2")
+    assert seen[0][1] == "admin" and seen[1][1] == "admin2"
+
+
+def test_preflight_unreachable_is_a_warning_not_a_verdict(env, monkeypatch):
+    from switch_migrator import connection as C
+    s = _session(env)
+    s.offline_dir = None
+    monkeypatch.setattr(C, "quick_auth_check",
+                        lambda *a, **k: "SSHException: timed out")
+    creds = Credentials("admin", "pw")
+    # continue? -> yes
+    assert M._preflight_credentials(s, ScriptedConsole(["y"]), creds) is creds
+    # continue? -> no
+    assert M._preflight_credentials(s, ScriptedConsole(["n"]), creds) is None
+
+
+def test_profiles_save_then_load_into_a_fresh_session(env):
+    tmp, cfg_path, inv, raw = env
+    s = _session(env)
+    s.profiles_path = tmp / "profiles.yaml"
+    s.new_switch = "leaf-a-01"
+    s.save_raw = True
+    M.action_profiles(s, ScriptedConsole(["2", "site-a"]))
+    assert (tmp / "profiles.yaml").is_file()
+
+    fresh = _session(env)
+    fresh.profiles_path = tmp / "profiles.yaml"
+    assert fresh.new_switch == ""
+    M.action_profiles(fresh, ScriptedConsole(["1", "site-a"]))
+    assert fresh.new_switch == "leaf-a-01"
+    assert fresh.save_raw
+    # loading only SET values - the session stays fully changeable
+    fresh.new_switch = "changed-later"
+    assert fresh.new_switch == "changed-later"

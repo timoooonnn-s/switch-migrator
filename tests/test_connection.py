@@ -360,3 +360,104 @@ def test_patient_ers_special_login_presses_ctrl_y(monkeypatch):
     inst.read_until_pattern = fake_read
     inst.special_login_handler()                 # must return, not hang/raise
     assert connection._CTRL_Y in writes          # Ctrl-Y was actually sent
+
+
+def test_paging_disable_exception_still_tries_the_fallback_spelling():
+    # a ReadTimeout on 'terminal more disable' must not skip 'term more dis' -
+    # otherwise one slow read leaves the pager alive for the whole session
+    class _FlakyConn(_FakeConn):
+        def send_command(self, command, read_timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("Pattern not detected")
+            return ""
+
+    conn = _FlakyConn(None)
+    runner = _make_runner(conn)
+    runner._ensure_paging_disabled()
+    assert conn.calls == 2                    # the fallback WAS sent
+    assert runner.setup_warnings == []        # and it was accepted
+
+
+def test_paging_disable_all_spellings_failing_is_one_warning():
+    conn = _FakeConn(TimeoutError("Pattern not detected"))
+    runner = _make_runner(conn)
+    runner._ensure_paging_disabled()
+    assert conn.calls == 2                    # both spellings were tried
+    assert len(runner.setup_warnings) == 1
+    assert "may stall" in runner.setup_warnings[0]
+
+
+def test_command_overrides_apply_at_the_runner_choke_point():
+    conn = _FakeConn(None)
+    runner = _make_runner(conn)
+    runner.command_overrides = {"show mlt": "show mlt all"}
+    runner.run("show mlt")
+    assert runner.command_log[-1].command == "show mlt all"
+    # unmapped commands pass through untouched
+    runner.run("show vlan")
+    assert runner.command_log[-1].command == "show vlan"
+
+
+def test_dry_run_runner_publishes_the_overridden_spelling():
+    from switch_migrator.connection import DryRunRunner
+    runner = DryRunRunner("sw", connection.Platform.VOSS,
+                          command_overrides={"show mlt": "show mlt all"})
+    runner.run("show mlt")
+    assert "show mlt all" in runner.commands
+    assert "show mlt" not in runner.commands
+
+
+def test_console_server_resolution_is_template_driven():
+    from switch_migrator.config import ConsoleServerSettings
+    cs = ConsoleServerSettings(host="tsserver",
+                               username_template="{username}:70{port}")
+    assert cs.resolve("admin", "15") == ("admin:7015", 22)
+    cs = ConsoleServerSettings(host="tsserver", tcp_port_template="30{port}")
+    assert cs.resolve("admin", "15") == ("admin", 3015)
+
+
+class _FakeConsoleChannel:
+    """The switch console as seen through a terminal server: silent first,
+    then a login gate, then a password prompt, then the CLI prompt."""
+
+    def __init__(self, reads):
+        self.reads = iter(reads)
+        self.writes: list[str] = []
+
+    def write_channel(self, data):
+        self.writes.append(data)
+
+    def read_until_pattern(self, pattern="", read_timeout=0.0):
+        nxt = next(self.reads)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+def test_drive_console_login_answers_the_switch_login():
+    from switch_migrator.config import ConsoleServerSettings, Credentials
+    runner = _make_runner(_FakeConn(None))
+    runner.console = "03"
+    runner.console_server = ConsoleServerSettings(host="tsserver")
+    chan = _FakeConsoleChannel([
+        TimeoutError("silent line"),
+        "\nsw-old login:",
+        "Password:",
+        "sw-old:1#",
+    ])
+    runner._drive_console_login(chan, Credentials("admin", "secret"))
+    assert "admin\n" in chan.writes
+    assert "secret\n" in chan.writes
+
+
+def test_drive_console_login_gives_up_with_a_named_error():
+    from switch_migrator.config import ConsoleServerSettings, Credentials
+    runner = _make_runner(_FakeConn(None))
+    runner.console = "03"
+    runner.console_server = ConsoleServerSettings(host="tsserver")
+    chan = _FakeConsoleChannel([TimeoutError("dead line")] * 20)
+    with pytest.raises(connection.ConnectionFailed) as excinfo:
+        runner._drive_console_login(chan, Credentials("admin", "secret"))
+    assert "tsserver" in str(excinfo.value)
+    assert "line 03" in str(excinfo.value)

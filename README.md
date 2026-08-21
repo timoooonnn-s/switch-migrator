@@ -106,6 +106,58 @@ Key settings in `config.yaml` (see the example file for full comments):
 | `mac_cap` | Learned MACs kept per port in the sheets (default 10). |
 | `locations` | Maps switch names to sites, for `--split-by-location`. |
 | `ssh` | Timeouts, retries, parallel workers, legacy-algorithm support. |
+| `inventory` | Default inventory file, so a plain `switch-migrator` needs no `-i` (a `./switches.yaml` is picked up even without this key). |
+| `commands` | Per-command spelling overrides (e.g. `'show mlt': 'show mlt all'`), applied at the runner so dry-run, raw capture and offline replay all see the same spelling. Replacements are validated read-only. |
+| `console_server` | Terminal server for switches without a management IP: SSH to the console server, land on the switch's serial console, continue there (see below). |
+
+### Console server (terminal server)
+
+Switches that have no management IP (yet) can be reached through a terminal
+server. The mechanics are template-driven, so both common flavors work:
+
+```yaml
+console_server:
+  host: tsserver
+  # Avocent-style - the console line rides in the SSH username
+  username_template: "{username}:70{port}"
+  # OR OpenGear-style - one SSH TCP port per line
+  # tcp_port_template: "70{port}"
+```
+
+and in the inventory, per switch:
+
+```yaml
+switches:
+  - name: new-leaf-01
+    platform: voss
+    console: "03"        # -> ssh admin:7003@tsserver
+```
+
+The tool SSHes to the terminal server, answers the switch's own console login
+(including the ERS `Ctrl-Y` gate) with the switch credentials, and then runs
+the normal collection over that console session. If the console server uses a
+different account than the switches, set `SM_CONSOLE_USERNAME` /
+`SM_CONSOLE_PASSWORD`.
+
+### Profiles (`profiles.yaml`)
+
+A profile bundles what one recurring scenario always needs - inventory, output
+directory, collection settings, target switch - so "scenario A" is one load
+instead of six prompts. Menu option `p` loads or saves them; on the command
+line, `--profile NAME` applies one (explicit flags always win). Profiles never
+hold credentials.
+
+```yaml
+profiles:
+  site-a:
+    inventory: inventories/site-a.yaml
+    output_dir: output/site-a
+    new_switch: leaf-a-01
+    save_raw: true
+    split_by_location: true
+    location_groups:
+      Frankfurt: [gx-11, gx-12]
+```
 
 ## Credentials
 
@@ -195,6 +247,23 @@ asks whether to include fabric state, running-config and MAC tables), and every
 output afterwards is produced from that same data — switching between use cases
 costs no further SSH round-trips. Options that need data you didn't collect say
 so instead of silently producing empty columns.
+
+A few behaviors worth knowing:
+
+* **`x` aborts anything.** At any prompt, `x` (or Ctrl-C) abandons the current
+  action and falls back to the menu. A stray Enter at the menu re-shows it —
+  quitting is an explicit `0`/`q`.
+* **Tab completes paths.** Every file/directory prompt has readline tab
+  completion.
+* **Default inventory.** With no `-i`, the config's `inventory:` key (or a
+  `./switches.yaml`) is picked up automatically.
+* **Credentials are checked first.** Before the full collection, one quick SSH
+  login against one device verifies the credentials — wrong ones fail in
+  seconds and can be corrected on the spot, instead of costing a read-timeout
+  per device (they are never blindly retried, so no lockout risk).
+* **Every collection is auto-snapshotted** to
+  `<output>/snapshots/snapshot-<stamp>.json` (toggle in Settings). A crash
+  costs nothing: option 8 lists the snapshots and reloads one by number.
 
 **All command-line flags below keep working unchanged** — the menu is an extra
 entry point, not a replacement, so existing scripts and cron jobs are unaffected.

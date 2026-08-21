@@ -104,5 +104,5 @@ def build(audits: list[SwitchAudit], fabric: FabricState, args,
 
 def write(path: Path, data: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return path

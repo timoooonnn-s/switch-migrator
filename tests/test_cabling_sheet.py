@@ -243,3 +243,20 @@ def test_one_worksheet_can_still_be_singled_out(tmp_path):
     write_excel(tables, path)
     sheet = CS.load(path, sheet_name="Cabling Munich")
     assert [r.old_switch for r in sheet.rows] == ["mu-01-a"]
+
+
+def test_xlsx_worksheet_with_a_leading_blank_row_is_still_read(tmp_path):
+    """openpyxl hands back leading blank rows; the header detection must skip
+    them like the parser does, or the whole worksheet silently vanishes."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cabling"
+    ws.append([])                       # a stray empty first row
+    ws.append(["Old switch", "Old port", "NEW switch", "NEW port"])
+    ws.append(["gx-01", "1/7", "leaf-01", "1/1"])
+    path = tmp_path / "sheet.xlsx"
+    wb.save(path)
+    sheet = CS.load(path)
+    assert len(sheet.rows) == 1
+    assert sheet.rows[0].old_port == "1/7"
