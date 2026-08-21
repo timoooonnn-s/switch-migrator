@@ -259,3 +259,21 @@ def test_an_unresolved_isid_still_says_so_when_the_fabric_was_read():
     resolve_binding_isids([audit], {audit.name: compare_switch(audit, fabric, _cfg())})
     cell = _pairs_cell({p.port: p for p in audit.ports}["49"].bindings)
     assert "?" in cell
+
+
+def test_the_raw_config_is_dropped_once_its_tagging_is_extracted():
+    """The config is read for tagging on every migration-sheets run, but it
+    holds RADIUS keys and SNMP users - and the snapshot is a file meant to be
+    handed to a colleague. Only --extract-config, which exists to neutralize
+    it, keeps the original text."""
+    target = SwitchTarget("ers", "ers", Platform.ERS)
+    audit = collect_switch(target, OfflineRunner("ers", FIXTURES), _cfg(),
+                           pull_config=True, pull_macs=True, keep_config=False)
+    assert audit.running_config == ""
+    # ...and the tagging it was read for survived
+    assert {p.port: p for p in audit.ports}["49"].tagging == "tagged"
+
+
+def test_keeping_the_config_is_still_possible_for_the_extract():
+    audit = _collect("ers")           # collect_switch(..., keep_config default)
+    assert "radius server host" in audit.running_config

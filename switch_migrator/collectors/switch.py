@@ -37,7 +37,8 @@ def _is_core_neighbor(sysname: str, patterns: list[str]) -> bool:
 
 def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
                    pull_config: bool = False,
-                   pull_macs: bool = False) -> SwitchAudit:
+                   pull_macs: bool = False,
+                   keep_config: bool = True) -> SwitchAudit:
     audit = SwitchAudit(name=target.name, host=target.host,
                         platform=target.platform, reachable=True)
     # session-setup problems (e.g. paging disable rejected) must be visible
@@ -53,6 +54,13 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
         out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
         audit.running_config = out or ""
     _enrich(audit, runner, cfg, pull_macs=pull_macs)
+    if not keep_config:
+        # The config was read for the tagging it carries, which is now in the
+        # bindings. The text itself holds RADIUS keys, SNMP users and the SPB
+        # identity, and it would otherwise travel on into the snapshot - a file
+        # meant to be handed to a colleague. Only --extract-config, which
+        # exists to produce a neutralized version of it, keeps the original.
+        audit.running_config = ""
     if pull_macs:
         # switch uptime tells us how long the interface counters have been
         # accumulating - '0 packets' only means something on a long-running box

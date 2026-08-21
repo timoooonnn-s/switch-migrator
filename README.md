@@ -661,6 +661,13 @@ A snapshot holds device data (hostnames, IPs, MAC addresses, LLDP neighbors,
 and with `--extract-config` the running-config). Keep it wherever the raw
 switch output belongs.
 
+`--migration-sheets` reads the running-config too, for the tagged/untagged
+columns — but **drops the text again** once that is extracted, so a snapshot
+from a sheets run carries the derived VLAN bindings and not the RADIUS keys,
+SNMP users and SPB identity the config itself contains. Only
+`--extract-config`, which exists to produce a neutralized version of it, keeps
+the original.
+
 ### Dry run (`--dry-run`)
 
 Prints every command the run would send to each device — switches and DvR

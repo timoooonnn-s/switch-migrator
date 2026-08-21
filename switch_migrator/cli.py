@@ -280,6 +280,7 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
             audit = collect_switch(
                 target, runner, cfg,
                 pull_config=_needs_config(args),
+                keep_config=bool(getattr(args, "extract_config", False)),
                 # verification needs the learned MACs on the NEW ports - they
                 # are the evidence that the right cable went into the right hole
                 pull_macs=bool(getattr(args, "migration_sheets", False)
