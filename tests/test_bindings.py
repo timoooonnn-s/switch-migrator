@@ -277,3 +277,65 @@ def test_the_raw_config_is_dropped_once_its_tagging_is_extracted():
 def test_keeping_the_config_is_still_possible_for_the_extract():
     audit = _collect("ers")           # collect_switch(..., keep_config default)
     assert "radius server host" in audit.running_config
+
+
+def test_ers_untag_pvid_only_is_a_trunk_with_a_native_vlan():
+    """The common ERS trunk. Testing only for tagAll called it wholly untagged
+    - one untagged VLAN on the sheet, and the rest silently wrong."""
+    model = ers_config.parse_ers_config("""
+vlan create 10,20,30 type port cist
+vlan members 10 5
+vlan members 20 5
+vlan members 30 5
+vlan ports 5 tagging untagPvidOnly
+vlan ports 5 pvid 10
+""")
+    assert [b.render() for b in ers_config.port_bindings(model)["5"]] == [
+        "10->? (u)", "20->? (t)", "30->? (t)"]
+
+
+def test_ers_tag_pvid_only_is_the_inverse():
+    model = ers_config.parse_ers_config("""
+vlan create 10,20 type port cist
+vlan members 10 5
+vlan members 20 5
+vlan ports 5 tagging tagPvidOnly
+vlan ports 5 pvid 10
+""")
+    assert [b.render() for b in ers_config.port_bindings(model)["5"]] == [
+        "10->? (t)", "20->? (u)"]
+
+
+def test_ers_tag_all_pvid_carries_both_directions():
+    model = ers_config.parse_ers_config("""
+vlan create 10,20 type port cist
+vlan members 10 5
+vlan members 20 5
+vlan ports 5 tagging tagAll
+vlan ports 5 pvid 10
+""")
+    assert [b.render() for b in ers_config.port_bindings(model)["5"]] == [
+        "10->? (t+u)", "20->? (t)"]
+
+
+def test_ers_port_with_no_tagging_line_defaults_to_untagged():
+    model = ers_config.parse_ers_config("""
+vlan create 10 type port cist
+vlan members 10 5
+""")
+    assert ers_config.port_bindings(model)["5"][0].tagging == UNTAGGED
+
+
+def test_coverage_does_not_call_spare_ports_an_error():
+    """Severities feed the exit code. A 48-port box with 12 patched is normal
+    and must not make the tool exit 1."""
+    from switch_migrator.models import PortState, SwitchAudit
+    from switch_migrator.report.tables import build_coverage
+
+    audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
+                        reachable=True)
+    audit.ports = [PortState(port=f"1/{n}") for n in range(1, 49)]
+    for port in audit.ports[:12]:
+        port.bindings = [VlanBinding(vlan=100, isid=10100, tagging=TAGGED)]
+    table = build_coverage([audit])
+    assert table.severities[0] == "warn"      # worth noting, not a failure

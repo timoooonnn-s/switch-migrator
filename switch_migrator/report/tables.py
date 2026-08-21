@@ -244,12 +244,14 @@ def build_coverage(audits: list[SwitchAudit]) -> Table:
         missing = [f"{s.name} ({s.detail})" if s.detail else s.name
                    for s in audit.sources if not s.ok]
         pct = f"{with_vlans * 100 // total}%" if total else "-"
-        # a switch whose ports mostly have no VLAN at all is the case worth
-        # catching: the sheet will look finished and be half empty
+        # Severities here feed the process exit code, so 'error' has to mean a
+        # collection that failed - not a switch with spare ports. A 48-port box
+        # with 12 patched is normal and says nothing about coverage; a
+        # reachable switch with ports and NO VLAN data at all is a real gap.
         severity = "ok"
         if not audit.reachable:
             severity = "error"
-        elif total and with_vlans * 2 < total:
+        elif total and not with_vlans:
             severity = "error"
         elif missing or (total and with_vlans < total) or not with_tagging:
             severity = "warn"

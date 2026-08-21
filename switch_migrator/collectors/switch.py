@@ -425,13 +425,20 @@ def _build_mlt_bindings(audit: SwitchAudit, by_port: dict,
                 vlan=b.vlan, isid=b.isid, tagging=b.tagging,
                 source=f"member {member}" if not b.source else b.source,
                 isid_note=b.isid_note) for b in port.bindings])
+        # compare BEFORE the column is merged in - afterwards every VLAN it
+        # named is in mlt.vlans by construction and the check can never fire
+        from_members = {b.vlan for b in mlt.bindings if b.vlan is not None}
+        # ...and only when the members had something to say. A box that rejects
+        # every 'show interfaces' variant contributes no member bindings at
+        # all, and every VLAN in the column would look unaccounted for.
+        missing = ([v for v in from_column if v not in from_members]
+                   if from_members else [])
         _merge_bindings(mlt.bindings, [
             VlanBinding(vlan=v, isid=isid_of.get(v), source="show mlt")
             for v in from_column])
         _sync_flat_lists(mlt)
         # the column and the members disagreeing is worth knowing about: one of
         # them is describing an aggregation that is not the one on the wire
-        missing = [v for v in from_column if v not in mlt.vlans]
         if missing:
             audit.warnings.append(
                 f"MLT {mlt.mlt_id}: 'show mlt' lists VLAN(s) "

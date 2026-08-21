@@ -232,8 +232,12 @@ def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
         return OfflineRunner(name, args.offline,
                              command_overrides=cfg.command_overrides)
     raw_dir = (args.output_dir / "raw" / name) if args.save_raw else None
+    # the sheets read the running-config for its tagging and then drop the
+    # text; capturing it to disk would keep exactly what that discards
+    raw_skip = (() if getattr(args, "extract_config", False)
+                else ("show running-config",))
     return SshRunner(name=name, host=host, platform=platform, creds=creds,
-                     ssh=cfg.ssh, raw_dir=raw_dir,
+                     ssh=cfg.ssh, raw_dir=raw_dir, raw_skip=raw_skip,
                      command_overrides=cfg.command_overrides,
                      console=console, console_server=cfg.console_server)
 

@@ -13,13 +13,33 @@ from switch_migrator.models import BOTH, TAGGED, UNTAGGED, VlanBinding
 from switch_migrator.parsers.common import expand_port_list
 
 
+# 'vlan ports X tagging <mode>'. ERS spells the four combinations out:
+#   untagAll       every frame egresses untagged (the default)
+#   tagAll         every frame egresses tagged
+#   untagPvidOnly  the PVID egresses untagged, everything else tagged
+#                  - the ordinary trunk-with-a-native-VLAN
+#   tagPvidOnly    the inverse, and rare
+UNTAG_ALL = "untagAll"
+TAG_ALL = "tagAll"
+UNTAG_PVID_ONLY = "untagPvidOnly"
+TAG_PVID_ONLY = "tagPvidOnly"
+_TAGGING_MODES = {m.lower(): m for m in
+                  (UNTAG_ALL, TAG_ALL, UNTAG_PVID_ONLY, TAG_PVID_ONLY)}
+
+
 @dataclass
 class ErsPort:
     port: str                 # ERS unit port number as a string, e.g. "7"
     name: str = ""
-    tagged: bool = False      # 'vlan ports X tagging tagAll' -> 802.1Q trunk
+    tagging_mode: str = UNTAG_ALL   # the port's 'vlan ports ... tagging' mode
     pvid: int | None = None   # untagged/native VLAN
     shutdown: bool = False
+
+    @property
+    def tagged(self) -> bool:
+        """Does this port egress tagged at all? (kept for the VOSS generator,
+        which only needs the tagAll/not distinction it always used.)"""
+        return self.tagging_mode == TAG_ALL
 
 
 @dataclass
@@ -83,10 +103,11 @@ def parse_ers_config(text: str) -> ErsModel:
                     vlan.members += [p for p in ports if p not in vlan.members]
             continue
 
-        mm = re.match(r"vlan ports\s+(\S+)\s+tagging\s+tagAll", s)
-        if mm:
+        mm = re.match(r"vlan ports\s+(\S+)\s+tagging\s+(\S+)", s)
+        if mm and mm.group(2).lower() in _TAGGING_MODES:
+            mode = _TAGGING_MODES[mm.group(2).lower()]
             for p in expand_port_list(mm.group(1)):
-                m.port(p).tagged = True
+                m.port(p).tagging_mode = mode
             continue
 
         mm = re.match(r"vlan ports\s+(\S+)\s+pvid\s+(\d+)", s)
@@ -131,9 +152,11 @@ def port_bindings(model: ErsModel) -> dict[str, list[VlanBinding]]:
 
     ERS has no I-SIDs, so every binding leaves `isid` unset - it is filled in
     later from the fabric comparison, which is the only thing that knows which
-    I-SID an ERS VLAN lands on. Tagging comes from `vlan ports <p> tagging`:
-    tagAll egresses everything tagged, untagAll everything untagged, and the
-    PVID names the untagged VLAN on a port that does both.
+    I-SID an ERS VLAN lands on. Tagging comes from the port's
+    `vlan ports ... tagging` mode read against its PVID, so the ordinary
+    trunk-with-a-native-VLAN (`untagPvidOnly`) comes out as one untagged VLAN
+    and the rest tagged - not, as a plain tagAll/not test would have it, as a
+    wholly untagged port.
 
     A port the config never mentions in a `vlan ports ... tagging` line is
     untagAll by default on ERS, which is why absence is read as untagged
@@ -143,13 +166,18 @@ def port_bindings(model: ErsModel) -> dict[str, list[VlanBinding]]:
     for vid, vlan in sorted(model.vlans.items()):
         for port in vlan.members:
             cfg = model.ports.get(port)
-            tagged = bool(cfg and cfg.tagged)
-            if tagged and cfg is not None and cfg.pvid == vid:
-                # tagAll with this VLAN as PVID: frames still egress tagged,
-                # but the port's untagged ingress lands here
-                tagging = BOTH
-            else:
-                tagging = TAGGED if tagged else UNTAGGED
+            mode = cfg.tagging_mode if cfg else UNTAG_ALL
+            is_pvid = cfg is not None and cfg.pvid == vid
+            if mode == TAG_ALL:
+                # everything egresses tagged; the PVID additionally takes the
+                # port's untagged ingress
+                tagging = BOTH if is_pvid else TAGGED
+            elif mode == UNTAG_ALL:
+                tagging = UNTAGGED
+            elif mode == UNTAG_PVID_ONLY:
+                tagging = UNTAGGED if is_pvid else TAGGED
+            else:                                    # tagPvidOnly
+                tagging = TAGGED if is_pvid else UNTAGGED
             result.setdefault(port, []).append(
                 VlanBinding(vlan=vid, tagging=tagging, source=SOURCE))
     for bindings in result.values():

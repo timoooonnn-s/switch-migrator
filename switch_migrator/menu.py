@@ -387,9 +387,11 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     s.audits, s.fabric = audits, fabric
     s.collected_at = datetime.now()
     s.collected_fabric = want_fabric
-    # the migration-sheet collection pulls the running-config too, because
-    # it is the only source of tagged-vs-untagged - record what really ran
-    s.collected_config = want_config or want_macs
+    # The migration-sheet collection reads the running-config too, for the
+    # tagging - but drops the text again unless it was asked for. So what is
+    # RETAINED, which is what the config extract and the snapshot need, is
+    # still exactly what the user said yes to here.
+    s.collected_config = want_config
     s.collected_macs = want_macs
     s.loaded_from = None
     s.commands_by_device = commands
