@@ -78,7 +78,7 @@ def write_csv(tables: list[Table], directory: Path) -> list[Path]:
     for table in tables:
         slug = re.sub(r"[^a-z0-9]+", "_", table.title.lower()).strip("_")
         path = directory / f"{slug}.csv"
-        with path.open("w", newline="") as fh:
+        with path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(table.headers)
             writer.writerows(table.rows)

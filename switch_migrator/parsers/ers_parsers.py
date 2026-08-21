@@ -96,8 +96,11 @@ def parse_mlt(output: str) -> list[MltState]:
             continue
         status_idx = next((i for i in range(len(tokens) - 1, 0, -1)
                            if tokens[i].lower() in ("enabled", "disabled")), None)
-        # need at least <name> <members> <bpdu> <mode> between the id and STATUS
-        if status_idx is None or status_idx < 4:
+        # need at least <name> <members> <bpdu> <mode> between the id and
+        # STATUS, i.e. STATUS at index 5 or later - at 4 the token three back
+        # would be the NAME column, and a digit-shaped name would be read as
+        # the members list
+        if status_idx is None or status_idx < 5:
             continue
         members_tok = tokens[status_idx - 3]
         if members_tok.upper() != "NONE" and not re.match(r"^[\d/,\-]+$", members_tok):

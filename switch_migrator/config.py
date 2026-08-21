@@ -34,6 +34,46 @@ class SwitchTarget:
     name: str
     host: str
     platform: Platform
+    # console-server line/port id. When set (and console_server is configured)
+    # the tool reaches this switch through the terminal server instead of a
+    # direct SSH to `host` - for boxes with no management IP yet.
+    console: str = ""
+
+
+@dataclass
+class ConsoleServerSettings:
+    """How to reach a switch's serial console through a terminal server.
+
+    Only the mechanics live here; WHICH line a switch hangs off is the
+    per-switch `console:` field in the inventory. Two common flavors, both
+    template-driven so the exact scheme stays in the config:
+
+    * username-embedded (Avocent-style `ssh user:7003@tsserver`):
+        username_template: "{username}:70{port}"
+    * TCP-port-per-line (OpenGear-style `ssh -p 3003 tsserver`):
+        tcp_port_template: "30{port}"
+
+    `{port}` is the switch's `console:` value; `{username}` the login name.
+    """
+    host: str = ""
+    username_template: str = ""       # e.g. "{username}:70{port}"
+    tcp_port_template: str = ""       # e.g. "70{port}" -> SSH TCP port
+    device_type: str = "generic_termserver"   # netmiko terminal-server driver
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.host)
+
+    def resolve(self, username: str, console: str) -> tuple[str, int]:
+        """(login username, TCP port) for one console line."""
+        user = username
+        if self.username_template:
+            user = self.username_template.format(username=username,
+                                                 port=console)
+        port = 22
+        if self.tcp_port_template:
+            port = int(self.tcp_port_template.format(port=console))
+        return user, port
 
 
 @dataclass
@@ -79,6 +119,16 @@ class Config:
     # how switch names map to sites, and which sites share a cabling worksheet
     locations: LocationRules = field(default_factory=LocationRules)
     ssh: SshSettings = field(default_factory=SshSettings)
+    # default inventory file, so a plain `switch-migrator` needs no -i;
+    # resolved relative to the config file's own directory
+    inventory: Path | None = None
+    # per-command spelling overrides ({'show mlt': 'show mlt all', ...}),
+    # applied at the runner - replacements are restricted to read-only
+    # spellings so the tool's licence to run in a change window survives
+    command_overrides: dict[str, str] = field(default_factory=dict)
+    # optional terminal server for switches with a `console:` line
+    console_server: ConsoleServerSettings = field(
+        default_factory=ConsoleServerSettings)
 
 
 def _require(data: dict, key: str, path: Path):
@@ -93,7 +143,7 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
     and reports per-switch state and never compares against a fabric.
     """
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         raise ConfigError(f"config file not found: {path}") from None
     except yaml.YAMLError as exc:
@@ -171,6 +221,40 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         groups=groups,
     )
 
+    inventory = data.get("inventory")
+    if inventory:
+        inventory = Path(str(inventory))
+        if not inventory.is_absolute():
+            # relative to the config file, so `-c deploy/config.yaml` works
+            # from any working directory
+            inventory = path.parent / inventory
+
+    overrides_raw = data.get("commands") or {}
+    if not isinstance(overrides_raw, dict):
+        raise ConfigError(f"{path}: 'commands' must be a mapping of "
+                          f"original -> replacement command")
+    command_overrides: dict[str, str] = {}
+    for orig, repl in overrides_raw.items():
+        repl = str(repl).strip()
+        if not repl.startswith(("show", "terminal", "term ", "enable")):
+            raise ConfigError(
+                f"{path}: commands['{orig}'] = '{repl}' is not a read-only "
+                f"command - overrides must start with 'show', 'terminal'/"
+                f"'term' or 'enable', because the tool's read-only claim "
+                f"covers everything it sends")
+        command_overrides[str(orig).strip()] = repl
+
+    cs_raw = data.get("console_server") or {}
+    if not isinstance(cs_raw, dict):
+        raise ConfigError(f"{path}: 'console_server' must be a mapping with "
+                          f"'host' and a username_template/tcp_port_template")
+    console_server = ConsoleServerSettings(
+        host=str(cs_raw.get("host") or ""),
+        username_template=str(cs_raw.get("username_template") or ""),
+        tcp_port_template=str(cs_raw.get("tcp_port_template") or ""),
+        device_type=str(cs_raw.get("device_type") or "generic_termserver"),
+    )
+
     return Config(
         dvr_controllers=dvrs,
         core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
@@ -182,12 +266,15 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         mac_cap=max(1, int(data.get("mac_cap", 10))),
         locations=locations,
         ssh=ssh,
+        inventory=inventory,
+        command_overrides=command_overrides,
+        console_server=console_server,
     )
 
 
 def load_inventory(path: Path) -> list[SwitchTarget]:
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         raise ConfigError(f"inventory file not found: {path}") from None
     except yaml.YAMLError as exc:
@@ -201,9 +288,23 @@ def load_inventory(path: Path) -> list[SwitchTarget]:
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict) or "name" not in entry or "platform" not in entry:
             raise ConfigError(f"{path}: switches[{i}] needs 'name' and 'platform'")
-        targets.append(_make_target(str(entry["name"]), str(entry.get("host") or entry["name"]),
-                                    str(entry["platform"]), where=f"{path}: switches[{i}]"))
+        target = _make_target(str(entry["name"]), str(entry.get("host") or entry["name"]),
+                              str(entry["platform"]), where=f"{path}: switches[{i}]")
+        if entry.get("console") is not None:
+            # console-server line for boxes with no management IP (yet);
+            # needs the config's console_server section to take effect
+            target.console = str(entry["console"]).strip()
+        targets.append(target)
     return targets
+
+
+def default_inventory(cfg: "Config") -> Path | None:
+    """The inventory to use when none is given: the config's `inventory:` key,
+    else a `switches.yaml` sitting in the working directory."""
+    if cfg.inventory is not None:
+        return cfg.inventory
+    fallback = Path("switches.yaml")
+    return fallback if fallback.is_file() else None
 
 
 def parse_switch_arg(arg: str) -> SwitchTarget:

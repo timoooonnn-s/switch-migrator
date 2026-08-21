@@ -42,7 +42,7 @@ Two words are used precisely throughout:
 ## 2. The runner contract
 
 Everything that touches a device goes through one tiny interface,
-`BaseRunner` (`connection.py:147`):
+`BaseRunner` (`connection.py:151`):
 
 ```python
 class BaseRunner:
@@ -71,8 +71,8 @@ Three consequences worth internalising:
 
 | Exception | Raised when | Meaning | Retried? |
 |---|---|---|---|
-| `ConnectionFailed` (`connection.py:45`) | during construction of a runner — SSH, auth, prompt | the device was never usable | connect-level retries only (`ssh.retries`), **never** for auth |
-| `CommandError` (`connection.py:108`) | in `run()` — device rejected the command, or transport died | *this command* failed; the session may still be fine | transport failures only (`ssh.command_retries`); a device **rejection** is never retried |
+| `ConnectionFailed` (`connection.py:49`) | during construction of a runner — SSH, auth, prompt | the device was never usable | connect-level retries only (`ssh.retries`), **never** for auth |
+| `CommandError` (`connection.py:112`) | in `run()` — device rejected the command, or transport died | *this command* failed; the session may still be fine | transport failures only (`ssh.command_retries`); a device **rejection** is never retried |
 
 A rejected command is a *fact about the release*, not a flake. Re-sending
 `show virtual-ist` to a box that answered `% Invalid input` cannot produce a
@@ -82,7 +82,7 @@ different answer, so `run()` deliberately does not.
 
 ## 3. The three runners, and which one runs
 
-`make_runner()` (`cli.py:207`) picks in this order:
+`make_runner()` (`cli.py:219`) picks in this order:
 
 ```python
 if args.dry_run:  return DryRunRunner(name, platform)   # connects to nothing
@@ -92,11 +92,11 @@ return SshRunner(name, host, platform, creds, cfg.ssh, raw_dir)  # live
 
 | Runner | Source of output | Used by | Platform-aware? |
 |---|---|---|---|
-| `SshRunner` (`connection.py:269`) | a live netmiko session | normal runs | yes — driver, paging command, ERS login class |
-| `OfflineRunner` (`connection.py:521`) | `<raw_root>/<device>/<command_slug>.txt` | `--offline`, and **every test in the suite** | no |
-| `DryRunRunner` (`connection.py:546`) | returns `""` for everything | `--dry-run` | yes — seeds the paging command |
+| `SshRunner` | a live netmiko session | normal runs | yes — driver, paging command, ERS login class |
+| `OfflineRunner` | `<raw_root>/<device>/<command_slug>.txt` | `--offline`, and the collector/end-to-end tests | no |
+| `DryRunRunner` | returns `""` for everything | `--dry-run` | yes — seeds `enable` + every paging spelling |
 
-`command_slug()` (`connection.py:115`) is the shared key: it lowercases a
+`command_slug()` (`connection.py:119`) is the shared key: it lowercases a
 command and replaces every non-alphanumeric run with `_`, so
 `show interfaces gigabitEthernet state` ⇄
 `show_interfaces_gigabitethernet_state.txt`. `--save-raw` writes with it and
@@ -106,9 +106,14 @@ translation step.
 `DryRunRunner` deserves a note because it is the tool's read-only proof.
 Returning `""` for every command walks the collectors down **every** fallback
 branch, so the printed list is the full set of commands the tool *could* send
-to that device — not the subset one particular release happens to accept. And
-because it is produced by running the real collectors, it cannot drift away
-from what the tool actually does.
+to that device — not the subset one particular release happens to accept. The
+session-setup commands a live run sends outside the collectors — `enable` and
+every paging-disable spelling, fallbacks included — are seeded into the list
+explicitly for the same reason. The one write the list cannot carry is the
+`q` + newline keystroke `_recover_channel()` sends to kill a stuck `--More--`
+pager after a timeout: it is a recovery keystroke, not a command. Because the
+rest is produced by running the real collectors, it cannot drift away from
+what the tool actually does.
 
 ---
 
@@ -120,17 +125,17 @@ of these branch points.
 
 | # | Location | Branch | Why |
 |---|---|---|---|
-| 1 | `connection.py:28` `NETMIKO_DEVICE_TYPE` | `VOSS → "extreme_vsp"`, `ERS → "extreme_ers"` | netmiko driver: prompt patterns, paging, `enable` behaviour |
-| 2 | `connection.py:183` `_PAGING_DISABLE` | VOSS `terminal more disable` → fallback `term more dis`; ERS `terminal length 0` | different CLI spellings; VOSS has no `terminal width` |
-| 3 | `connection.py:408` in `_connect()` | `if platform is Platform.ERS: connect_cls = _patient_ers_class()` | the Ctrl-Y login gate; the VOSS path is untouched |
+| 1 | `connection.py:32` `NETMIKO_DEVICE_TYPE` | `VOSS → "extreme_vsp"`, `ERS → "extreme_ers"` | netmiko driver: prompt patterns, paging, `enable` behaviour |
+| 2 | `connection.py:194` `_PAGING_DISABLE` | VOSS `terminal more disable` → fallback `term more dis`; ERS `terminal length 0` | different CLI spellings; VOSS has no `terminal width` |
+| 3 | `connection.py:429` in `_connect()` | `if platform is Platform.ERS: connect_cls = _patient_ers_class()` | the Ctrl-Y login gate; the VOSS path is untouched |
 | 4 | `collectors/switch.py:38` | `if VOSS: _collect_voss() else: _collect_ers()` | entirely different command sets |
-| 5 | `collectors/switch.py:219` `_collect_fdb()` | `if not VOSS:` → `show mac-address-table`; VOSS → `show interfaces gigabitEthernet fdb-entry` (bare, then per-up-port) | VOSS has no `show mac-address-table` |
+| 5 | `collectors/switch.py:208` `_collect_fdb()` | `if not VOSS:` → `show mac-address-table`; VOSS → `show interfaces gigabitEthernet fdb-entry` (bare, then per-up-port) | VOSS has no `show mac-address-table` |
 | 6 | `collectors/switch.py:336` in `_enrich_migration_fields()` | VOSS-only: `show pluggable-optical-modules basic`, `show interfaces gigabitEthernet statistics` | no ERS equivalent used |
-| 7 | `collectors/switch.py:385` in `_enrich()` | LLDP command **order**: VOSS tries `summary` first, ERS tries the block form first | each platform's native form first; the other is a fallback |
+| 7 | `collectors/switch.py:389` in `_enrich()` | LLDP command **order**: VOSS tries `summary` first, ERS tries the block form first | each platform's native form first; the other is a fallback |
 | 8 | `parsers/` | `voss_parsers` vs `ers_parsers`, shared helpers in `common.py` | different table layouts |
 | 9 | `compare.py:74`, `compare.py:129` | VOSS-only local VLAN↔I-SID binding logic; `LOCAL_ONLY` verdict is VOSS-only | ERS has no I-SID concept, so absence from the fabric *is* the finding |
-| 10 | `report/migration.py:205`, `cli.py:386` | VOSS config is filtered/neutralized; ERS config is translated to a VOSS flex-UNI draft | migration direction is ERS/VOSS → VOSS |
-| 11 | `cli.py:306,347`, `menu.py:539` | DvR controllers and post-migration verification targets are **hardcoded** `Platform.VOSS` | DvR controllers are always Fabric Engine; new switches are assumed VOSS (override with `-s`) |
+| 10 | `report/migration.py:205`, `cli.py:407` | VOSS config is filtered/neutralized; ERS config is translated to a VOSS flex-UNI draft | migration direction is ERS/VOSS → VOSS |
+| 11 | `cli.py:368,447`, `menu.py:691` | DvR controllers and post-migration verification targets are **hardcoded** `Platform.VOSS` | DvR controllers are always Fabric Engine; new switches are assumed VOSS (override with `-s`) |
 
 **Two `else`-shaped traps.** Branch 4 and branch 5 are written as "VOSS or
 everything else". A third platform added to the enum would therefore be
@@ -149,7 +154,7 @@ diverge.
 ### Phase 0 — before any socket: legacy algorithms
 
 `SshRunner.__init__` calls `enable_legacy_ssh_algorithms()`
-(`connection.py:65`) when `ssh.legacy_algorithms` is true (the default). It
+(`connection.py:69`) when `ssh.legacy_algorithms` is true (the default). It
 **appends** to paramiko's `Transport._preferred_kex` / `_preferred_ciphers` /
 `_preferred_keys`:
 
@@ -179,7 +184,7 @@ gear.
 Nothing here touches the OS, the device, `/etc/ssh`, or system-wide crypto
 policy. It is entirely inside this process's paramiko.
 
-### Phase 1 — connect (`SshRunner._connect`, `connection.py:376`)
+### Phase 1 — connect (`SshRunner._connect`, `connection.py:396`)
 
 Parameters worth knowing (all from `SshSettings`):
 
@@ -199,8 +204,9 @@ Parameters worth knowing (all from `SshSettings`):
 **ERS divergence:** if the platform is ERS, `_patient_ers_class()` is built and
 instantiated **directly** rather than via `ConnectHandler` — netmiko only
 dispatches by string name, so a subclass cannot be selected any other way. If
-that import fails, `connect_cls` is `None` and the stock class is used, so a
-netmiko layout change degrades instead of crashing.
+that import fails, `connect_cls` is `None` and the stock class is used; inside
+the handler, `prompt_pattern` and `RETURN` are read with `getattr` defaults —
+so a netmiko layout change degrades instead of crashing.
 
 Retry policy:
 
@@ -217,7 +223,7 @@ After a successful connect the in-memory session log is detached
 (`self._conn.session_log.session_log = None`) so it stops growing with every
 command's output — DvR controllers can emit very large tables.
 
-### Phase 1b — the ERS login gate (`_patient_ers_class`, `connection.py:193`)
+### Phase 1b — the ERS login gate (`_patient_ers_class`, `connection.py:204`)
 
 This is the single most important piece of ERS-specific code, so it is worth
 reading closely.
@@ -253,7 +259,7 @@ interface. The handler sends Ctrl-C at a `Menu` prompt, but the tool
 deliberately does not try to navigate a menu UI; such a box is reported
 UNREACHABLE. Fix it on the device (`cmd-interface cli`) or audit it by hand.
 
-### Phase 2 — enter privileged EXEC (`_ensure_privileged`, `connection.py:298`)
+### Phase 2 — enter privileged EXEC (`_ensure_privileged`, `connection.py:319`)
 
 **Both platforms** log in at user EXEC (`>`). On VOSS 8.x,
 `show interfaces gigabitEthernet ...` and `show lldp ...` are privileged-only,
@@ -271,7 +277,7 @@ operator to check the account's access level. It is a warning, not a fatal
 error, because the commands that *do* work in user EXEC still produce useful
 data.
 
-### Phase 3 — disable paging, and verify it (`_ensure_paging_disabled`, `connection.py:344`)
+### Phase 3 — disable paging, and verify it (`_ensure_paging_disabled`, `connection.py:365`)
 
 netmiko sends a paging-disable command too, but (a) it only verifies the
 command **echo**, not whether the device accepted it, and (b) it runs *before*
@@ -282,13 +288,15 @@ output.
 
 So the tool sends it again explicitly, now privileged, and checks the device's
 actual answer with `looks_like_error()`. VOSS gets a second spelling
-(`term more dis`, field-verified) if the first is rejected. A rejection of all
-spellings becomes a `setup_warnings` entry saying long outputs may stall.
+(`term more dis`, field-verified) if the first fails — whether the failure is a
+rejection **or** an exception (a `ReadTimeout` on the first spelling recovers
+the channel and still tries the fallback). Only when every spelling has failed
+does a `setup_warnings` entry say long outputs may stall.
 
 No other session-tuning command is sent. VOSS has no `terminal width`, and an
 unknown command desyncs the channel.
 
-### Phase 4 — run commands (`SshRunner.run`, `connection.py:469`)
+### Phase 4 — run commands (`SshRunner.run`, `connection.py:581`)
 
 ```
 if self._dead: raise CommandError("session abandoned")     # circuit breaker
@@ -310,7 +318,7 @@ return output
 
 Four behaviours to keep straight:
 
-* **`_recover_channel()`** (`connection.py:459`) sends `q\n` and drains the
+* **`_recover_channel()`** (`connection.py:571`) sends `q\n` and drains the
   buffer. A `ReadTimeout` is most often a stuck `--More--`; quitting it stops
   the *next* command from being eaten. (`test_stuck_pager_is_quit_after_transport_failure`)
 * **The circuit breaker.** `max_transport_failures` (default 2) *consecutive*
@@ -324,7 +332,7 @@ Four behaviours to keep straight:
 * **Raw capture happens before error detection**, so a rejection is captured
   too and shows up in an offline replay exactly as the device answered.
 
-### `looks_like_error()` — how a rejection is recognised (`connection.py:123`)
+### `looks_like_error()` — how a rejection is recognised (`connection.py:127`)
 
 Two passes, because VOSS makes the naive version wrong:
 
@@ -456,11 +464,61 @@ something.
 
 ---
 
+## 7b. Reaching a switch through a console server
+
+A switch with no management IP (a new leaf before day one, a box whose mgmt
+VLAN died) can be reached through a terminal server. Two pieces, both
+config-driven:
+
+* **`console_server:`** in `config.yaml` → `ConsoleServerSettings`
+  (`config.py`): the terminal server's `host` plus a template for how one
+  console line is addressed — `username_template: "{username}:70{port}"`
+  (Avocent-style, the line rides in the SSH username) or
+  `tcp_port_template: "70{port}"` (OpenGear-style, one SSH TCP port per
+  line). `resolve()` turns (username, line) into the login name and TCP port.
+* **`console: "03"`** on the switch in the inventory → `SwitchTarget.console`.
+
+When both are set, `SshRunner._connect` branches to `_connect_via_console()`
+(`connection.py:466`): SSH to the terminal server with netmiko's
+`generic_termserver` driver, then `_drive_console_login()`
+(`connection.py:507`) answers whatever the switch's serial console shows —
+`login:`/`Username:`, `Password:`, the ERS `Ctrl-Y` gate, a stale session's
+prompt — with the **switch** credentials, and finally netmiko's `redispatch()`
+hands the live channel to the normal platform driver. From there the session
+is indistinguishable from a direct SSH: same privilege check, same paging
+check, same collectors.
+
+Console-server credentials default to the switch credentials; set
+`SM_CONSOLE_USERNAME` / `SM_CONSOLE_PASSWORD` when the terminal server uses
+its own account. A console login that never reaches a prompt raises a
+`ConnectionFailed` naming the console server and line, so a wrong line number
+reads as exactly that.
+
+## 7c. Command overrides and the pre-flight credential check
+
+Two smaller additions that live in this layer:
+
+* **`commands:`** in `config.yaml` remaps command spellings
+  (`'show mlt': 'show mlt all'`). The remap is applied by `BaseRunner._map()`
+  at the choke point, so the live runner, `--save-raw` capture filenames,
+  `--offline` replay and `--dry-run` all see the same overridden spelling.
+  Replacements are validated at config load: anything not starting with
+  `show`/`terminal`/`term`/`enable` is rejected, so the read-only claim
+  survives user configuration.
+* **`quick_auth_check()`** (`connection.py:703`) opens ONE SSH session to one
+  device, authenticates, and closes — no channel, no command. The interactive
+  menu runs it after credentials are entered and before the parallel
+  collection, so wrong credentials fail in seconds and can be corrected on
+  the spot instead of costing `workers × read_timeout` (and are still never
+  blindly retried — re-entry is a human decision, three attempts at most).
+
+---
+
 ## 8. Errors: taxonomy, message shape, and where each one surfaces
 
 ### The failure message is deliberately built, not just re-raised
 
-`_fail()` (`connection.py:434`) and `_clean_reason()` (`connection.py:451`)
+`_fail()` (`connection.py:546`) and `_clean_reason()` (`connection.py:563`)
 exist because the raw exceptions are unusable in a report:
 
 * a device's login banner/MOTD is verbose and, across a wall of dead switches,
@@ -486,7 +544,7 @@ exist because the raw exceptions are unusable in a report:
 | required command failed | `errors[]` | Issues | per-command `ok: false` | data-completeness findings | 1 |
 | optional command failed | `warnings[]` | Issues | per-command `ok: false` | — | 0 |
 | `absent_ok` command failed | *nothing* | — | per-command `ok: false` | — | 0 |
-| session abandoned | `errors[]` per remaining command | Issues | commands marked failed | — | 1 |
+| session abandoned | `errors[]`/`warnings[]` per remaining command, by its `required` flag (`absent_ok` commands: log line only) | Issues | skipped commands are **absent** — `run()` raises before `_log_start`, so they never enter `command_log` | — | 1 |
 
 `setup_warnings` reach the audit through one line in
 `collectors/switch.py:37`:
@@ -541,7 +599,8 @@ an opaque paramiko error per device.
 Never in a config file. `get_credentials()` (`config.py`) resolves in order:
 
 1. `SM_USERNAME` / `SM_PASSWORD` (switches), `SM_DVR_USERNAME` /
-   `SM_DVR_PASSWORD` (DvR controllers);
+   `SM_DVR_PASSWORD` (DvR controllers), `SM_CONSOLE_USERNAME` /
+   `SM_CONSOLE_PASSWORD` (terminal server, when it has its own account);
 2. a fallback (DvR sessions reuse the switch credentials when no DvR-specific
    pair is set);
 3. an interactive prompt — and if there is no TTY, a `ConfigError` that names
@@ -636,7 +695,7 @@ collector test in `tests/` already does.
 switch-migrator -s old-access-07:ers:10.1.1.17 --debug
 ```
 `--debug` lowers the stderr handler to DEBUG and stops silencing the `paramiko`
-and `netmiko` loggers (`setup_logging`, `cli.py:189`).
+and `netmiko` loggers (`setup_logging`, `cli.py:201`).
 
 ---
 
@@ -673,11 +732,11 @@ half-done platform leaves broken.
    whether `looks_like_error`'s markers cover this CLI's rejection wording.
 6. `collectors/switch.py:38`: **convert the `if VOSS / else ERS` into explicit
    dispatch** and add `_collect_<platform>`. Do the same at
-   `_collect_fdb` (`:219`), which is also written as "not VOSS → ERS".
+   `_collect_fdb` (`:208`), which is also written as "not VOSS → ERS".
 7. `parsers/<platform>_parsers.py`, reusing `parsers/common.py`
    (`expand_port_list`, `parse_mac_table`, `normalize_mac`, LLDP parsers) —
    those are already cross-platform.
-8. Decide the LLDP command order for it (`_enrich`, `:385`).
+8. Decide the LLDP command order for it (`_enrich`, `:389`).
 9. `compare.py`: does it have an I-SID concept? The VOSS-only branches at
    `:74` and `:129` decide `LOCAL_ONLY` vs `MISSING_ON_DVR`.
 10. `config_extract` / `config_generate` / `report/migration.py:205`: what does
@@ -710,7 +769,9 @@ Each of these exists because of a real failure, and most are pinned by a test.
 5. **Keep `fast_cli=False`.** Old ERS gear chokes on netmiko's fast path.
 6. **Never send anything but `show`, `enable` and the paging command.** The
    read-only claim is the tool's licence to run in a change window, and
-   `--dry-run` publishes the full list.
+   `--dry-run` publishes the full command list (`enable` and every paging
+   spelling included; the only write it cannot show is `_recover_channel`'s
+   `q` keystroke, which is pager recovery, not a command).
 7. **Never record writes in the session log** (`session_log_record_writes=False`)
    — the password is a write.
 8. **Never put a device banner in the report.** Log it; put a one-line
@@ -747,6 +808,8 @@ Each of these exists because of a real failure, and most are pinned by a test.
 | legacy SSH | `test_enable_legacy_ssh_algorithms`, `..._appended_not_prepended`, `..._is_idempotent`, `test_paramiko_pin_still_excludes_the_release_that_dropped_ssh_dss`, `test_installed_paramiko_supports_ers_host_keys` |
 | ERS login | `test_patient_ers_special_login_presses_ctrl_y`, `test_patient_ers_class_retries_then_succeeds`, `..._gives_up_and_reraises` |
 | error messages | `test_fail_keeps_banner_out_of_report_but_logs_it`, `test_fail_no_hint_and_no_banner_when_device_silent`, `test_clean_reason_takes_only_the_first_line` |
+| command overrides | `test_command_overrides_apply_at_the_runner_choke_point`, `test_dry_run_runner_publishes_the_overridden_spelling` |
+| console server | `test_console_server_resolution_is_template_driven`, `test_drive_console_login_answers_the_switch_login`, `..._gives_up_with_a_named_error` |
 
 The pattern for testing `SshRunner` without a device is
 `object.__new__(SshRunner)` plus a `_FakeConn` exposing `send_command`,
@@ -754,8 +817,9 @@ The pattern for testing `SshRunner` without a device is
 constructed, so `__init__`'s connect is never reached. Reuse `_make_runner()`
 rather than inventing a second double.
 
-Everything else in `tests/` uses `OfflineRunner` against fixtures, so the whole
-suite runs with no network and no device.
+The collector and end-to-end tests in `tests/` use `OfflineRunner` against
+fixtures, and the parser tests feed captured text straight to the parsers — so
+the whole suite runs with no network and no device.
 
 ```bash
 pip install -e '.[dev]'

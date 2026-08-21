@@ -161,3 +161,31 @@ ssh:
   # paramiko's: kex / ciphers / keys (host keys).
   # disabled_algorithms:
   #   kex: ["curve25519-sha256", "curve25519-sha256@libssh.org"]
+
+# --- Default inventory --------------------------------------------------------
+# Used when no -i is given (a ./switches.yaml is picked up even without this).
+# Relative paths are resolved against THIS file's directory.
+# inventory: switches.yaml
+
+# --- Command overrides --------------------------------------------------------
+# Change the spelling of any command the tool sends, without touching code -
+# e.g. a release that wants 'show mlt all'. Applied at the runner, so
+# --dry-run, --save-raw and --offline all see the same overridden spelling.
+# Replacements must stay read-only (show/terminal/term/enable) - anything else
+# is rejected at load time.
+# commands:
+#   "show mlt": "show mlt all"
+
+# --- Console server (terminal server) ----------------------------------------
+# Reach switches that have no management IP (yet) through a terminal server:
+# SSH to the console server, land on the switch's serial console, log in there
+# and collect as usual. Which line a switch hangs off is the per-switch
+# `console:` field in the inventory.
+#
+# Two template flavors ({port} = the switch's console line, {username} = the
+# login name). Console-server credentials default to the switch credentials;
+# set SM_CONSOLE_USERNAME / SM_CONSOLE_PASSWORD if they differ.
+# console_server:
+#   host: tsserver
+#   username_template: "{username}:70{port}"    # Avocent-style
+#   # tcp_port_template: "70{port}"             # OpenGear-style (TCP port per line)

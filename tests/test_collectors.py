@@ -152,3 +152,23 @@ def test_missing_media_table_is_not_reported_as_a_failure(tmp_path: Path,
     assert audit.ports
     assert not any("gigabitEthernet interface" in w for w in audit.warnings)
     assert not audit.errors
+
+
+def test_counter_sections_do_not_reset_has_traffic(tmp_path, cfg):
+    """`show int gig statistics` prints several sections (traffic, errors) and
+    a port appears in each; an all-zero error row must not overwrite a
+    non-zero traffic row - that misclassifies a formerly-active port as
+    UNUSED and drops it from the commands file."""
+    d = tmp_path / "sw1"
+    shutil.copytree(FIXTURES / "voss", d)
+    (d / "show_interfaces_gigabitethernet_statistics.txt").write_text(
+        "Port Stats Interface\n"
+        "PORT_NUM IN_OCTETS OUT_OCTETS\n"
+        "1/1 123456 654321\n"
+        "Port Stats Interface Error\n"
+        "PORT_NUM IN_ERROR OUT_ERROR\n"
+        "1/1 0 0\n")
+    audit = collect_switch(SwitchTarget("sw1", "sw1", Platform.VOSS),
+                           OfflineRunner("sw1", tmp_path), cfg, pull_macs=True)
+    port = next(p for p in audit.ports if p.port == "1/1")
+    assert port.has_traffic is True

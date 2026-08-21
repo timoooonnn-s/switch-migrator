@@ -88,3 +88,16 @@ def test_expand_port_list():
     assert expand_port_list("49-50") == ["49", "50"]
     assert expand_port_list("NONE") == []
     assert expand_port_list("2/1/1") == ["2/1/1"]
+
+
+def test_parse_mlt_digit_shaped_name_is_not_read_as_members():
+    # a trunk literally named '7' must not have its NAME column mistaken for
+    # the members column (STATUS at index 4 would put members three back = name)
+    out = ("Id Name Members Bpdu Mode Status Type\n"
+           "-- ---- ------- ---- ---- ------ ----\n"
+           "4  7    NONE    All  Basic Enabled Trunk\n")
+    mlts = ers_parsers.parse_mlt(out)
+    assert len(mlts) == 1
+    assert mlts[0].mlt_id == 4
+    assert mlts[0].name == "7"
+    assert mlts[0].members == []

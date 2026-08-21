@@ -222,3 +222,24 @@ def test_the_check_sends_no_commands():
     source = inspect.getsource(health)
     assert "runner" not in source.lower()
     assert "show " not in source
+
+
+def test_degraded_ports_are_found_without_the_usage_classification():
+    """--health-check on its own pulls no MACs, so p.usage stays empty; the
+    check must then derive 'down member of a forwarding MLT' directly instead
+    of silently checking nothing."""
+    a = _audit()
+    a.ports += [PortState(port="1/9", oper_up=False, mlt_id=35)]
+    a.mlts = [MltState(mlt_id=35, name="srv-lag", members=["1/2", "1/9"],
+                       in_datapath=True)]
+    finding = _findings(health.check([a]), "degraded ports")[0]
+    assert finding.verdict == health.WARN
+    assert "1/9" in finding.detail
+
+
+def test_no_degraded_finding_for_a_down_port_of_a_dead_mlt_without_usage():
+    a = _audit()
+    a.ports += [PortState(port="1/9", oper_up=False, mlt_id=35)]
+    a.mlts = [MltState(mlt_id=35, name="srv-lag", members=["1/9"],
+                       in_datapath=False)]
+    assert _findings(health.check([a]), "degraded ports") == []

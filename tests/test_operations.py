@@ -33,16 +33,19 @@ def test_dry_run_lists_commands_without_connecting(cfg):
         [SwitchTarget("gx-01", "10.0.0.1", Platform.VOSS),
          SwitchTarget("ers-01", "10.0.0.2", Platform.ERS)], cfg, args)
     voss, ers = preview["gx-01"], preview["ers-01"]
-    # the paging setting plus the reads the collector really performs
-    assert voss[0] == "terminal more disable"
+    # session setup first - 'enable' and EVERY paging spelling (fallbacks
+    # included; the list is the full honest answer) - then the real reads
+    assert voss[:3] == ["enable", "terminal more disable", "term more dis"]
     assert "show mlt" in voss and "show vlan i-sid" in voss
-    assert ers[0] == "terminal length 0"
+    assert ers[:2] == ["enable", "terminal length 0"]
     assert "show mac-address-table" in ers          # ERS FDB command
     assert "show interfaces gigabitEthernet fdb-entry" in voss   # VOSS FDB command
-    # read-only is the claim the preview exists to support
+    # read-only is the claim the preview exists to support: only reads, the
+    # privilege mode switch and terminal-paging settings
     for commands in preview.values():
         for command in commands:
-            assert command.startswith(("show ", "terminal ", "term ")), command
+            assert command == "enable" or \
+                command.startswith(("show ", "terminal ", "term ")), command
 
 
 def test_dry_run_covers_both_port_state_variants(cfg):
@@ -270,8 +273,8 @@ def test_dry_run_runner_answers_everything_with_nothing():
     runner = DryRunRunner("sw", Platform.VOSS)
     assert runner.run("show mlt") == ""
     assert runner.run("show vlan i-sid") == ""
-    assert runner.commands == ["terminal more disable", "show mlt",
-                               "show vlan i-sid"]
+    assert runner.commands == ["enable", "terminal more disable",
+                               "term more dis", "show mlt", "show vlan i-sid"]
     assert all(r.ok for r in runner.command_log)
 
 
@@ -390,3 +393,26 @@ def test_excel_tab_names_survive_long_and_illegal_location_names(tmp_path):
     for title in titles:
         assert len(title) <= 31
         assert not set(title) & set("[]:*?/\\")
+
+
+def test_cli_profile_supplies_inventory_and_settings(tmp_path, capsys):
+    """--profile fills in what the command line left at defaults."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("excluded_vlans: [1]\n")
+    inv = tmp_path / "inv.yaml"
+    inv.write_text("switches:\n  - name: gx-01\n    platform: voss\n")
+    profs = tmp_path / "profiles.yaml"
+    profs.write_text(f"profiles:\n  site-a:\n    inventory: {inv}\n")
+    code = main(["-c", str(cfg_path), "-o", str(tmp_path / "out"),
+                 "--profiles-file", str(profs), "--profile", "site-a",
+                 "--no-fabric", "--dry-run"])
+    assert code == 0
+
+
+def test_cli_unknown_profile_is_a_config_error(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("excluded_vlans: [1]\n")
+    code = main(["-c", str(cfg_path), "-o", str(tmp_path / "out"),
+                 "--profiles-file", str(tmp_path / "profiles.yaml"),
+                 "--profile", "nope", "--no-fabric", "--dry-run"])
+    assert code == 2

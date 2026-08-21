@@ -199,14 +199,17 @@ def _build_row(mapping: dict[str, str], number: int) -> CablingRow:
 
 
 def _rows_from_csv(path: Path) -> list[tuple[str, list[list]]]:
-    with path.open(newline="") as fh:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         return [(path.name, [row for row in csv.reader(fh)])]
 
 
 def _looks_like_cabling(rows: list[list]) -> bool:
-    for row in rows[:1]:
-        if any(_key(c) == "oldport" for c in row):
-            return True
+    # the header is the first NON-EMPTY row - _parse_table drops blank rows
+    # too, so a sheet with a leading blank row must not silently vanish here
+    for row in rows:
+        if not any(_cell(c) for c in row):
+            continue
+        return any(_key(c) == "oldport" for c in row)
     return False
 
 

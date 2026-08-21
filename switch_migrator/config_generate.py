@@ -147,8 +147,12 @@ def generate_voss_from_ers(ers: ErsModel, cfg: Config,
         if not low and not high:
             continue  # VLAN lives only on the uplink -> carried by the fabric
 
+        # untagged-traffic only for a genuine access port: PVID matches AND the
+        # port is not an 802.1Q trunk ('tagging tagAll'). On a trunk the PVID
+        # VLAN still egresses tagged, so it must stay a c-vid.
         untagged = [p for p in low
-                    if p in ers.ports and ers.ports[p].pvid == vid]
+                    if p in ers.ports and ers.ports[p].pvid == vid
+                    and not ers.ports[p].tagged]
         tagged = [p for p in low if p not in untagged]
         access_used.update(low)
 

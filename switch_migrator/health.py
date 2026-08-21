@@ -189,8 +189,24 @@ def _check_uplinks(a: SwitchAudit) -> list[Finding]:
 
 
 def _check_degraded_ports(a: SwitchAudit) -> list[Finding]:
-    """Ports the usage classification called out as a fault on a live cable."""
+    """Ports down on a still-forwarding MLT: a fault on a live cable.
+
+    The usage classification marks these DEGRADED, but it only runs when MACs
+    were pulled (--migration-sheets). When it has not run - p.usage is empty on
+    every port - the same rule is applied directly to the port/MLT state here,
+    so a plain --health-check is never a silent no-op.
+    """
     degraded = [p for p in a.ports if p.usage == usage.DEGRADED]
+    if not any(p.usage for p in a.ports):
+        by_mlt = {m.mlt_id: m for m in a.mlts}
+        degraded = []
+        for p in a.ports:
+            if p.oper_up is not False or p.macs or p.mlt_id is None:
+                continue
+            mlt = by_mlt.get(p.mlt_id)
+            if mlt is not None and (mlt.in_datapath is True
+                                    or bool(mlt.members_up)):
+                degraded.append(p)
     if not degraded:
         return []
     listed = ", ".join(p.port for p in degraded[:8])

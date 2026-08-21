@@ -168,3 +168,20 @@ def test_compress_never_bridges_a_range_across_units():
     assert _compress(["1/47", "1/48", "2/1", "2/2"]) == "1/47-1/48,2/1-2/2"
     assert _compress(["3"]) == "1/3"
     assert _compress(["ALL"]) == ""
+
+
+def test_pvid_on_a_tagall_trunk_stays_a_cvid_not_untagged_traffic():
+    """On an ERS trunk ('tagging tagAll') the PVID VLAN still egresses tagged,
+    so the generator must keep it as c-vid - only a genuine access port
+    becomes untagged-traffic."""
+    m = parse_ers_config(
+        "vlan create 100 type port\n"
+        "vlan members 100 5,6\n"
+        "vlan ports 5 tagging tagAll\n"
+        "vlan ports 5 pvid 100\n"
+        "vlan ports 6 pvid 100\n")
+    res = generate_voss_from_ers(m, _cfg(isid_explicit={100: 2500100}))
+    text = res.text
+    assert "untagged-traffic port 1/6" in text          # true access port
+    assert "untagged-traffic port 1/5" not in text      # trunk stays tagged
+    assert "c-vid 100 port 1/5" in text

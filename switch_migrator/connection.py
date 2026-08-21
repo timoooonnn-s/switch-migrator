@@ -20,7 +20,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from switch_migrator.config import Credentials, SshSettings
+from switch_migrator.config import (
+    ConsoleServerSettings,
+    Credentials,
+    SshSettings,
+)
 from switch_migrator.models import Platform
 
 log = logging.getLogger(__name__)
@@ -154,6 +158,13 @@ class BaseRunner:
     # device traffic, so this is the one place that sees every command without
     # threading a callback through every collector.
     on_command: "Callable[[str, str, int], None] | None" = None
+    # per-command spelling overrides (config `commands:`); applied here at the
+    # choke point so collectors, raw capture, dry run and offline replay all
+    # see the SAME remapped spelling. Values are validated read-only at load.
+    command_overrides: dict[str, str] = {}
+
+    def _map(self, command: str) -> str:
+        return self.command_overrides.get(command, command)
 
     def run(self, command: str) -> str:
         raise NotImplementedError
@@ -209,34 +220,38 @@ def _patient_ers_class():
 
     class PatientExtremeErs(ExtremeErsSSH):
         def special_login_handler(self, delay_factor: float = 1.0) -> None:
-            prompt = self.prompt_pattern  # r"(?m:[>#]\s*$)"
-            pattern = (r"(?:sername|ssword|[Cc]trl-?[Yy]|Press [Ee][Nn][Tt][Ee][Rr]"
+            # getattr with defaults: a netmiko layout change that drops either
+            # attribute must degrade (defaults match today's values), not crash
+            # every ERS connect
+            prompt = getattr(self, "prompt_pattern", r"(?m:[>#]\s*$)")
+            enter = getattr(self, "RETURN", "\r")
+            pattern = (r"(?:sername|ssword|[Cc]trl[-\s]?[Yy]|Press [Ee][Nn][Tt][Ee][Rr]"
                        rf"|Menu|{prompt})")
-            self.write_channel(self.RETURN)  # wake boxes that wait for a keystroke
+            self.write_channel(enter)  # wake boxes that wait for a keystroke
             for _ in range(6):
                 try:
                     chunk = self.read_until_pattern(pattern=pattern, read_timeout=6.0)
                 except Exception:  # noqa: BLE001 - silent so far: nudge with Ctrl-Y
                     self.write_channel(_CTRL_Y)
                     time.sleep(0.3 * delay_factor)
-                    self.write_channel(self.RETURN)
+                    self.write_channel(enter)
                     continue
                 if re.search(prompt, chunk):
                     return
-                if re.search(r"[Cc]trl-?[Yy]", chunk):
+                if re.search(r"[Cc]trl[-\s]?[Yy]", chunk):
                     self.write_channel(_CTRL_Y)
                     time.sleep(0.3 * delay_factor)
-                    self.write_channel(self.RETURN)
+                    self.write_channel(enter)
                 elif re.search(r"Press [Ee][Nn][Tt][Ee][Rr]", chunk):
-                    self.write_channel(self.RETURN)
+                    self.write_channel(enter)
                 elif "Menu" in chunk:
                     self.write_channel(_CTRL_C)
                 elif "sername" in chunk:
-                    self.write_channel((self.username or "") + self.RETURN)
+                    self.write_channel((self.username or "") + enter)
                 elif "ssword" in chunk:
-                    self.write_channel((self.password or "") + self.RETURN)
+                    self.write_channel((self.password or "") + enter)
                 else:
-                    self.write_channel(self.RETURN)
+                    self.write_channel(enter)
             # Don't hard-fail: session_preparation() retries prompt detection and
             # raises the friendlier connect error if the box truly won't enter.
 
@@ -253,7 +268,7 @@ def _patient_ers_class():
                         self.clear_buffer()
                         self.write_channel(_CTRL_Y)
                         time.sleep(0.3)
-                        self.write_channel(self.RETURN)
+                        self.write_channel(getattr(self, "RETURN", "\r"))
                         time.sleep(0.5 + attempt * 0.5)
                         self.clear_buffer()
                     except Exception:  # noqa: BLE001 - best-effort re-nudge
@@ -269,12 +284,18 @@ def _patient_ers_class():
 class SshRunner(BaseRunner):
     def __init__(self, name: str, host: str, platform: Platform,
                  creds: Credentials, ssh: SshSettings,
-                 raw_dir: Path | None = None):
+                 raw_dir: Path | None = None,
+                 command_overrides: dict[str, str] | None = None,
+                 console: str = "",
+                 console_server: ConsoleServerSettings | None = None):
         self.name = name
         self.host = host
         self.platform = platform
         self.ssh = ssh
         self.raw_dir = raw_dir
+        self.command_overrides = dict(command_overrides or {})
+        self.console = console
+        self.console_server = console_server
         self.setup_warnings: list[str] = []
         self.command_log: list[CommandRecord] = []
         self._transport_failures = 0
@@ -352,25 +373,24 @@ class SshRunner(BaseRunner):
         is field-verified on VOSS ('term more dis').
         """
         commands = _PAGING_DISABLE[self.platform]
-        detail = ""
+        details: list[str] = []
         for command in commands:
             try:
                 out = self._conn.send_command(command, read_timeout=15)
             except Exception as exc:  # noqa: BLE001 - never fail the whole device here
-                self.setup_warnings.append(
-                    f"could not verify paging disable ('{command}'): "
-                    f"{exc.__class__.__name__}: {exc} - long command outputs may "
-                    f"stall on this device")
-                log.warning("[%s] %s", self.name, self.setup_warnings[-1])
-                return
+                # a timeout on one spelling must not skip the remaining
+                # spellings: recover the channel and try the next form
+                details.append(f"'{command}': {exc.__class__.__name__}: {exc}")
+                self._recover_channel()
+                continue
             if not looks_like_error(out):
                 return  # accepted
-            detail = " | ".join(
+            answer = " | ".join(
                 line.strip() for line in out.splitlines() if line.strip())[:120]
+            details.append(f"device rejected '{command}': {answer}")
         self.setup_warnings.append(
-            f"device rejected '{commands[0]}'"
-            + (f" (and fallback '{commands[-1]}')" if len(commands) > 1 else "")
-            + f": {detail} - long command outputs may stall on this device")
+            "; ".join(details)[:300]
+            + " - long command outputs may stall on this device")
         log.warning("[%s] %s", self.name, self.setup_warnings[-1])
 
     def _connect(self, creds: Credentials):
@@ -413,6 +433,8 @@ class SshRunner(BaseRunner):
             try:
                 log.debug("connecting to %s (%s) as %s, attempt %d",
                           self.name, self.host, creds.username, attempt + 1)
+                if self._via_console:
+                    return self._connect_via_console(creds)
                 if connect_cls is not None:
                     direct = {k: v for k, v in params.items() if k != "device_type"}
                     return connect_cls(**direct)
@@ -420,6 +442,9 @@ class SshRunner(BaseRunner):
             except NetmikoAuthenticationException as exc:
                 # never retry auth failures - avoids account lockouts
                 raise self._fail(exc, "authentication failed") from exc
+            except ConnectionFailed:
+                # already a finished, named failure (console-login gave up)
+                raise
             except (NetmikoTimeoutException, OSError) as exc:
                 last_exc = exc
                 if attempt < self.ssh.retries:
@@ -430,6 +455,93 @@ class SshRunner(BaseRunner):
                 # ReadTimeout (prompt not found) also lands here.
                 raise self._fail(exc) from exc
         raise self._fail(last_exc) from last_exc
+
+    @property
+    def _via_console(self) -> bool:
+        """Route through the terminal server? Needs both halves: the switch's
+        console line AND the config's console_server section."""
+        return bool(self.console and self.console_server
+                    and self.console_server.configured)
+
+    def _connect_via_console(self, creds: Credentials):
+        """SSH to the terminal server, land on the switch's serial console,
+        drive the switch's own console login, then hand the session to the
+        platform's netmiko driver (redispatch).
+
+        The terminal-server login itself is shaped by the config's templates
+        (Avocent-style user:70NN usernames, or a TCP port per line) - see
+        ConsoleServerSettings. Console-server credentials come from
+        SM_CONSOLE_USERNAME/SM_CONSOLE_PASSWORD when set, else the switch
+        credentials are reused for both hops.
+        """
+        import os
+
+        from netmiko import ConnectHandler, redispatch
+
+        cs = self.console_server
+        cs_user = os.environ.get("SM_CONSOLE_USERNAME") or creds.username
+        cs_pass = os.environ.get("SM_CONSOLE_PASSWORD") or creds.password
+        username, port = cs.resolve(cs_user, self.console)
+        log.debug("[%s] via console server %s port %s as %s (line %s)",
+                  self.name, cs.host, port, username, self.console)
+        conn = ConnectHandler(
+            device_type=cs.device_type, host=cs.host, port=port,
+            username=username, password=cs_pass,
+            conn_timeout=self.ssh.conn_timeout,
+            banner_timeout=max(15, self.ssh.conn_timeout),
+            auth_timeout=max(15, self.ssh.conn_timeout),
+            session_log=self._session_log,
+            session_log_record_writes=False,
+        )
+        try:
+            self._drive_console_login(conn, creds)
+            redispatch(conn, device_type=NETMIKO_DEVICE_TYPE[self.platform])
+        except Exception:
+            try:
+                conn.disconnect()
+            except Exception:  # noqa: BLE001 - best effort on a failed hop
+                pass
+            raise
+        return conn
+
+    def _drive_console_login(self, conn, creds: Credentials) -> None:
+        """A serial console shows the switch's own login (or ERS's Ctrl-Y
+        gate, or a stale session's prompt) - answer whatever appears until a
+        CLI prompt is reached."""
+        prompt = r"[>#]\s*$"
+        pattern = (r"(?:sername|ogin|ssword|[Cc]trl[-\s]?[Yy]"
+                   r"|Press [Ee][Nn][Tt][Ee][Rr]|Menu|[>#]\s*$)")
+        conn.write_channel("\r\n")     # wake the line; consoles are silent
+        for _ in range(10):
+            try:
+                chunk = conn.read_until_pattern(pattern=pattern,
+                                                read_timeout=8.0)
+            except Exception:  # noqa: BLE001 - still silent: nudge again
+                conn.write_channel(_CTRL_Y)
+                time.sleep(0.3)
+                conn.write_channel("\r\n")
+                continue
+            # a chunk ENDING in a prompt is the goal, whatever banner text
+            # (e.g. 'Last login: ...') came along with it - check it first
+            if re.search(prompt, chunk):
+                return
+            if re.search(r"[Cc]trl[-\s]?[Yy]", chunk):
+                conn.write_channel(_CTRL_Y)
+                time.sleep(0.3)
+                conn.write_channel("\r\n")
+            elif re.search(r"sername|ogin", chunk):
+                conn.write_channel(creds.username + "\n")
+            elif "ssword" in chunk:
+                conn.write_channel(creds.password + "\n")
+            elif "Menu" in chunk:
+                conn.write_channel(_CTRL_C)
+            else:
+                conn.write_channel("\r\n")
+        raise ConnectionFailed(
+            f"{self.name}: connected to console server "
+            f"{self.console_server.host} (line {self.console}) but never "
+            f"reached a switch CLI prompt - is the line number right and the "
+            f"switch console alive?")
 
     def _fail(self, exc: Exception, note: str = "") -> "ConnectionFailed":
         """Build a CONCISE, one-line connect failure. The device's login banner
@@ -467,6 +579,7 @@ class SshRunner(BaseRunner):
             pass
 
     def run(self, command: str) -> str:
+        command = self._map(command)
         if self._dead:
             raise CommandError(
                 command, "(skipped: session abandoned after repeated transport failures)")
@@ -503,8 +616,12 @@ class SshRunner(BaseRunner):
             break
         self._transport_failures = 0
         if self.raw_dir is not None:
+            # explicit encoding: the default is locale-dependent, and a
+            # UnicodeEncodeError here is not a CommandError - it would escalate
+            # to 'collection crashed' for the whole device
             self.raw_dir.mkdir(parents=True, exist_ok=True)
-            (self.raw_dir / f"{command_slug(command)}.txt").write_text(output)
+            (self.raw_dir / f"{command_slug(command)}.txt").write_text(
+                output, encoding="utf-8")
         if looks_like_error(output):
             self._log_end(command, started, False, attempts, "device rejected")
             raise CommandError(command, output)
@@ -521,21 +638,26 @@ class SshRunner(BaseRunner):
 class OfflineRunner(BaseRunner):
     """Replays command output from <raw_root>/<device_name>/<command_slug>.txt."""
 
-    def __init__(self, name: str, raw_root: Path):
+    def __init__(self, name: str, raw_root: Path,
+                 command_overrides: dict[str, str] | None = None):
         self.name = name
         self.setup_warnings: list[str] = []
         self.command_log: list[CommandRecord] = []
+        self.command_overrides = dict(command_overrides or {})
         self.device_dir = raw_root / name
         if not self.device_dir.is_dir():
             raise ConnectionFailed(f"{name}: no raw capture directory at {self.device_dir}")
 
     def run(self, command: str) -> str:
+        # same remap as live: a capture saved under an overridden spelling
+        # replays under that same spelling
+        command = self._map(command)
         started = self._log_start(command)
         path = self.device_dir / f"{command_slug(command)}.txt"
         if not path.is_file():
             self._log_end(command, started, False, error="no capture file")
             raise CommandError(command, f"(offline) no capture file {path}")
-        output = path.read_text()
+        output = path.read_text(encoding="utf-8", errors="replace")
         if looks_like_error(output):
             self._log_end(command, started, False, error="device rejected")
             raise CommandError(command, output)
@@ -554,15 +676,58 @@ class DryRunRunner(BaseRunner):
     cannot drift away from what the tool actually does.
     """
 
-    def __init__(self, name: str, platform: Platform):
+    def __init__(self, name: str, platform: Platform,
+                 command_overrides: dict[str, str] | None = None):
         self.name = name
         self.platform = platform
         self.setup_warnings: list[str] = []
         self.command_log: list[CommandRecord] = []
-        self.commands: list[str] = list(_PAGING_DISABLE[platform][:1])
+        self.command_overrides = dict(command_overrides or {})
+        # seed the session-setup commands a live run could send: 'enable' (the
+        # privilege mode switch) and EVERY paging-disable spelling, fallbacks
+        # included - the list must be the complete honest answer, not the happy
+        # path's subset
+        self.commands: list[str] = [
+            self._map(c) for c in ("enable", *_PAGING_DISABLE[platform])]
 
     def run(self, command: str) -> str:
+        # the remap applies here too, so --dry-run publishes the overridden
+        # spellings the live run would really send
+        command = self._map(command)
         started = self._log_start(command)
         self.commands.append(command)
         self._log_end(command, started, True)
         return ""
+
+
+def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | None:
+    """One fast SSH authentication against one device, before the real run.
+
+    Wrong credentials against a whole inventory cost `workers x read_timeout`
+    of waiting (and, worse, a lockout on every box at once). This opens a
+    single SSH session, authenticates, and closes - no channel, no command.
+    Returns None when the login worked, 'auth' when the device refused the
+    credentials, or a short reason string for any other failure (unreachable,
+    algorithm mismatch, ...), which is NOT proof the credentials are wrong.
+    """
+    import paramiko
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(host, username=creds.username, password=creds.password,
+                       timeout=ssh.conn_timeout,
+                       banner_timeout=max(15, ssh.conn_timeout),
+                       auth_timeout=max(15, ssh.conn_timeout),
+                       allow_agent=False, look_for_keys=False)
+        return None
+    except paramiko.AuthenticationException:
+        return "auth"
+    except Exception as exc:  # noqa: BLE001 - reachability, algorithms, ...
+        first = str(exc).splitlines()[0] if str(exc) else ""
+        return f"{exc.__class__.__name__}: {first}"
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass

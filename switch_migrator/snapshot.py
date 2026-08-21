@@ -82,7 +82,8 @@ def to_dict(audits: list[SwitchAudit], fabric: FabricState,
 def save(path: Path, audits: list[SwitchAudit], fabric: FabricState,
          meta: dict | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(to_dict(audits, fabric, meta), indent=2))
+    path.write_text(json.dumps(to_dict(audits, fabric, meta), indent=2),
+                    encoding="utf-8")
     return path
 
 
@@ -155,7 +156,7 @@ def _fabric_from(data: dict) -> FabricState:
 def load(path: Path) -> tuple[list[SwitchAudit], FabricState, dict]:
     """Read a snapshot -> (audits, fabric, meta). Raises SnapshotError."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise SnapshotError(f"snapshot not found: {path}") from None
     except json.JSONDecodeError as exc:

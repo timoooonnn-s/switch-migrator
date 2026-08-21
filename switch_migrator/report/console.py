@@ -10,7 +10,13 @@ from switch_migrator.report.tables import Table
 _STYLES = {"ok": "green", "warn": "yellow", "error": "bold red", None: ""}
 
 # tables whose whole point is the exported file, not the terminal
-_FILE_ONLY = ("Ports", "MLTs", "Fabric I-SIDs", "Port Info", "Cabling")
+_FILE_ONLY = ("Ports", "MLTs", "Fabric I-SIDs", "Port Info")
+
+
+def _file_only(title: str) -> bool:
+    # the per-location cabling sheets are titled 'Cabling <group>'
+    # (--split-by-location), so the whole family is matched by prefix
+    return title in _FILE_ONLY or title.startswith("Cabling")
 
 
 def render(tables: list[Table], console: Console | None = None,
@@ -21,7 +27,7 @@ def render(tables: list[Table], console: Console | None = None,
         # unless -v is given. The two migration sheets are here for the same
         # reason as Ports/MLTs - they are made to be printed and filled in, not
         # read in a shell.
-        if not verbose and table.title in _FILE_ONLY:
+        if not verbose and _file_only(table.title):
             continue
         if not table.rows:
             if table.title == "Issues":

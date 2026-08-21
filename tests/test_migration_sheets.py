@@ -320,3 +320,21 @@ def test_cabling_sheet_has_new_mlt_placeholders():
     for col in ("NEW switch", "NEW port", "NEW MLT ID", "NEW MLT name", "NEW VLAN"):
         assert col in hdr, col
         assert all(r[hdr.index(col)] == "" for r in t.rows), f"{col} must be blank"
+
+
+def test_per_location_cabling_sheets_stay_out_of_the_console():
+    """--split-by-location titles the sheets 'Cabling <group>'; without -v the
+    21-column fill-in sheets must not be dumped to the terminal."""
+    import io
+    from rich.console import Console
+    from switch_migrator.report import console as console_report
+    from switch_migrator.report.tables import Table
+
+    t = Table("Cabling Frankfurt", ["A"])
+    t.add(["x"])
+    buf = io.StringIO()
+    console_report.render([t], Console(file=buf, width=100), verbose=False)
+    assert buf.getvalue() == ""            # file-only without -v
+    buf = io.StringIO()
+    console_report.render([t], Console(file=buf, width=100), verbose=True)
+    assert "x" in buf.getvalue()           # -v shows it

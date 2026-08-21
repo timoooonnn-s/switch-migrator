@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,7 @@ from switch_migrator.config import (
     ConfigError,
     Credentials,
     SwitchTarget,
+    default_inventory,
     load_config,
     load_inventory,
     parse_switch_arg,
@@ -34,6 +37,7 @@ from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator import health as health_mod
 from switch_migrator import location as location_mod
 from switch_migrator import manifest as manifest_mod
+from switch_migrator import profiles as profiles_mod
 from switch_migrator import snapshot as snapshot_mod
 from switch_migrator.report.progress import make_progress
 
@@ -50,9 +54,14 @@ class Session:
     offline_dir: Path | None = None
     save_raw: bool = False
     write_manifest: bool = False
+    # crash insurance: persist every collection to a timestamped snapshot
+    # right away, so nothing ever has to be re-collected after a crash
+    auto_snapshot: bool = True
     split_by_location: bool = False
     location_groups: dict = field(default_factory=dict)
     new_switch: str = ""
+    profiles_path: Path = field(
+        default_factory=lambda: profiles_mod.DEFAULT_FILE)
     # collected data
     audits: list[SwitchAudit] = field(default_factory=list)
     fabric: FabricState | None = None
@@ -92,12 +101,61 @@ class Session:
         return argparse.Namespace(**base)
 
 
-def _ask(console: Console, prompt: str, default: str = "") -> str:
+class Abort(Exception):
+    """The user typed 'x' (or pressed Ctrl-C) at a prompt: abandon the current
+    action immediately and fall back to the main menu. Every prompt honours
+    it, so any process can be aborted at any state."""
+
+
+@contextmanager
+def _path_completion():
+    """Readline tab-completion for filesystem paths, active only around a
+    path prompt. Degrades to nothing where readline is unavailable."""
+    try:
+        import glob
+        import readline
+    except ImportError:                     # e.g. Windows without pyreadline3
+        yield
+        return
+
+    def complete(text: str, state: int):
+        expanded = os.path.expanduser(text)
+        matches = sorted(glob.glob(expanded + "*"))
+        matches = [m + os.sep if os.path.isdir(m) else m for m in matches]
+        return matches[state] if state < len(matches) else None
+
+    old_completer = readline.get_completer()
+    old_delims = readline.get_completer_delims()
+    readline.set_completer(complete)
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("tab: complete")
+    try:
+        yield
+    finally:
+        readline.set_completer(old_completer)
+        readline.set_completer_delims(old_delims)
+
+
+def _ask(console: Console, prompt: str, default: str = "",
+         path: bool = False) -> str:
+    """One prompt. Blank returns the default; 'x' aborts the whole action
+    (Abort); EOF (closed stdin / exhausted test script) reads as blank.
+    path=True turns on tab-completion for filesystem paths."""
     suffix = f" [{default}]" if default else ""
     try:
-        raw = console.input(f"[bold cyan]{prompt}{suffix}:[/bold cyan] ").strip()
-    except (EOFError, KeyboardInterrupt):
+        if path:
+            with _path_completion():
+                raw = console.input(
+                    f"[bold cyan]{prompt}{suffix}:[/bold cyan] ").strip()
+        else:
+            raw = console.input(
+                f"[bold cyan]{prompt}{suffix}:[/bold cyan] ").strip()
+    except EOFError:
         return ""
+    except KeyboardInterrupt:
+        raise Abort() from None
+    if raw.lower() == "x":
+        raise Abort()
     return raw or default
 
 
@@ -150,7 +208,8 @@ _ENTRIES = [
     ("h", "Health check", "go/no-go before the window: what is already broken?"),
     ("m", "Generate MLT blocks", "new switches' MLT config from a filled-in cabling sheet"),
     ("v", "Verify migration", "after the window: check every re-patched link"),
-    ("s", "Settings", "output directory, offline replay, manifest, target switch"),
+    ("p", "Profiles", "load or save a named scenario (inventory + settings)"),
+    ("s", "Settings", "change one setting at a time; nothing else is touched"),
     ("0", "Quit", ""),
 ]
 
@@ -179,7 +238,8 @@ def action_select(s: Session, console: Console) -> None:
         except ConfigError as exc:
             console.print(f"[red]{exc}[/red]")
     if not s.all_targets:
-        path = _ask(console, "Inventory YAML path (blank to add switches by hand)")
+        path = _ask(console, "Inventory YAML path (blank to add switches by hand)",
+                    path=True)
         if path:
             try:
                 s.inventory_path = Path(path)
@@ -230,6 +290,48 @@ def action_select(s: Session, console: Console) -> None:
     console.print(f"[green]{len(s.selected)} switch(es) selected.[/green]")
 
 
+def _preflight_credentials(s: Session, console: Console, creds):
+    """One quick SSH login against one device BEFORE the full run, so wrong
+    credentials fail in seconds instead of a read_timeout per device - and can
+    be re-entered on the spot. Returns the (possibly corrected) credentials,
+    or None to abort the collection."""
+    from switch_migrator.connection import quick_auth_check
+
+    if s.offline_dir is not None:
+        return creds                    # replay: nothing to authenticate
+    # console-routed switches authenticate differently; probe a plain one
+    probe = next((t for t in s.selected if not getattr(t, "console", "")), None)
+    if probe is None:
+        return creds
+    for _ in range(3):
+        console.print(f"[dim]Checking credentials against {probe.name} "
+                      f"({probe.host})...[/dim]")
+        result = quick_auth_check(probe.host, creds, s.cfg.ssh)
+        if result is None:
+            console.print("[green]Credentials OK.[/green]")
+            return creds
+        if result != "auth":
+            # unreachable / algorithm trouble is not proof the creds are wrong
+            console.print(f"[yellow]Could not verify credentials against "
+                          f"{probe.name}: {result}[/yellow]")
+            if _yes(console, "Continue with the collection anyway?"):
+                return creds
+            return None
+        console.print(f"[red]{probe.name} refused the credentials.[/red]")
+        user = _ask(console, "Username", creds.username)
+        try:
+            pw = console.input("[bold cyan]Password:[/bold cyan] ",
+                               password=True)
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not user or not pw:
+            return None
+        creds = Credentials(user, pw)
+    console.print("[red]Still refused after 3 attempts - aborting the "
+                  "collection (no lockout risk taken).[/red]")
+    return None
+
+
 def action_collect(s: Session, console: Console, creds_fn) -> None:
     from switch_migrator.cli import collect_fabric, run_collection
 
@@ -245,6 +347,14 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     creds, dvr_creds = creds_fn(s, console)
     if creds is None:
         return
+    checked = _preflight_credentials(s, console, creds)
+    if checked is None:
+        return
+    if dvr_creds is creds:
+        # the DvR sessions were reusing the switch credentials - keep them in
+        # step when the pre-flight corrected those
+        dvr_creds = checked
+    creds = checked
 
     args = s.to_args(no_fabric=not want_fabric, extract_config=want_config,
                      migration_sheets=want_macs)
@@ -284,6 +394,17 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
         if not a.reachable:
             console.print(f"  [red]UNREACHABLE {a.name}: "
                           f"{a.errors[-1] if a.errors else 'unknown'}[/red]")
+    if s.auto_snapshot and s.audits:
+        # crash insurance: the expensive part is now on disk, timestamped;
+        # option 8 lists these for one-keystroke reload
+        path = (s.output_dir / "snapshots"
+                / f"snapshot-{started.strftime('%Y%m%d-%H%M%S')}.json")
+        try:
+            snapshot_mod.save(path, s.audits, s.fabric or FabricState(),
+                              meta=_snapshot_meta(s))
+            console.print(f"[dim]Auto-saved snapshot: {path}[/dim]")
+        except OSError as exc:
+            console.print(f"[yellow]could not auto-save a snapshot: {exc}[/yellow]")
     if s.write_manifest:
         s.output_dir.mkdir(parents=True, exist_ok=True)
         path = manifest_mod.write(
@@ -330,7 +451,8 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     write_excel(tables, written[0])
     if migration_sheets:
         cmd = s.output_dir / f"migration-commands-{stamp}.txt"
-        cmd.write_text(build_commands(s.audits, new_switch=s.new_switch))
+        cmd.write_text(build_commands(s.audits, new_switch=s.new_switch),
+                       encoding="utf-8")
         written.append(cmd)
     if extract_config:
         written += _write_config_extracts(s.audits, s.output_dir, comparisons,
@@ -387,6 +509,25 @@ def action_everything(s: Session, console: Console) -> None:
                    title="migration-full")
 
 
+def _snapshot_meta(s: Session) -> dict:
+    return {"collected_at": s.collected_at.isoformat(timespec="seconds")
+            if s.collected_at else "",
+            "config": str(s.config_path),
+            "no_fabric": not s.collected_fabric,
+            "has_running_config": s.collected_config,
+            "has_macs": s.collected_macs}
+
+
+def _find_snapshots(s: Session) -> list[Path]:
+    """Snapshot files this session's output would hold, newest first - the
+    timestamped names sort chronologically."""
+    found: set[Path] = set()
+    for where in (s.output_dir, s.output_dir / "snapshots"):
+        if where.is_dir():
+            found.update(p for p in where.glob("snapshot-*.json") if p.is_file())
+    return sorted(found, key=lambda p: p.name, reverse=True)
+
+
 def action_snapshot(s: Session, console: Console) -> None:
     """Save the session's collected state, or load an earlier one.
 
@@ -404,17 +545,12 @@ def action_snapshot(s: Session, console: Console) -> None:
         choice = "2"
 
     if choice == "1":
-        default = str(s.output_dir / f"snapshot-{stamp}.json")
-        path = Path(_ask(console, "Snapshot file", default))
+        default = str(s.output_dir / "snapshots" / f"snapshot-{stamp}.json")
+        path = Path(_ask(console, "Snapshot file", default, path=True))
         try:
-            written = snapshot_mod.save(
-                path, s.audits, s.fabric or FabricState(),
-                meta={"collected_at": s.collected_at.isoformat(timespec="seconds")
-                      if s.collected_at else "",
-                      "config": str(s.config_path),
-                      "no_fabric": not s.collected_fabric,
-                      "has_running_config": s.collected_config,
-                      "has_macs": s.collected_macs})
+            written = snapshot_mod.save(path, s.audits,
+                                        s.fabric or FabricState(),
+                                        meta=_snapshot_meta(s))
         except OSError as exc:
             console.print(f"[red]could not write {path}: {exc}[/red]")
             return
@@ -423,9 +559,22 @@ def action_snapshot(s: Session, console: Console) -> None:
                       "neighbors) - keep it where the switch output belongs.[/dim]")
         return
 
-    path = Path(_ask(console, "Snapshot file to load"))
-    if not str(path):
+    found = _find_snapshots(s)
+    if found:
+        t = RichTable(title="Snapshots found", title_justify="left")
+        t.add_column("#", justify="right")
+        t.add_column("File")
+        t.add_column("Size", justify="right")
+        for i, p in enumerate(found[:15], 1):
+            t.add_row(str(i), str(p), f"{p.stat().st_size // 1024} KB")
+        console.print(t)
+    raw = _ask(console, "Snapshot to load (number or file path)", path=True)
+    if not raw:
         return
+    if raw.isdigit() and found and 1 <= int(raw) <= len(found[:15]):
+        path = found[int(raw) - 1]
+    else:
+        path = Path(raw)
     try:
         audits, fabric, meta = snapshot_mod.load(path)
     except snapshot_mod.SnapshotError as exc:
@@ -489,9 +638,10 @@ def action_generate_mlt(s: Session, console: Console) -> None:
     """Cabling sheet in, MLT config blocks out. Touches no device."""
     from switch_migrator import cabling_sheet, mlt_generate
 
-    path = Path(_ask(console, "Filled-in cabling sheet (.xlsx or .csv)"))
-    if not str(path) or str(path) == ".":
+    raw = _ask(console, "Filled-in cabling sheet (.xlsx or .csv)", path=True)
+    if not raw:
         return
+    path = Path(raw)
     try:
         sheet = cabling_sheet.load(path)
     except cabling_sheet.SheetError as exc:
@@ -503,7 +653,8 @@ def action_generate_mlt(s: Session, console: Console) -> None:
         console.print(f"[yellow]![/yellow] {problem}")
     out = s.output_dir / "config" / "mlt-blocks.cfg"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(mlt_generate.render(result, source=str(path)))
+    out.write_text(mlt_generate.render(result, source=str(path)),
+                   encoding="utf-8")
     console.print(f"[green]{len(result.plans)} MLT(s)[/green] from "
                   f"{len(sheet.migrated)} re-patched link(s)")
     for plan in result.plans:
@@ -521,9 +672,10 @@ def action_verify(s: Session, console: Console, creds_fn) -> None:
     from switch_migrator.report.migration_tables import (
         build_verification, build_verification_summary)
 
-    path = Path(_ask(console, "Filled-in cabling sheet (.xlsx or .csv)"))
-    if not str(path) or str(path) == ".":
+    raw = _ask(console, "Filled-in cabling sheet (.xlsx or .csv)", path=True)
+    if not raw:
         return
+    path = Path(raw)
     try:
         sheet = cabling_sheet.load(path)
     except cabling_sheet.SheetError as exc:
@@ -566,38 +718,215 @@ def action_verify(s: Session, console: Console, creds_fn) -> None:
     console.print(f"[green]Written:[/green] {out}")
 
 
-def action_settings(s: Session, console: Console) -> None:
-    out = _ask(console, "Output directory", str(s.output_dir))
-    s.output_dir = Path(out)
+def _set_offline(s: Session, console: Console) -> None:
     # asked as a yes/no first, so an offline session can always get back to
     # live SSH (a blank path answer used to just keep the old value)
-    if _yes(console, "Replay from a saved capture instead of SSH?",
-            default=s.offline_dir is not None):
-        off = _ask(console, "Offline replay directory",
-                   str(s.offline_dir) if s.offline_dir else "")
-        s.offline_dir = Path(off) if off else None
-    else:
+    if not _yes(console, "Replay from a saved capture instead of SSH?",
+                default=s.offline_dir is not None):
         s.offline_dir = None
-    s.save_raw = _yes(console, "Save raw CLI output (--save-raw)?", s.save_raw)
-    s.write_manifest = _yes(console, "Write a run manifest after collecting?",
-                            s.write_manifest)
-    s.split_by_location = _yes(
-        console, "Split the cabling sheet into one worksheet per location?",
-        s.split_by_location)
-    if s.split_by_location:
-        current = "; ".join(f"{g}={','.join(m)}"
-                            for g, m in s.location_groups.items())
-        raw = _ask(console, "Groups for this session as NAME=loc1,loc2 "
-                            "(semicolon separated, blank = use the config)",
-                   current)
+        return
+    raw_root = s.output_dir / "raw"
+    if raw_root.is_dir():
+        console.print(f"[dim]Captures found under {raw_root} "
+                      f"({', '.join(sorted(p.name for p in raw_root.iterdir() if p.is_dir())[:8])})[/dim]")
+    off = _ask(console, "Offline replay directory",
+               str(s.offline_dir) if s.offline_dir
+               else (str(raw_root) if raw_root.is_dir() else ""),
+               path=True)
+    s.offline_dir = Path(off) if off else None
+
+
+def _set_location_groups(s: Session, console: Console) -> None:
+    current = "; ".join(f"{g}={','.join(m)}"
+                        for g, m in s.location_groups.items())
+    raw = _ask(console, "Groups for this session as NAME=loc1,loc2 "
+                        "(semicolon separated, blank = use the config)",
+               current)
+    try:
+        s.location_groups = location_mod.parse_group_args(
+            [x for x in raw.split(";") if x.strip()])
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red] - keeping the config's groups")
+        s.location_groups = {}
+
+
+def action_settings(s: Session, console: Console) -> None:
+    """Pick ONE setting, change it, done - repeat as long as wanted.
+
+    Each choice touches exactly one value, so mistyping (or a crash) can no
+    longer cost the answers to every other question on the way through.
+    """
+    def onoff(v: bool) -> str:
+        return "[green]on[/green]" if v else "[dim]off[/dim]"
+
+    while True:
+        rows = [
+            ("1", "Output directory", str(s.output_dir)),
+            ("2", "Offline replay", str(s.offline_dir) if s.offline_dir
+             else "[dim]off (live SSH)[/dim]"),
+            ("3", "Save raw CLI output (--save-raw)", onoff(s.save_raw)),
+            ("4", "Run manifest after collecting", onoff(s.write_manifest)),
+            ("5", "Auto-save snapshot after collecting", onoff(s.auto_snapshot)),
+            ("6", "Split cabling sheet by location", onoff(s.split_by_location)),
+            ("7", "Location groups (this session)",
+             "; ".join(f"{g}={','.join(m)}" for g, m in s.location_groups.items())
+             or "[dim](from the config)[/dim]"),
+            ("8", "NEW switch name", s.new_switch or "[dim](unset)[/dim]"),
+        ]
+        t = RichTable(title="Settings", title_justify="left", show_header=False,
+                      box=None, pad_edge=False)
+        t.add_column(justify="right", style="bold cyan", width=3)
+        t.add_column(style="bold")
+        t.add_column()
+        for row in rows:
+            t.add_row(*row)
+        console.print(t)
+        pick = _ask(console, "Change which setting? (blank = back)")
+        if not pick:
+            return
+        if pick == "1":
+            s.output_dir = Path(_ask(console, "Output directory",
+                                     str(s.output_dir), path=True))
+        elif pick == "2":
+            _set_offline(s, console)
+        elif pick == "3":
+            s.save_raw = _yes(console, "Save raw CLI output (--save-raw)?",
+                              s.save_raw)
+        elif pick == "4":
+            s.write_manifest = _yes(
+                console, "Write a run manifest after collecting?",
+                s.write_manifest)
+        elif pick == "5":
+            s.auto_snapshot = _yes(
+                console, "Auto-save a snapshot after every collection?",
+                s.auto_snapshot)
+        elif pick == "6":
+            s.split_by_location = _yes(
+                console,
+                "Split the cabling sheet into one worksheet per location?",
+                s.split_by_location)
+            if s.split_by_location:
+                _set_location_groups(s, console)
+        elif pick == "7":
+            _set_location_groups(s, console)
+        elif pick == "8":
+            s.new_switch = _ask(console, "Name of the NEW switch", s.new_switch)
+        else:
+            console.print(f"[red]Unknown setting '{pick}'.[/red]")
+            continue
+        console.print("[green]Setting updated.[/green]")
+
+
+def _apply_profile(s: Session, name: str, prof: dict, console: Console) -> None:
+    """Set the session from a profile. Only SETS values - everything stays
+    changeable on the fly afterwards (settings, selection, everything)."""
+    applied: list[str] = []
+    if "inventory" in prof:
         try:
-            s.location_groups = location_mod.parse_group_args(
-                [x for x in raw.split(";") if x.strip()])
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red] - keeping the config's groups")
-            s.location_groups = {}
-    s.new_switch = _ask(console, "Name of the NEW switch", s.new_switch)
-    console.print("[green]Settings updated.[/green]")
+            s.all_targets = load_inventory(prof["inventory"])
+            s.inventory_path = prof["inventory"]
+            s.selected = list(s.all_targets)
+            applied.append(f"inventory {prof['inventory']} "
+                           f"({len(s.all_targets)} switches)")
+        except ConfigError as exc:
+            console.print(f"[red]{exc}[/red] - inventory not changed")
+    if "output_dir" in prof:
+        s.output_dir = prof["output_dir"]
+        applied.append(f"output {s.output_dir}")
+    if "offline" in prof:
+        s.offline_dir = prof["offline"]
+        applied.append(f"offline replay {s.offline_dir}")
+    for key, attr in (("save_raw", "save_raw"), ("manifest", "write_manifest"),
+                      ("auto_snapshot", "auto_snapshot"),
+                      ("split_by_location", "split_by_location")):
+        if key in prof:
+            setattr(s, attr, prof[key])
+            applied.append(f"{key} {'on' if prof[key] else 'off'}")
+    if "location_groups" in prof:
+        s.location_groups = dict(prof["location_groups"])
+        applied.append(f"{len(s.location_groups)} location group(s)")
+    if "new_switch" in prof:
+        s.new_switch = prof["new_switch"]
+        applied.append(f"new switch '{s.new_switch}'")
+    console.print(f"[green]Profile '{name}' loaded:[/green] "
+                  + ("; ".join(applied) if applied else "(empty profile)"))
+    console.print("[dim]Everything can still be changed on the fly "
+                  "(options 1 and s).[/dim]")
+
+
+def _session_profile(s: Session) -> dict:
+    """The session's current shape, as a profile dict worth saving."""
+    prof: dict = {
+        "output_dir": s.output_dir,
+        "save_raw": s.save_raw,
+        "manifest": s.write_manifest,
+        "auto_snapshot": s.auto_snapshot,
+        "split_by_location": s.split_by_location,
+    }
+    if s.inventory_path:
+        prof["inventory"] = s.inventory_path
+    if s.offline_dir:
+        prof["offline"] = s.offline_dir
+    if s.location_groups:
+        prof["location_groups"] = dict(s.location_groups)
+    if s.new_switch:
+        prof["new_switch"] = s.new_switch
+    return prof
+
+
+def action_profiles(s: Session, console: Console) -> None:
+    """Named scenarios: 'scenario A always needs inventory X and settings Y'
+    becomes one load. Profiles never hold credentials."""
+    try:
+        profiles = profiles_mod.load_profiles(s.profiles_path)
+    except profiles_mod.ProfileError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    names = sorted(profiles)
+    if names:
+        t = RichTable(title=f"Profiles ({s.profiles_path})",
+                      title_justify="left")
+        t.add_column("#", justify="right")
+        t.add_column("Name")
+        t.add_column("Inventory")
+        t.add_column("Output")
+        t.add_column("New switch")
+        for i, name in enumerate(names, 1):
+            p = profiles[name]
+            t.add_row(str(i), name, str(p.get("inventory", "")),
+                      str(p.get("output_dir", "")), p.get("new_switch", ""))
+        console.print(t)
+    else:
+        console.print(f"[dim]No profiles in {s.profiles_path} yet.[/dim]")
+    console.print("[bold]1[/bold] load a profile   "
+                  "[bold]2[/bold] save the current session as a profile")
+    choice = _ask(console, "Choose", "1" if names else "2")
+    if choice == "1":
+        if not names:
+            console.print("[yellow]Nothing to load - save one first.[/yellow]")
+            return
+        raw = _ask(console, "Profile (number or name)")
+        if not raw:
+            return
+        if raw.isdigit() and 1 <= int(raw) <= len(names):
+            name = names[int(raw) - 1]
+        elif raw in profiles:
+            name = raw
+        else:
+            console.print(f"[red]No profile '{raw}'.[/red]")
+            return
+        _apply_profile(s, name, profiles[name], console)
+    elif choice == "2":
+        name = _ask(console, "Save as profile name")
+        if not name:
+            return
+        try:
+            written = profiles_mod.save_profile(name, _session_profile(s),
+                                                s.profiles_path)
+        except (OSError, profiles_mod.ProfileError) as exc:
+            console.print(f"[red]could not save the profile: {exc}[/red]")
+            return
+        console.print(f"[green]Profile '{name}' saved to {written}.[/green]")
 
 
 # --------------------------------------------------------------------------- #
@@ -637,6 +966,12 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         console.print(f"[bold red]Config error:[/bold red] {exc}")
         return 2
 
+    if inventory_path is None:
+        # default inventory: the config's `inventory:` key, or a
+        # ./switches.yaml - so the everyday session starts ready to collect
+        inventory_path = default_inventory(cfg)
+        if inventory_path is not None:
+            console.print(f"[dim]Using default inventory: {inventory_path}[/dim]")
     s = Session(config_path=config_path, cfg=cfg, inventory_path=inventory_path,
                 output_dir=output_dir)
     if inventory_path:
@@ -659,16 +994,32 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         "h": lambda: action_health(s, console),
         "m": lambda: action_generate_mlt(s, console),
         "v": lambda: action_verify(s, console, creds_fn),
+        "p": lambda: action_profiles(s, console),
         "s": lambda: action_settings(s, console),
     }
+    idle_rounds = 0
     while True:
         console.print()
         console.print(_status_panel(s))
         console.print(_menu_table(s))
-        choice = _ask(console, "Choose").lower()
-        if choice in ("0", "q", "quit", "exit", ""):
+        console.print("[dim]'x' at any prompt aborts the current action; "
+                      "0/q quits.[/dim]")
+        try:
+            choice = _ask(console, "Choose").lower()
+        except Abort:
+            continue
+        if choice in ("0", "q", "quit", "exit"):
             console.print("[dim]Bye.[/dim]")
             return 0
+        if not choice:
+            # a stray Enter re-shows the menu instead of quitting - quitting
+            # is an explicit 0/q. A closed stdin (blank forever) still exits.
+            idle_rounds += 1
+            if idle_rounds >= 50:
+                console.print("[dim]No input - bye.[/dim]")
+                return 0
+            continue
+        idle_rounds = 0
         action = actions.get(choice)
         if action is None:
             console.print(f"[red]Unknown choice '{choice}'.[/red]")
@@ -678,6 +1029,8 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
             continue
         try:
             action()
+        except Abort:
+            console.print("\n[yellow]Aborted - back to the menu.[/yellow]")
         except KeyboardInterrupt:
             console.print("\n[yellow]Cancelled.[/yellow]")
         except Exception as exc:  # noqa: BLE001 - never kill the menu on one action
