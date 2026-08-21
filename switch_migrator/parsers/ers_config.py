@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from switch_migrator.models import BOTH, TAGGED, UNTAGGED, VlanBinding
 from switch_migrator.parsers.common import expand_port_list
 
 
@@ -120,3 +121,37 @@ def parse_ers_config(text: str) -> ErsModel:
                 members=expand_port_list(mem_m.group(1)) if mem_m else []))
             continue
     return m
+
+
+SOURCE = "running-config"
+
+
+def port_bindings(model: ErsModel) -> dict[str, list[VlanBinding]]:
+    """Per-port VLAN bindings with tagging, from an ERS running-config.
+
+    ERS has no I-SIDs, so every binding leaves `isid` unset - it is filled in
+    later from the fabric comparison, which is the only thing that knows which
+    I-SID an ERS VLAN lands on. Tagging comes from `vlan ports <p> tagging`:
+    tagAll egresses everything tagged, untagAll everything untagged, and the
+    PVID names the untagged VLAN on a port that does both.
+
+    A port the config never mentions in a `vlan ports ... tagging` line is
+    untagAll by default on ERS, which is why absence is read as untagged
+    rather than as unknown.
+    """
+    result: dict[str, list[VlanBinding]] = {}
+    for vid, vlan in sorted(model.vlans.items()):
+        for port in vlan.members:
+            cfg = model.ports.get(port)
+            tagged = bool(cfg and cfg.tagged)
+            if tagged and cfg is not None and cfg.pvid == vid:
+                # tagAll with this VLAN as PVID: frames still egress tagged,
+                # but the port's untagged ingress lands here
+                tagging = BOTH
+            else:
+                tagging = TAGGED if tagged else UNTAGGED
+            result.setdefault(port, []).append(
+                VlanBinding(vlan=vid, tagging=tagging, source=SOURCE))
+    for bindings in result.values():
+        bindings.sort(key=lambda b: (b.vlan is None, b.vlan or 0))
+    return result

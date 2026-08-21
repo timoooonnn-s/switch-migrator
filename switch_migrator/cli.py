@@ -16,7 +16,7 @@ from rich.console import Console
 from switch_migrator import __version__
 from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
-from switch_migrator.compare import compare_switch
+from switch_migrator.compare import compare_switch, resolve_binding_isids
 from switch_migrator.config_extract import extract_voss_config
 from switch_migrator.config_generate import generate_voss_from_ers
 from switch_migrator.isid import build_worksheet
@@ -232,6 +232,18 @@ def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
                      console=console, console_server=cfg.console_server)
 
 
+def _needs_config(args: argparse.Namespace) -> bool:
+    """Should this run pull `show running-config`?
+
+    Beyond --extract-config, the migration sheets need it too: it is the only
+    source that says whether a VLAN egresses a port tagged or untagged, which
+    is exactly what gets configured on the new switch. One extra command per
+    device buys the tagging column and authoritative VLAN membership.
+    """
+    return bool(getattr(args, "extract_config", False)
+                or getattr(args, "migration_sheets", False))
+
+
 def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
                      args: argparse.Namespace,
                      progress: NullProgress | None = None,
@@ -261,7 +273,7 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         try:
             audit = collect_switch(
                 target, runner, cfg,
-                pull_config=args.extract_config,
+                pull_config=_needs_config(args),
                 # verification needs the learned MACs on the NEW ports - they
                 # are the evidence that the right cable went into the right hole
                 pull_macs=bool(getattr(args, "migration_sheets", False)
@@ -316,7 +328,7 @@ def preview_commands(targets: list[SwitchTarget], cfg: Config,
                               command_overrides=cfg.command_overrides)
         try:
             collect_switch(target, runner, cfg,
-                           pull_config=args.extract_config,
+                           pull_config=_needs_config(args),
                            pull_macs=getattr(args, "migration_sheets", False))
         except Exception:  # noqa: BLE001 - a preview must never fail the run
             log.exception("[%s] dry-run preview incomplete", target.name)
@@ -677,6 +689,10 @@ def main(argv: list[str] | None = None) -> int:
     # 3) Compare (skipped entirely in no-fabric mode)
     comparisons = {} if args.no_fabric else {
         a.name: compare_switch(a, fabric, cfg) for a in audits if a.reachable}
+    # the comparison is the only thing that knows which I-SID a VLAN without a
+    # local binding lands on - push that answer back into the port/MLT bindings
+    # so the migration sheets can show it instead of an empty cell
+    resolve_binding_isids(audits, comparisons)
 
     # 4) Report
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)

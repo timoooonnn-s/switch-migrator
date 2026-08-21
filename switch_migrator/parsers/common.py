@@ -26,6 +26,40 @@ def _clean_ip(value: str) -> str:
 # port lists as they appear in MLT member columns: 1/1-1/2, 1/47,1/48, 49-50
 PORT_LIST_RE = re.compile(r"^\d+(?:/\d+){0,2}(?:[,\-]\d+(?:/\d+){0,2})*$")
 
+# One comma-separated element of a port list: '1/7', '1/1-1/10', '49-50'.
+# Validated per element so a list can be checked without depending on how the
+# device chose to break it across lines.
+_PORT_CHUNK_RE = re.compile(r"^\d+(?:/\d+){0,2}(?:-\d+(?:/\d+){0,2})?$")
+
+
+def is_port_list(raw: str) -> bool:
+    """Does this token look like a port list?
+
+    Tolerant of the trailing comma a device leaves behind when it wraps a long
+    list onto a continuation line ('1/1-1/10,1/12,'), which is exactly the case
+    where recognising the token matters most.
+    """
+    return bool(_port_chunks(raw))
+
+
+def _port_chunks(raw: str) -> list[str]:
+    """Split a port list into validated elements, or [] if it is not one.
+
+    Empty elements are dropped rather than failing the whole list: a device
+    that wraps a long port list leaves a trailing comma on the first line, and
+    rejecting the string outright used to lose every port of that VLAN or MLT,
+    not just the wrapped remainder.
+    """
+    raw = raw.strip()
+    if not raw or raw.upper() == "NONE":
+        return []
+    chunks = [c.strip() for c in raw.split(",")]
+    chunks = [c for c in chunks if c]
+    if not chunks or not all(_PORT_CHUNK_RE.match(c) for c in chunks):
+        return []
+    return chunks
+
+
 _UPDOWN = {"up": True, "down": False, "testing": False}
 
 # 'ist' / 'vist' as a whole word, not as three letters inside another one -
@@ -47,12 +81,11 @@ def expand_port_list(raw: str) -> list[str]:
 
     Ranges only expand within the last element (the port number); ranges that
     cross slots/units are kept as their two endpoints rather than guessed.
+    A trailing comma (a list the device wrapped onto a continuation line) is
+    tolerated and expands to the ports named so far.
     """
     ports: list[str] = []
-    raw = raw.strip()
-    if not raw or raw.upper() == "NONE" or not PORT_LIST_RE.match(raw):
-        return ports
-    for chunk in raw.split(","):
+    for chunk in _port_chunks(raw):
         if "-" not in chunk:
             ports.append(chunk)
             continue

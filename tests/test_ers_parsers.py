@@ -101,3 +101,35 @@ def test_parse_mlt_digit_shaped_name_is_not_read_as_members():
     assert mlts[0].mlt_id == 4
     assert mlts[0].name == "7"
     assert mlts[0].members == []
+
+
+def test_wrapped_port_members_line_keeps_every_port():
+    """A long 'Port Members:' list wraps onto an unlabelled continuation line.
+
+    The trailing comma used to make expand_port_list reject the whole string,
+    so the VLAN came back with no ports at all - not even the ones before the
+    break.
+    """
+    out = """\
+100  Users Floor 1        Port     None             0x0000 Yes    IVL     No
+        Port Members: 1-8,10,26,
+                      30-32,41
+200  Printers             Port     None             0x0000 Yes    IVL     No
+        Port Members: 11-13
+"""
+    vlans = {v.vlan_id: v.members for v in ers_parsers.parse_vlans(out)}
+    assert vlans[100] == ["1", "2", "3", "4", "5", "6", "7", "8", "10", "26",
+                          "30", "31", "32", "41"]
+    assert vlans[200] == ["11", "12", "13"]
+
+
+def test_unwrapped_member_list_is_not_extended_by_the_next_line():
+    out = """\
+100  Users                Port     None             0x0000 Yes    IVL     No
+        Port Members: 1-3
+99   99                   Port     None             0x0000 Yes    IVL     No
+        Port Members: 7
+"""
+    vlans = {v.vlan_id: v.members for v in ers_parsers.parse_vlans(out)}
+    assert vlans[100] == ["1", "2", "3"]
+    assert vlans[99] == ["7"]

@@ -8,7 +8,12 @@ from __future__ import annotations
 import re
 
 from switch_migrator.models import IstState, MltState, PortState, VlanInfo
-from switch_migrator.parsers.common import PORT_RE, expand_port_list, name_says_ist
+from switch_migrator.parsers.common import (
+    PORT_RE,
+    expand_port_list,
+    is_port_list,
+    name_says_ist,
+)
 
 _VLAN_TYPES = ("Port", "Protocol", "Protocol-based", "MAC", "MACSA", "SPBM-BVLAN",
                "Spbm-bvlan", "Private", "IDS", "RSPAN")
@@ -56,9 +61,11 @@ def parse_vlans(output: str) -> list[VlanInfo]:
     )
     member_re = re.compile(r"Port\s+Members?\s*:\s*(.+?)\s*$", re.IGNORECASE)
     current: VlanInfo | None = None
+    raw = ""       # member list still being accumulated across wrapped lines
     for line in output.splitlines():
         m = type_re.match(line)
         if m:
+            raw = ""
             vlan_id = int(m.group(1))
             if not 1 <= vlan_id <= 4094:
                 current = None
@@ -70,6 +77,21 @@ def parse_vlans(output: str) -> list[VlanInfo]:
         if pm and current is not None:
             raw = pm.group(1).strip()
             current.members = [] if raw.upper() == "NONE" else expand_port_list(raw)
+            if not raw.endswith(","):
+                raw = ""
+            continue
+        # a long 'Port Members:' list wraps onto unlabelled continuation lines,
+        # broken after a comma - keep absorbing them while one is still open,
+        # or the VLAN keeps only the ports named before the break
+        if raw and current is not None:
+            cont = line.strip()
+            if not is_port_list(cont):
+                raw = ""
+                continue
+            raw += cont
+            current.members = expand_port_list(raw)
+            if not raw.endswith(","):
+                raw = ""
     return vlans
 
 

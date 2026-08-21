@@ -25,6 +25,61 @@ class LldpNeighbor:
     sys_descr: str = ""
 
 
+# How a VLAN egresses a port. The distinction is what you actually configure
+# on the new switch - `c-vid <vlan> port ...` for tagged, `untagged-traffic
+# port ...` for untagged - so it matters more than a bare PVID number, which
+# a flex-UNI leaf does not really have.
+TAGGED = "t"
+UNTAGGED = "u"
+BOTH = "t+u"          # VOSS: a c-vid AND untagged-traffic on the same I-SID
+
+
+# How a missing I-SID is spelled on the sheet. '?' (the default) means the
+# tool looked and did not find one - a task, not a blank.
+_ISID_NOTES = {"local": "(local)", "excluded": "(excluded)"}
+
+
+@dataclass
+class VlanBinding:
+    """One VLAN carried on a port or MLT, with its I-SID and how it egresses.
+
+    Kept as a pair rather than two parallel lists because the sheets used to
+    print 'VLANs 200,4000' beside 'I-SIDs 10200' and leave the reader to guess
+    which was which - and to silently drop any VLAN whose I-SID was unknown.
+    `isid is None` is therefore a real state ('local VLAN' or 'not resolved'),
+    distinguished by `isid_note`, never an omission.
+    """
+    vlan: int | None = None       # None = untagged traffic with no c-vid of its own
+    isid: int | None = None
+    tagging: str = ""             # TAGGED / UNTAGGED / BOTH, '' when unknown
+    source: str = ""              # which collected source this came from
+    isid_note: str = ""           # 'local' / 'unresolved' when isid is None
+
+    @property
+    def key(self) -> tuple[int | None, int | None]:
+        return (self.vlan, self.isid)
+
+    def render(self) -> str:
+        """'200->10200 (t)' - one self-contained cell entry."""
+        left = str(self.vlan) if self.vlan is not None else "untagged"
+        right = (str(self.isid) if self.isid is not None
+                 else _ISID_NOTES.get(self.isid_note, "?"))
+        text = f"{left}->{right}"
+        return f"{text} ({self.tagging})" if self.tagging else text
+
+
+@dataclass
+class SourceStatus:
+    """Whether one collected source answered, for the coverage report.
+
+    A command that a release rejects is not an error - but it does mean a
+    column is thinner than it looks, and that has to be visible somewhere.
+    """
+    name: str                     # the command, or a derived source's name
+    ok: bool
+    detail: str = ""
+
+
 @dataclass
 class PortState:
     port: str
@@ -52,6 +107,15 @@ class PortState:
     tagging: str = ""             # tagged / untagged / mixed / ""
     vlans: list[int] = field(default_factory=list)  # VLANs configured on the port
     isids: list[int] = field(default_factory=list)  # I-SIDs of those VLANs
+    # the authoritative form of the two lists above: VLAN<->I-SID pairs that
+    # also carry tagged/untagged. The flat lists stay for filtering and sorting.
+    bindings: list[VlanBinding] = field(default_factory=list)
+
+    @property
+    def binding_sources(self) -> str:
+        """Which sources the VLAN/I-SID cell was built from (provenance)."""
+        return ",".join(sorted({part for b in self.bindings
+                                for part in b.source.split(",") if part}))
 
     @property
     def media(self) -> str:
@@ -78,6 +142,7 @@ class MltState:
     lacp: bool | None = None      # LACP admin state (VOSS: show mlt LACP table)
     vlans: list[int] = field(default_factory=list)  # VLAN IDS column of show mlt
     isids: list[int] = field(default_factory=list)  # I-SIDs of those VLANs
+    bindings: list[VlanBinding] = field(default_factory=list)
     is_ist: bool = False
     is_uplink: bool = False
 
@@ -126,8 +191,17 @@ class SwitchAudit:
     # rows from `show interfaces gigabitEthernet i-sid`, kept so the per-port
     # VLAN/I-SID columns need no second call
     port_isid_rows: list[dict] = field(default_factory=list)
+    # which sources answered on this device, for the coverage report
+    sources: list[SourceStatus] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    def record_source(self, name: str, ok: bool, detail: str = "") -> None:
+        self.sources.append(SourceStatus(name=name, ok=ok, detail=detail))
+
+    @property
+    def ports_with_vlans(self) -> int:
+        return sum(1 for p in self.ports if p.bindings)
 
     @property
     def ports_up(self) -> int:

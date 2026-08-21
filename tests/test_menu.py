@@ -116,7 +116,10 @@ def test_collect_once_then_multiple_outputs(env):
     # collect: (no fabric question - config has no DvRs), config? n, macs? y
     M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
     assert s.has_data and len(s.audits) == 2
-    assert s.collected_macs and not s.collected_config
+    # saying yes to the MAC/migration-sheet collection pulls the running-config
+    # too even when the config extract was declined: it is the only source of
+    # tagged-vs-untagged, so the sheets need it either way
+    assert s.collected_macs and s.collected_config
     collected_at = s.collected_at
 
     # two different outputs from the SAME collected data - no re-collection

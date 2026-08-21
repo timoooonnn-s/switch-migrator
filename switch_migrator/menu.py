@@ -341,7 +341,8 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     want_fabric = bool(s.cfg.dvr_controllers) and _yes(
         console, f"Collect fabric state from {len(s.cfg.dvr_controllers)} DvR "
                  f"controller(s)? (needed for the audit comparison)")
-    want_config = _yes(console, "Also pull running-config? (needed for config extract)")
+    want_config = _yes(console, "Also pull running-config? (needed for config "
+                                "extract; also gives the sheets tagged/untagged)")
     want_macs = _yes(console, "Also collect MAC tables? (needed for migration sheets)")
 
     creds, dvr_creds = creds_fn(s, console)
@@ -384,7 +385,9 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     s.audits, s.fabric = audits, fabric
     s.collected_at = datetime.now()
     s.collected_fabric = want_fabric
-    s.collected_config = want_config
+    # the migration-sheet collection pulls the running-config too, because
+    # it is the only source of tagged-vs-untagged - record what really ran
+    s.collected_config = want_config or want_macs
     s.collected_macs = want_macs
     s.loaded_from = None
     s.commands_by_device = commands
@@ -419,7 +422,7 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
                    title: str) -> None:
     """Build the tables for one use case and write the report files."""
     from switch_migrator.cli import _write_config_extracts
-    from switch_migrator.compare import compare_switch
+    from switch_migrator.compare import compare_switch, resolve_binding_isids
     from switch_migrator.report import console as console_report
     from switch_migrator.report.excel import write_excel
     from switch_migrator.report.migration import (
@@ -430,6 +433,7 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     fabric = s.fabric or FabricState()
     comparisons = {} if no_fabric else {
         a.name: compare_switch(a, fabric, s.cfg) for a in s.audits if a.reachable}
+    resolve_binding_isids(s.audits, comparisons)
     tables = build_all(s.audits, fabric, comparisons, no_fabric=no_fabric)
     if migration_sheets:
         assign_port_uids(s.audits)
