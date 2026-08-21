@@ -282,6 +282,10 @@ def _patient_ers_class():
 
 
 class SshRunner(BaseRunner):
+    # class-level default so a runner built without __init__ (the tests do)
+    # still has one, and the raw-capture branch never raises on a missing attr
+    raw_skip: tuple[str, ...] = ()
+
     def __init__(self, name: str, host: str, platform: Platform,
                  creds: Credentials, ssh: SshSettings,
                  raw_dir: Path | None = None,

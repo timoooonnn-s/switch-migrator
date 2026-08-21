@@ -461,3 +461,31 @@ def test_drive_console_login_gives_up_with_a_named_error():
         runner._drive_console_login(chan, Credentials("admin", "secret"))
     assert "tsserver" in str(excinfo.value)
     assert "line 03" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# Raw capture
+# --------------------------------------------------------------------------- #
+
+def _raw_runner(tmp_path, raw_skip=()):
+    runner = _make_runner(_FakeConn(None, response="ok"))
+    runner.raw_dir = tmp_path / "raw"
+    runner.raw_skip = raw_skip
+    return runner
+
+
+def test_raw_capture_writes_command_output(tmp_path):
+    runner = _raw_runner(tmp_path)
+    runner.run("show mlt")
+    assert (tmp_path / "raw" / "show_mlt.txt").is_file()
+
+
+def test_raw_capture_skips_what_the_run_is_going_to_discard(tmp_path):
+    """--migration-sheets reads the running-config for its tagging and then
+    drops the text. Capturing it to disk would keep on disk exactly the RADIUS
+    keys and SNMP users that discarding is meant to avoid."""
+    runner = _raw_runner(tmp_path, raw_skip=("show running-config",))
+    runner.run("show running-config")
+    runner.run("show mlt")
+    written = sorted(p.name for p in (tmp_path / "raw").glob("*"))
+    assert written == ["show_mlt.txt"]
