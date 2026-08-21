@@ -34,6 +34,7 @@ from switch_migrator.config import (
     parse_switch_arg,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
+from switch_migrator import handover as handover_mod
 from switch_migrator import health as health_mod
 from switch_migrator import location as location_mod
 from switch_migrator import manifest as manifest_mod
@@ -193,7 +194,7 @@ def _status_panel(s: Session) -> Panel:
     return Panel("\n".join(lines), title="switch-migrator", title_align="left")
 
 
-_NEEDS_DATA = ("3", "4", "5", "6", "7", "h")
+_NEEDS_DATA = ("3", "4", "5", "6", "7", "h", "b")
 
 _ENTRIES = [
     ("1", "Select switches", "pick targets from the inventory or add them by hand"),
@@ -208,6 +209,7 @@ _ENTRIES = [
     ("h", "Health check", "go/no-go before the window: what is already broken?"),
     ("m", "Generate MLT blocks", "new switches' MLT config from a filled-in cabling sheet"),
     ("v", "Verify migration", "after the window: check every re-patched link"),
+    ("b", "Handover bundle", "one folder with every output and an index to hand over"),
     ("p", "Profiles", "load or save a named scenario (inventory + settings)"),
     ("s", "Settings", "change one setting at a time; nothing else is touched"),
     ("0", "Quit", ""),
@@ -433,7 +435,8 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     fabric = s.fabric or FabricState()
     comparisons = {} if no_fabric else {
         a.name: compare_switch(a, fabric, s.cfg) for a in s.audits if a.reachable}
-    resolve_binding_isids(s.audits, comparisons)
+    resolve_binding_isids(s.audits, comparisons,
+                          fabric_checked=not no_fabric)
     tables = build_all(s.audits, fabric, comparisons, no_fabric=no_fabric)
     if migration_sheets:
         assign_port_uids(s.audits)
@@ -880,6 +883,37 @@ def _session_profile(s: Session) -> dict:
     return prof
 
 
+def action_handover(s: Session, console: Console) -> None:
+    """Everything this session produced, in one folder with an index page.
+
+    Reuses whatever is already in the output directory rather than re-running
+    anything: the bundle is a way to hand work over, not a way to do it again.
+    """
+    from switch_migrator.compare import compare_switch, resolve_binding_isids
+    from switch_migrator.report.tables import build_all
+
+    fabric = s.fabric or FabricState()
+    comparisons = {} if not s.collected_fabric else {
+        a.name: compare_switch(a, fabric, s.cfg) for a in s.audits if a.reachable}
+    resolve_binding_isids(s.audits, comparisons,
+                          fabric_checked=s.collected_fabric)
+    tables = build_all(s.audits, fabric, comparisons,
+                       no_fabric=not s.collected_fabric)
+
+    files = sorted(p for p in s.output_dir.glob("*")
+                   if p.is_file() and not p.name.startswith("switch-migrator"))
+    if not files:
+        console.print("[yellow]Nothing in the output directory yet - produce a "
+                      "report first (options 3-7).[/yellow]")
+        return
+    bundle = handover_mod.build(
+        s.output_dir, files, tables, s.audits,
+        meta={"switches": ", ".join(a.name for a in s.audits),
+              "config": str(s.config_path) if s.config_path else ""})
+    console.print(f"[green]Handover bundle:[/green] {bundle}")
+    console.print(f"  open [bold]{bundle / 'index.html'}[/bold]")
+
+
 def action_profiles(s: Session, console: Console) -> None:
     """Named scenarios: 'scenario A always needs inventory X and settings Y'
     becomes one load. Profiles never hold credentials."""
@@ -1000,6 +1034,7 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         "h": lambda: action_health(s, console),
         "m": lambda: action_generate_mlt(s, console),
         "v": lambda: action_verify(s, console, creds_fn),
+        "b": lambda: action_handover(s, console),
         "p": lambda: action_profiles(s, console),
         "s": lambda: action_settings(s, console),
     }

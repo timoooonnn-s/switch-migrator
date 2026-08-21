@@ -22,6 +22,7 @@ change board.
 | Window opens | `--health-check` | Is anything already broken that this would make worse? |
 | During | `--generate-mlt` | The MLT config for the new switches, from the filled-in sheet |
 | After | `--verify-migration` | Did every link come back up where it should? |
+| Handover | `--handover` | One folder, with an index, for a reviewer or the change record |
 
 Each has its own section below. Running `switch-migrator` with no arguments
 opens an interactive menu that does all of it without flags.
@@ -238,6 +239,7 @@ switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
   h  Health check          go/no-go before the window: what is already broken?
   m  Generate MLT blocks   new switches' MLT config from a filled-in cabling sheet
   v  Verify migration      after the window: check every re-patched link
+  b  Handover bundle      one folder with every output and an index to hand over
   s  Settings              output directory, offline replay, manifest, target switch
   0  Quit
 ```
@@ -323,14 +325,25 @@ the whole run — the key that ties both sheets together when several old
 switches consolidate onto fewer new ones.
 
 * **Port Info** (all ports) — Port ID, switch, port, device on the port (LLDP
-  name / IP / SysDescr), MAC addresses, tagging, VLAN IDs, I-SIDs, admin & oper
-  state, LACP, MLT ID & name, transceiver, media, uplink flag.
+  name / IP / SysDescr), MAC addresses, untagged VLAN, tagging, the
+  **VLAN → I-SID pairs**, the flat VLAN/I-SID lists, admin & oper state, LACP,
+  MLT ID & name, transceiver, media, uplink flag, usage and the VLAN source.
 * **Cabling** (connected ports only — what actually gets re-patched) —
   deliberately wide, *one big paper*, so every row is self-contained at the
-  rack: first VLAN, type (access/mlt/uplink), Port ID, end device / neighbor,
-  **empty NEW switch + NEW port columns for the technicians to fill in**, old
-  switch, old port, **MLT ID, MLT name, the MLT's VLANs and I-SIDs**, the
-  **port's own VLANs and I-SIDs**, MAC addresses and physical media.
+  rack, and laid out in the order the work happens:
+
+  | | Columns |
+  |---|---|
+  | What the link is | Port ID, Usage, Type (access/mlt/uplink), Untagged VLAN, End device / neighbor |
+  | Where it is now | **Rack (old)** ✎, Old switch, Old port |
+  | Where it goes | **Rack (new)** ✎, **NEW switch** ✎, **NEW port** ✎, **NEW MLT ID** ✎, **NEW MLT name** ✎, **NEW VLAN** ✎ |
+  | What to configure | Tagging, VLAN → I-SID, MLT ID, MLT name, MLT VLAN → I-SID, the flat VLAN/I-SID lists |
+  | Evidence | MAC addresses, Media, Why, VLAN source |
+
+  ✎ = filled in by hand. Those columns are shaded, unlocked and wide enough to
+  write in; everything derived from the devices is locked so it cannot be
+  edited by accident. **Rack (old)** and **Rack (new)** are new and deliberately
+  empty — no switch knows which rack it is in.
 * **`migration-commands-<stamp>.txt`** — per-port
   `show interfaces gigabitEthernet fdb-entry` commands to run on the **new**
   switch (each annotated with the Port ID, the
@@ -339,7 +352,50 @@ switches consolidate onto fewer new ones.
   to copy.
 
 MAC addresses are capped at 10 per port with a `(+N more)` note. Pass
-`--new-switch NAME` to name the target device in the commands file.
+`--new-switch NAME` to name the target device in the commands file;
+`--new-switch a,b` names several and turns the sheet's **NEW switch** column
+into a dropdown of exactly those, so a target is picked rather than typed.
+
+The workbook prints: landscape, fit to width, the header row repeated on every
+page, and a page break whenever the old switch changes, so no rack's rows
+straddle two sheets of paper.
+
+#### VLAN → I-SID, and tagged vs untagged
+
+Both sheets carry the port's VLANs and I-SIDs as **pairs**, not as two
+independent lists:
+
+```
+735->2500735 (u), 100->2500100 (t), 174->(local), 2200->?
+```
+
+* `(u)` untagged, `(t)` tagged, `(t+u)` a c-vid that also takes the port's
+  untagged traffic (VOSS flex-UNI).
+* `(local)` — a VLAN with no fabric service by design; `(excluded)` — matched
+  `excluded_vlans`; `?` — the tool looked and found nothing. **A VLAN is never
+  dropped for want of an I-SID**: a question mark is a task, a blank cell is a
+  trap.
+* Untagged first, then by VLAN id. The flat `Port VLANs` / `Port I-SIDs`
+  columns stay beside them for filtering and sorting.
+
+Tagged-vs-untagged is what you actually configure on the new switch
+(`c-vid <vlan> port …` versus `untagged-traffic port …`), so it matters more
+than a bare PVID number — which a flex-UNI leaf does not really have. It can
+only be read from the device's **running-config**, so `--migration-sheets`
+pulls it as well (one extra command per device). Without it the tagging columns
+stay empty rather than being guessed, and the **Coverage** sheet says so.
+
+#### Is my data actually complete? (the Coverage sheet)
+
+Several sources are optional — a release that rejects `show vlan members`, a
+run without the running-config — and the sheet still comes out looking
+finished, just with thinner VLAN columns. The **Coverage** sheet makes that a
+number: per switch, how many ports have VLANs, I-SIDs and tagging at all, which
+sources answered and which did not. Every row also carries a **VLAN source**
+column, so an empty cell can be told apart from an unknown one.
+
+Check it before the window. It is the sheet that would have caught a cabling
+sheet reaching a data centre short of VLANs nobody knew were missing.
 
 #### Is this port actually used?
 
@@ -632,13 +688,30 @@ errors and warnings raised, and the files produced. It never contains
 credentials and never command output — only the command text and its outcome.
 Turns "we checked before the migration" into something you can show afterwards.
 
+### Handover bundle (`--handover`)
+
+A migration leaves a trail across several files, and each of them assumes you
+know what the others are. That is fine for whoever produced them and useless to
+everybody else — the colleague reviewing the plan, the manager asking what this
+window will do, or you, six months later, opening the folder for a site you
+last touched in spring.
+
+`--handover` writes `<output>/handover-<stamp>/`: every file the run produced,
+**copied** (the originals stay where they were), plus an `index.html` that says
+what each one is and shows the Summary, Coverage and Issues tables inline. The
+page is plain self-contained HTML — no external assets — so it opens from a
+file share, an email attachment or a USB stick, with no tool and no network.
+
+In the menu it is option `b`, and it bundles whatever is already in the output
+directory rather than re-running anything.
+
 ## Output files and exit codes
 
 Output goes to `./output/` by default:
 
 * `migration-audit-<timestamp>.xlsx` — one workbook, color-coded, filterable,
   with a frozen header row. Always: **Summary**, **VLAN vs Fabric**, **Ports**,
-  **MLTs**, **Fabric I-SIDs**, **Issues**. Plus **Port Info** and **Cabling**
+  **MLTs**, **Fabric I-SIDs**, **Coverage**, **Issues**. Plus **Port Info** and **Cabling**
   with `--migration-sheets` (one `Cabling <site>` tab per location with
   `--split-by-location`), **Health Summary** / **Health Check** with
   `--health-check`, **Verification Summary** / **Verification** with
@@ -649,6 +722,8 @@ Output goes to `./output/` by default:
 * `csv-<timestamp>/*.csv` with `--csv` — one file per sheet,
 * `snapshot-<timestamp>.json` with `--save-snapshot`,
 * `manifest-<timestamp>.json` with `--manifest`,
+* `handover-<timestamp>/` with `--handover` — every file above plus an
+  `index.html` tying them together,
 * `raw/<device>/<command>.txt` with `--save-raw`,
 * `switch-migrator.log`.
 
@@ -666,6 +741,9 @@ a failed link in the verification), `2` = config error.
 * **VLAN vs Fabric** — the core sheet: per VLAN the expected convention
   I-SID(s), what the DvR controllers actually attach, the matched I-SID and the status
   from the table above. This is your migration checklist.
+* **Coverage** — how complete the collected data is per switch: ports with
+  VLANs / I-SIDs / tagging, and which sources answered. Read this before
+  trusting an empty cell anywhere else.
 * **Issues** — flat, filterable list of everything that needs a human:
   unreachable devices, down IST sessions, MLTs with down members, VLAN
   mismatches.
@@ -692,7 +770,8 @@ command. Then, per platform:
 | config ‡ | `show running-config` | `show running-config` |
 
 † only with `--migration-sheets` or `--verify-migration` (the MAC, optic and
-usage columns need them)  ‡ only with `--extract-config`
+usage columns need them)  ‡ with `--extract-config` **or**
+`--migration-sheets` — the config is the only source of tagged-vs-untagged
 
 On the **DvR controllers**: `show dvr interfaces`, `show isis spbm i-sid all`,
 `show i-sid`, `show vlan i-sid`.
@@ -772,6 +851,17 @@ not failures.
   as `IN_FABRIC_NOT_ATTACHED` — that's the "verify by hand" bucket by
   design. You can add important BEBs to `dvr_controllers`; any VOSS node
   works as an additional state source.
+* **Wrapped port lists.** Both platforms break a long member list after a
+  comma onto a continuation line. Port lists are validated per element and the
+  member parsers absorb continuation lines, so a VLAN whose members wrapped
+  keeps all of them. (Before this, the trailing comma made the whole list
+  fail to parse and the VLAN lost *every* port, not just the wrapped ones.)
+* **Tagged vs untagged comes only from the running-config.** No `show` command
+  states it reliably on either platform. Without the config the tagging columns
+  stay empty rather than being guessed, and Coverage reports it.
+* **A VLAN in the running-config that `show vlan` never listed** is adopted
+  into the switch's VLAN set, so it reaches the fabric comparison instead of
+  ending up as an unresolved `?` on the sheet.
 * **ERS LACP-only trunks** (without MLT) are not listed as MLTs; their ports
   still appear in the Ports sheet with link state.
 * **MLT member-up counts** are computed by cross-referencing member ports
@@ -824,12 +914,15 @@ switch_migrator/
 ├── verify.py           # post-migration: did every link come back up?
 ├── snapshot.py         # save/load the whole collected state as JSON
 ├── manifest.py         # per-run audit trail: commands, outcomes, files
+├── handover.py         # one folder + index.html to hand the run over
 ├── collectors/
 │   ├── switch.py       # legacy switch collection (VOSS + ERS)
 │   └── dvr.py          # DvR fabric-state collection + merge
 ├── parsers/
 │   ├── voss_parsers.py # VOSS/Fabric Engine CLI parsers
+│   ├── voss_config.py  # VOSS running-config -> per-port VLAN/I-SID + tagging
 │   ├── ers_parsers.py  # ERS/BOSS CLI parsers
+│   ├── ers_config.py   # ERS running-config -> L2 model + tagging
 │   └── common.py       # port-list expansion, LLDP block parser
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers

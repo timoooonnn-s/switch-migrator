@@ -36,7 +36,8 @@ BOTH = "t+u"          # VOSS: a c-vid AND untagged-traffic on the same I-SID
 
 # How a missing I-SID is spelled on the sheet. '?' (the default) means the
 # tool looked and did not find one - a task, not a blank.
-_ISID_NOTES = {"local": "(local)", "excluded": "(excluded)"}
+_ISID_NOTES = {"local": "(local)", "excluded": "(excluded)",
+               "no-fabric": "(no fabric)"}
 
 
 @dataclass

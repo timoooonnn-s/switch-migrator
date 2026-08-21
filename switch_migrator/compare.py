@@ -139,8 +139,12 @@ def _compare_vlan(audit: SwitchAudit, vlan_id: int, vlan_name: str,
 
 
 def resolve_binding_isids(audits: list[SwitchAudit],
-                          comparisons: dict[str, list[VlanComparison]]) -> None:
+                          comparisons: dict[str, list[VlanComparison]],
+                          fabric_checked: bool = True) -> None:
     """Fill in the I-SID of every port/MLT binding the device could not name.
+
+    With `fabric_checked` false (--no-fabric) nothing is resolved and the
+    unresolved bindings say so, rather than claiming a failed lookup.
 
     A VOSS switch states its own VLAN<->I-SID bindings, so its ports mostly
     arrive with I-SIDs already. An ERS switch has no I-SIDs at all: without
@@ -156,6 +160,10 @@ def resolve_binding_isids(audits: list[SwitchAudit],
         CompStatus.LOCAL_ONLY: "local",
         CompStatus.EXCLUDED: "excluded",
     }
+    # in --no-fabric mode there is no fabric to resolve against, and saying '?'
+    # would claim the tool looked and found nothing - on an isolated estate
+    # that is every VLAN on the sheet flagged for no reason
+    unmatched = "unresolved" if fabric_checked else "no-fabric"
     for audit in audits:
         by_vlan = {c.vlan_id: c for c in comparisons.get(audit.name, [])}
         for holder in [*audit.ports, *audit.mlts]:
@@ -169,8 +177,8 @@ def resolve_binding_isids(audits: list[SwitchAudit],
                     binding.source = ",".join(
                         filter(None, [binding.source, "fabric"]))
                 elif comp is not None:
-                    binding.isid_note = notes.get(comp.status, "unresolved")
+                    binding.isid_note = notes.get(comp.status, unmatched)
                 else:
-                    binding.isid_note = "unresolved"
+                    binding.isid_note = unmatched
             holder.isids = sorted({b.isid for b in holder.bindings
                                    if b.isid is not None})

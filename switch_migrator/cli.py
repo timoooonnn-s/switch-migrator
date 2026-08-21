@@ -42,7 +42,7 @@ from switch_migrator.connection import (
     enable_legacy_ssh_algorithms,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
-from switch_migrator import cabling_sheet, health, location
+from switch_migrator import cabling_sheet, handover, health, location
 from switch_migrator import manifest as manifest_mod
 from switch_migrator import mlt_generate, snapshot as snapshot_mod, verify
 from switch_migrator.report import console as console_report
@@ -54,12 +54,12 @@ from switch_migrator.report.migration_tables import (
 )
 from switch_migrator.report.progress import NullProgress, make_progress
 from switch_migrator.report.migration import (
-    new_switch_names,
     assign_port_uids,
     build_cabling,
     build_cabling_by_location,
     build_commands,
     build_port_info,
+    new_switch_names,
 )
 from switch_migrator.report.excel import write_csv, write_excel
 from switch_migrator.report.tables import build_all
@@ -152,6 +152,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "every command sent and its outcome, what failed, "
                              "which files were produced - an audit trail of the "
                              "pre-migration check")
+    parser.add_argument("--handover", action="store_true",
+                        help="collect this run's output into "
+                             "<output>/handover-<stamp>/ with an index.html "
+                             "tying it together - the folder to hand to a "
+                             "reviewer, a change record or your future self")
     parser.add_argument("--health-check", action="store_true",
                         help="go/no-go check before the migration window: "
                              "flags anything already broken that the migration "
@@ -693,7 +698,8 @@ def main(argv: list[str] | None = None) -> int:
     # the comparison is the only thing that knows which I-SID a VLAN without a
     # local binding lands on - push that answer back into the port/MLT bindings
     # so the migration sheets can show it instead of an empty cell
-    resolve_binding_isids(audits, comparisons)
+    resolve_binding_isids(audits, comparisons,
+                          fabric_checked=not args.no_fabric)
 
     # 4) Report
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
@@ -786,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 
+
     # Exit code mirrors the worst finding so the tool is scriptable
     severities = [t for table in tables for t in table.severities]
     unreachable = [a for a in audits if not a.reachable]
@@ -804,6 +811,19 @@ def main(argv: list[str] | None = None) -> int:
                                written, commands_by_device,
                                config_path=args.config, exit_code=code))
         console.print(f"Run manifest: [bold]{path}[/bold]")
+        written.append(path)
+
+    # last, so the folder contains everything the run produced - the manifest
+    # included, which is the file a change record actually wants
+    if args.handover:
+        bundle = handover.build(
+            args.output_dir, written, tables, audits,
+            meta={"started": started.isoformat(timespec="seconds"),
+                  "config": str(args.config),
+                  "switches": ", ".join(a.name for a in audits)},
+            stamp=stamp)
+        console.print(f"Handover bundle: [bold]{bundle}[/bold]\n"
+                      f"  open [bold]{bundle / 'index.html'}[/bold]")
     return code
 
 
