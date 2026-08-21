@@ -146,6 +146,11 @@ A device that still can't connect is reported as **UNREACHABLE** (console +
 Summary + Issues) and the audit simply continues with the remaining
 switches — one dead box never aborts the run.
 
+For the full picture of the session layer — the Ctrl-Y login gate on ERS, the
+`enable`/paging phases, retries and the circuit breaker, every place the two
+platforms diverge, and a symptom-to-fix decision tree — see
+**[docs/CONNECTIONS.md](docs/CONNECTIONS.md)**.
+
 ## Usage
 
 Two interfaces over the same code: a menu for working through a migration, and
@@ -725,6 +730,9 @@ pytest -v
 The test suite runs entirely offline against captured CLI fixtures in
 `tests/fixtures/` — including a full end-to-end pipeline test through
 collectors, comparison and report writers.
+
+`docs/CONNECTIONS.md` documents the connection layer in depth (both platforms,
+its invariants, and how to add a third one).
 
 ### Project layout
 
