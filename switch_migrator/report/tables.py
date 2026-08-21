@@ -25,6 +25,24 @@ class Table:
     # Excel and CSV always get every column; None means "show them all".
     console_columns: list[str] | None = None
 
+    # --- presentation hints, honoured by the Excel writer -------------------
+    # Columns whose content is long enough to need wrapping rather than being
+    # cut off at the column width (VLAN pair lists, MAC lists, evidence).
+    wrap_columns: list[str] = field(default_factory=list)
+    # Columns a human fills in by hand. They are left unlocked when the sheet
+    # is protected, and shaded so the eye finds them on a printed page.
+    manual_columns: list[str] = field(default_factory=list)
+    # {column: allowed values} - a dropdown, so a switch name is picked rather
+    # than typed at 3am.
+    choice_columns: dict[str, list[str]] = field(default_factory=dict)
+    # Columns that must hold a whole number if they hold anything.
+    int_columns: list[str] = field(default_factory=list)
+    # Start a new printed page whenever this column's value changes, so one
+    # rack's rows never straddle two sheets of paper.
+    page_break_column: str = ""
+    # How many leading columns stay on screen while scrolling right.
+    freeze_columns: int = 0
+
     def add(self, row: list, severity: str | None = None):
         self.rows.append(row)
         self.severities.append(severity)
@@ -199,6 +217,50 @@ def build_issues(audits: list[SwitchAudit], fabric: FabricState,
     return t
 
 
+def build_coverage(audits: list[SwitchAudit]) -> Table:
+    """How complete the collected data actually is, per switch.
+
+    Several sources are optional: a release that rejects `show vlan members`,
+    or a run without the running-config, still produces a full-looking sheet -
+    with thinner VLAN columns. That difference used to be invisible, which is
+    how a cabling sheet reached a data centre missing VLANs nobody knew were
+    missing. This sheet makes it a number you can look at before the window.
+    """
+    t = Table("Coverage", [
+        "Switch", "Reachable", "Ports", "Ports with VLANs", "VLAN coverage",
+        "Ports with I-SIDs", "Ports with tagging", "VLANs", "MLTs",
+        "MLTs with VLANs", "Sources that answered", "Sources that did not",
+    ])
+    t.wrap_columns = ["Sources that answered", "Sources that did not"]
+    for audit in sorted(audits, key=lambda a: a.name):
+        total = len(audit.ports)
+        with_vlans = audit.ports_with_vlans
+        with_isids = sum(1 for p in audit.ports
+                         if any(b.isid is not None for b in p.bindings))
+        with_tagging = sum(1 for p in audit.ports
+                           if any(b.tagging for b in p.bindings))
+        mlts_with_vlans = sum(1 for m in audit.mlts if m.bindings)
+        ok = [s.name for s in audit.sources if s.ok]
+        missing = [f"{s.name} ({s.detail})" if s.detail else s.name
+                   for s in audit.sources if not s.ok]
+        pct = f"{with_vlans * 100 // total}%" if total else "-"
+        # a switch whose ports mostly have no VLAN at all is the case worth
+        # catching: the sheet will look finished and be half empty
+        severity = "ok"
+        if not audit.reachable:
+            severity = "error"
+        elif total and with_vlans * 2 < total:
+            severity = "error"
+        elif missing or (total and with_vlans < total) or not with_tagging:
+            severity = "warn"
+        t.add([
+            audit.name, "yes" if audit.reachable else "NO", total, with_vlans,
+            pct, with_isids, with_tagging, len(audit.vlans), len(audit.mlts),
+            mlts_with_vlans, ", ".join(ok) or "-", ", ".join(missing) or "-",
+        ], severity)
+    return t
+
+
 def build_all(audits: list[SwitchAudit], fabric: FabricState,
               comparisons: dict[str, list[VlanComparison]],
               no_fabric: bool = False) -> list[Table]:
@@ -209,6 +271,7 @@ def build_all(audits: list[SwitchAudit], fabric: FabricState,
             build_vlan_inventory(audits),
             build_ports(audits),
             build_mlts(audits),
+            build_coverage(audits),
             build_issues(audits, fabric, comparisons),
         ]
     return [
@@ -217,5 +280,6 @@ def build_all(audits: list[SwitchAudit], fabric: FabricState,
         build_ports(audits),
         build_mlts(audits),
         build_fabric(fabric),
+        build_coverage(audits),
         build_issues(audits, fabric, comparisons),
     ]

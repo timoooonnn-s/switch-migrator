@@ -387,7 +387,9 @@ def test_excel_tab_names_survive_long_and_illegal_location_names(tmp_path):
         tables.append(t)
     path = tmp_path / "sheets.xlsx"
     write_excel(tables, path)
-    titles = load_workbook(path).sheetnames
+    from switch_migrator.report.excel import STAMP_SHEET
+    # the hidden version stamp is not one of the report tabs
+    titles = [t for t in load_workbook(path).sheetnames if t != STAMP_SHEET]
     assert len(titles) == 3, "a tab was lost to a name collision"
     assert len(set(titles)) == 3
     for title in titles:

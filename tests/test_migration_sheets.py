@@ -8,7 +8,13 @@ import pytest
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.config import Config, SshSettings, SwitchTarget
 from switch_migrator.connection import OfflineRunner
-from switch_migrator.models import Platform, PortState, SwitchAudit
+from switch_migrator.models import (
+    UNTAGGED,
+    Platform,
+    PortState,
+    SwitchAudit,
+    VlanBinding,
+)
 from switch_migrator.parsers.common import normalize_mac, parse_mac_table
 from switch_migrator.parsers.voss_parsers import parse_mlt_lacp
 from switch_migrator.report.migration import (
@@ -91,7 +97,9 @@ def _audit_with_ports() -> SwitchAudit:
     a.ports = [
         PortState(port="1/1", description="10GbSR", admin_up=True, oper_up=True,
                   lldp_neighbor="srv-a", macs=["00:11:22:00:00:01"], mac_total=1,
-                  vlans=[695], isids=[2500695], tagging="untagged"),
+                  vlans=[695], isids=[2500695], tagging="untagged",
+                  bindings=[VlanBinding(vlan=695, isid=2500695, tagging=UNTAGGED,
+                                        source="running-config")]),
         PortState(port="1/2", description="10GbSR", admin_up=True, oper_up=False),
         PortState(port="1/48", description="10GbSR", admin_up=True, oper_up=True,
                   lldp_neighbor="core-01", is_uplink=True, mlt_id=1,
@@ -121,6 +129,8 @@ def test_port_info_lists_every_port_with_migration_columns():
     assert row[hdr.index("MAC addresses")] == "00:11:22:00:00:01"
     assert row[hdr.index("VLAN IDs")] == "695"
     assert row[hdr.index("I-SIDs")] == "2500695"
+    assert row[hdr.index("VLAN -> I-SID")] == "695->2500695 (u)"
+    assert row[hdr.index("VLAN source")] == "running-config"
     assert row[hdr.index("Media")] == "10GbSR"
     uplink = t.rows[2]
     assert uplink[hdr.index("LACP")] == "yes"
@@ -135,7 +145,11 @@ def test_cabling_sheet_only_connected_ports_with_blank_new_columns():
     assert len(t.rows) == 2
     hdr = t.headers
     first = t.rows[0]
-    assert first[hdr.index("VLAN")] == 695              # first VLAN
+    # the leading column is the port's UNTAGGED VLAN, not whichever VLAN
+    # happened to sort first - on a trunk that number meant nothing
+    assert first[hdr.index("Untagged VLAN")] == 695
+    assert first[hdr.index("VLAN -> I-SID")] == "695->2500695 (u)"
+    assert first[hdr.index("Rack (old)")] == ""        # filled in by hand
     assert first[hdr.index("Type")] == "access"
     assert first[hdr.index("Port ID")] == "P0001"
     assert first[hdr.index("Old switch")] == "old-01"

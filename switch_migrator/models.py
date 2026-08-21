@@ -68,6 +68,23 @@ class VlanBinding:
         return f"{text} ({self.tagging})" if self.tagging else text
 
 
+def tagging_summary(bindings: list[VlanBinding]) -> str:
+    """One word for a whole port or MLT, derived from its bindings.
+
+    Only says something when the bindings do. The rule this replaced - one
+    VLAN means untagged, several mean tagged - called a trunk carrying a
+    single tagged VLAN 'untagged', which is a wrong port on the new switch.
+    """
+    kinds = {b.tagging for b in bindings if b.tagging}
+    if not kinds:
+        return ""
+    if kinds == {TAGGED}:
+        return "tagged"
+    if kinds == {UNTAGGED}:
+        return "untagged"
+    return "mixed"
+
+
 @dataclass
 class SourceStatus:
     """Whether one collected source answered, for the coverage report.

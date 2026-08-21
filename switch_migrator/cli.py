@@ -54,6 +54,7 @@ from switch_migrator.report.migration_tables import (
 )
 from switch_migrator.report.progress import NullProgress, make_progress
 from switch_migrator.report.migration import (
+    new_switch_names,
     assign_port_uids,
     build_cabling,
     build_cabling_by_location,
@@ -698,7 +699,9 @@ def main(argv: list[str] | None = None) -> int:
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
     if args.migration_sheets:
         assign_port_uids(audits)
-        tables += [build_port_info(audits), build_cabling(audits)]
+        targets = new_switch_names(args.new_switch)
+        tables += [build_port_info(audits),
+                   build_cabling(audits, targets)]
 
     if args.migration_sheets and (args.split_by_location or args.location_group):
         rules = cfg.locations
@@ -711,7 +714,8 @@ def main(argv: list[str] | None = None) -> int:
         # fill-in document, and one link on two sheets means one set of
         # answers gets lost
         tables = [t for t in tables if t.title != "Cabling"]
-        tables += build_cabling_by_location(audits, rules)
+        tables += build_cabling_by_location(
+            audits, rules, new_switch_names(args.new_switch))
         console.print("Cabling sheet split by location:")
         for line in location.describe(rules, [a.name for a in audits]):
             console.print(f"  {line}")

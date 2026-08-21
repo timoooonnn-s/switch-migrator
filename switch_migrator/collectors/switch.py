@@ -8,13 +8,12 @@ import logging
 from switch_migrator.config import Config, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError
 from switch_migrator.models import (
-    TAGGED,
-    UNTAGGED,
     Platform,
     PortState,
     SwitchAudit,
     VlanBinding,
     VlanInfo,
+    tagging_summary,
 )
 from switch_migrator.parsers import ers_config, ers_parsers, voss_config, voss_parsers
 from switch_migrator.usage import classify_audit, parse_uptime_days
@@ -391,24 +390,7 @@ def _build_port_bindings(audit: SwitchAudit, by_port: dict,
 
     for port in audit.ports:
         _sync_flat_lists(port)
-        port.tagging = _tagging_summary(port.bindings)
-
-
-def _tagging_summary(bindings: list[VlanBinding]) -> str:
-    """One word for the whole port, from the bindings' own tagging.
-
-    Only says something when the bindings do. The old rule - one VLAN means
-    untagged, several mean tagged - called a trunk carrying a single tagged
-    VLAN 'untagged', which is a wrong port on the new switch.
-    """
-    kinds = {b.tagging for b in bindings if b.tagging}
-    if not kinds:
-        return ""
-    if kinds == {TAGGED}:
-        return "tagged"
-    if kinds == {UNTAGGED}:
-        return "untagged"
-    return "mixed"
+        port.tagging = tagging_summary(port.bindings)
 
 
 def _build_mlt_bindings(audit: SwitchAudit, by_port: dict,

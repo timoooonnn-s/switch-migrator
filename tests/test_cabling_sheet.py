@@ -260,3 +260,84 @@ def test_xlsx_worksheet_with_a_leading_blank_row_is_still_read(tmp_path):
     sheet = CS.load(path)
     assert len(sheet.rows) == 1
     assert sheet.rows[0].old_port == "1/7"
+
+
+# --------------------------------------------------------------------------- #
+# The sheet the writer produces, read straight back in
+# --------------------------------------------------------------------------- #
+
+def _written_sheet(tmp_path, rows=None):
+    from switch_migrator.models import UNTAGGED, PortState, SwitchAudit, VlanBinding
+    from switch_migrator.models import Platform
+    from switch_migrator.report.excel import write_excel
+    from switch_migrator.report.migration import assign_port_uids, build_cabling
+
+    a = SwitchAudit(name="old-01", host="old-01", platform=Platform.VOSS,
+                    reachable=True)
+    a.ports = [PortState(port="1/1", admin_up=True, oper_up=True,
+                         lldp_neighbor="srv-a", usage="IN USE",
+                         bindings=[VlanBinding(vlan=695, isid=2500695,
+                                               tagging=UNTAGGED,
+                                               source="running-config")])]
+    assign_port_uids([a])
+    table = build_cabling([a], ["new-01", "new-02"])
+    path = tmp_path / "cabling.xlsx"
+    write_excel([table], path)
+    return path
+
+
+def test_the_written_cabling_sheet_reads_back(tmp_path):
+    path = _written_sheet(tmp_path)
+    sheet = CS.load(path)
+    assert len(sheet.rows) == 1
+    row = sheet.rows[0]
+    assert row.old_switch == "old-01" and row.old_port == "1/1"
+    assert row.uid == "P0001"
+    assert row.tagging == "untagged"
+    # the rack columns exist and are empty - a human fills them in
+    assert row.rack_old == "" and row.rack_new == ""
+    # the hidden stamp is not mistaken for a worksheet of links
+    assert "_migrator" not in sheet.sheets_read
+
+
+def test_the_stamp_records_the_build_that_wrote_the_sheet(tmp_path):
+    from switch_migrator.report.excel import SHEET_SCHEMA
+    sheet = CS.load(_written_sheet(tmp_path))
+    assert sheet.schema == SHEET_SCHEMA
+    assert sheet.written_by
+    # a current sheet raises no version complaint
+    assert not [p for p in sheet.problems if "written by switch-migrator" in p]
+
+
+def test_a_sheet_from_an_older_build_is_flagged_not_rejected(tmp_path):
+    from openpyxl import load_workbook
+    from switch_migrator.report.excel import STAMP_SHEET
+    path = _written_sheet(tmp_path)
+    wb = load_workbook(path)
+    stamp = wb[STAMP_SHEET]
+    for row in stamp.iter_rows():
+        if row[0].value == "schema":
+            row[1].value = "1"
+    wb.save(path)
+
+    sheet = CS.load(path)
+    assert len(sheet.rows) == 1            # still read, not rejected
+    assert any("sheet schema 1" in p for p in sheet.problems)
+
+
+def test_rack_columns_are_read_when_filled_in(tmp_path):
+    from openpyxl import load_workbook
+    path = _written_sheet(tmp_path)
+    wb = load_workbook(path)
+    ws = wb["Cabling"]
+    headers = [c.value for c in ws[1]]
+    ws.cell(row=2, column=headers.index("Rack (old)") + 1).value = "R12"
+    ws.cell(row=2, column=headers.index("Rack (new)") + 1).value = "R44"
+    ws.cell(row=2, column=headers.index("NEW switch") + 1).value = "new-01"
+    ws.cell(row=2, column=headers.index("NEW port") + 1).value = "Port 1/9"
+    wb.save(path)
+
+    row = CS.load(path).rows[0]
+    assert row.rack_old == "R12" and row.rack_new == "R44"
+    assert row.migrated and row.new_switch == "new-01"
+    assert row.new_port == "1/9"           # normalised on the way in

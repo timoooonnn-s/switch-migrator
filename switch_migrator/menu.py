@@ -427,7 +427,7 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     from switch_migrator.report.excel import write_excel
     from switch_migrator.report.migration import (
         assign_port_uids, build_cabling, build_cabling_by_location,
-        build_commands, build_port_info)
+        build_commands, build_port_info, new_switch_names)
     from switch_migrator.report.tables import build_all
 
     fabric = s.fabric or FabricState()
@@ -440,12 +440,14 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
         tables.append(build_port_info(s.audits))
         if s.split_by_location:
             rules = s.location_rules()
-            tables += build_cabling_by_location(s.audits, rules)
+            tables += build_cabling_by_location(
+                s.audits, rules, new_switch_names(s.new_switch))
             console.print("[dim]Cabling split by location:[/dim]")
             for line in location_mod.describe(rules, [a.name for a in s.audits]):
                 console.print(f"  [dim]{line}[/dim]")
         else:
-            tables.append(build_cabling(s.audits))
+            tables.append(
+                build_cabling(s.audits, new_switch_names(s.new_switch)))
 
     console_report.render(tables, console, verbose=False)
 
