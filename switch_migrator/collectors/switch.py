@@ -53,6 +53,12 @@ def collect_switch(target: SwitchTarget, runner: BaseRunner, cfg: Config,
     if pull_config:
         out = _run(audit, runner, "show running-config", required=False, absent_ok=True)
         audit.running_config = out or ""
+        if not out:
+            # absent_ok keeps this out of the warnings, but it is exactly the
+            # invisibility the coverage sheet exists to end: without the config
+            # the tagging columns are empty, and nothing else would say why
+            audit.record_source("running-config", False,
+                                "the device returned no running-config")
     _enrich(audit, runner, cfg, pull_macs=pull_macs)
     if not keep_config:
         # The config was read for the tagging it carries, which is now in the
@@ -329,7 +335,13 @@ def _config_bindings(audit: SwitchAudit,
     except Exception as exc:                       # never lose a run to a config
         audit.warnings.append(f"running-config not usable as a VLAN source: {exc}")
         audit.record_source("running-config", False, str(exc)[:120])
-        return {}, {}, {}
+        # cache the failure as well: returning early used to leave the cache
+        # empty, so the second consumer parsed the config again and appended a
+        # duplicate warning and a duplicate coverage row
+        empty: tuple[dict, dict, dict] = ({}, {}, {})
+        if _cache is not None:
+            _cache["bindings"] = empty
+        return empty
     audit.record_source("running-config", True,
                         f"{len(ports)} port(s) with VLAN bindings")
     result = (ports, mlts, vlans)

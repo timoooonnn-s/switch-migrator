@@ -326,16 +326,67 @@ vlan members 10 5
     assert ers_config.port_bindings(model)["5"][0].tagging == UNTAGGED
 
 
-def test_coverage_does_not_call_spare_ports_an_error():
-    """Severities feed the exit code. A 48-port box with 12 patched is normal
-    and must not make the tool exit 1."""
+def test_coverage_does_not_flag_spare_ports_at_all():
+    """Severities feed the exit code. Most of a 48-port box being dark is
+    normal - not an error, and not even worth an amber row."""
     from switch_migrator.models import PortState, SwitchAudit
     from switch_migrator.report.tables import build_coverage
 
     audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
                         reachable=True)
-    audit.ports = [PortState(port=f"1/{n}") for n in range(1, 49)]
+    audit.ports = [PortState(port=f"1/{n}", oper_up=False) for n in range(1, 49)]
     for port in audit.ports[:12]:
+        port.oper_up = True
         port.bindings = [VlanBinding(vlan=100, isid=10100, tagging=TAGGED)]
     table = build_coverage([audit])
-    assert table.severities[0] == "warn"      # worth noting, not a failure
+    assert table.severities[0] == "ok"
+
+
+def test_coverage_flags_an_up_port_with_no_vlan_data():
+    """The hole that matters: a live port whose VLANs nothing could read. It
+    reaches the cabling sheet looking complete and empty."""
+    from switch_migrator.models import PortState, SwitchAudit
+    from switch_migrator.report.tables import build_coverage
+
+    audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
+                        reachable=True)
+    audit.ports = [
+        PortState(port="1/1", oper_up=True,
+                  bindings=[VlanBinding(vlan=100, isid=10100, tagging=TAGGED)]),
+        PortState(port="1/2", oper_up=True),        # up, and we know nothing
+    ]
+    table = build_coverage([audit])
+    row = dict(zip(table.headers, table.rows[0]))
+    assert row["Up ports missing VLANs"] == 1
+    assert table.severities[0] == "warn"
+
+
+def test_coverage_reads_a_snapshot_from_an_older_build():
+    """Older snapshots carry the flat vlans/isids lists and no bindings.
+    Counting bindings alone reported complete data as 0% and, because that
+    tripped the error branch, made --from-snapshot exit 1."""
+    from switch_migrator.models import PortState, SwitchAudit
+    from switch_migrator.report.tables import build_coverage
+
+    audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
+                        reachable=True)
+    audit.ports = [PortState(port="1/1", oper_up=True, vlans=[100],
+                             isids=[10100], tagging="untagged")]
+    table = build_coverage([audit])
+    row = dict(zip(table.headers, table.rows[0]))
+    assert row["Ports with VLANs"] == 1 and row["VLAN coverage"] == "100%"
+    assert row["Ports with I-SIDs"] == 1 and row["Ports with tagging"] == 1
+    assert table.severities[0] == "ok"
+
+
+def test_coverage_is_quiet_on_a_plain_audit_run():
+    """A plain audit never reads the running-config, so tagging is empty by
+    design. Amber on every switch for that would be pure noise."""
+    from switch_migrator.report.tables import build_coverage
+    target = SwitchTarget("voss", "voss", Platform.VOSS)
+    audit = collect_switch(target, OfflineRunner("voss", FIXTURES), _cfg())
+    table = build_coverage([audit])
+    row = dict(zip(table.headers, table.rows[0]))
+    assert row["Ports with tagging"] == 0        # no config was pulled
+    assert row["Sources that did not"] == "-"
+    assert table.severities[0] == "ok"

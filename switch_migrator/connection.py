@@ -589,6 +589,10 @@ class SshRunner(BaseRunner):
             pass
 
     def run(self, command: str) -> str:
+        # the caller's spelling, kept for raw_skip: a `commands:` override
+        # renames the command, and matching only the mapped form would let an
+        # override for 'show running-config' walk the config into the capture
+        requested = command
         command = self._map(command)
         if self._dead:
             raise CommandError(
@@ -625,7 +629,8 @@ class SshRunner(BaseRunner):
                 raise err from exc
             break
         self._transport_failures = 0
-        if self.raw_dir is not None and command not in self.raw_skip:
+        skip = self.raw_skip
+        if self.raw_dir is not None and command not in skip and requested not in skip:
             # explicit encoding: the default is locale-dependent, and a
             # UnicodeEncodeError here is not a CommandError - it would escalate
             # to 'collection crashed' for the whole device

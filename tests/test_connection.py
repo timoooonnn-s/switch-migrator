@@ -539,3 +539,15 @@ def test_quick_auth_check_leaves_the_algorithms_alone_when_disabled(monkeypatch)
     connection.quick_auth_check("host", Credentials("u", "p"),
                                 SshSettings(legacy_algorithms=False))
     assert calls["legacy"] == 0
+
+
+def test_raw_skip_survives_a_command_override(tmp_path):
+    """`commands:` renames the command before it is sent. Matching only the
+    mapped spelling let an override for 'show running-config' walk the config
+    - RADIUS keys and all - straight into the --save-raw capture."""
+    runner = _raw_runner(tmp_path, raw_skip=("show running-config",))
+    runner.command_overrides = {"show running-config":
+                                "show running-config verbose"}
+    runner.run("show running-config")
+    runner.run("show mlt")
+    assert sorted(p.name for p in (tmp_path / "raw").glob("*")) == ["show_mlt.txt"]

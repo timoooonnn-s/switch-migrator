@@ -225,40 +225,53 @@ def build_coverage(audits: list[SwitchAudit]) -> Table:
     with thinner VLAN columns. That difference used to be invisible, which is
     how a cabling sheet reached a data centre missing VLANs nobody knew were
     missing. This sheet makes it a number you can look at before the window.
+
+    Severities feed the process exit code, so they have to mean something
+    actionable. A switch with spare ports is not a finding - most of a 48-port
+    box is usually dark - and neither is missing tagging on a plain audit run,
+    which never reads the running-config in the first place. What IS a finding:
+    a source that was tried and failed, and a port that is UP with no VLAN data
+    behind it, because that is a hole in exactly what the sheet is for.
     """
     t = Table("Coverage", [
         "Switch", "Reachable", "Ports", "Ports with VLANs", "VLAN coverage",
-        "Ports with I-SIDs", "Ports with tagging", "VLANs", "MLTs",
-        "MLTs with VLANs", "Sources that answered", "Sources that did not",
+        "Up ports missing VLANs", "Ports with I-SIDs", "Ports with tagging",
+        "VLANs", "MLTs", "MLTs with VLANs",
+        "Sources that answered", "Sources that did not",
     ])
     t.wrap_columns = ["Sources that answered", "Sources that did not"]
     for audit in sorted(audits, key=lambda a: a.name):
         total = len(audit.ports)
-        with_vlans = audit.ports_with_vlans
+        # Bindings are the current shape, but a snapshot written by an older
+        # build carries only the flat lists. Counting bindings alone reported
+        # complete data as zero coverage and failed the run on --from-snapshot.
+        with_vlans = sum(1 for p in audit.ports if p.bindings or p.vlans)
         with_isids = sum(1 for p in audit.ports
-                         if any(b.isid is not None for b in p.bindings))
+                         if any(b.isid is not None for b in p.bindings)
+                         or p.isids)
         with_tagging = sum(1 for p in audit.ports
-                           if any(b.tagging for b in p.bindings))
-        mlts_with_vlans = sum(1 for m in audit.mlts if m.bindings)
+                           if any(b.tagging for b in p.bindings) or p.tagging)
+        mlts_with_vlans = sum(1 for m in audit.mlts if m.bindings or m.vlans)
+        blind_up = sum(1 for p in audit.ports
+                       if p.oper_up and not (p.bindings or p.vlans))
         ok = [s.name for s in audit.sources if s.ok]
         missing = [f"{s.name} ({s.detail})" if s.detail else s.name
                    for s in audit.sources if not s.ok]
         pct = f"{with_vlans * 100 // total}%" if total else "-"
-        # Severities here feed the process exit code, so 'error' has to mean a
-        # collection that failed - not a switch with spare ports. A 48-port box
-        # with 12 patched is normal and says nothing about coverage; a
-        # reachable switch with ports and NO VLAN data at all is a real gap.
+        # a reachable switch with ports and NO VLAN data at all is a collection
+        # that failed, whatever it says elsewhere
         severity = "ok"
         if not audit.reachable:
             severity = "error"
         elif total and not with_vlans:
             severity = "error"
-        elif missing or (total and with_vlans < total) or not with_tagging:
+        elif missing or blind_up:
             severity = "warn"
         t.add([
             audit.name, "yes" if audit.reachable else "NO", total, with_vlans,
-            pct, with_isids, with_tagging, len(audit.vlans), len(audit.mlts),
-            mlts_with_vlans, ", ".join(ok) or "-", ", ".join(missing) or "-",
+            pct, blind_up, with_isids, with_tagging, len(audit.vlans),
+            len(audit.mlts), mlts_with_vlans,
+            ", ".join(ok) or "-", ", ".join(missing) or "-",
         ], severity)
     return t
 

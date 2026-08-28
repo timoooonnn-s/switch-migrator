@@ -341,3 +341,24 @@ def test_rack_columns_are_read_when_filled_in(tmp_path):
     assert row.rack_old == "R12" and row.rack_new == "R44"
     assert row.migrated and row.new_switch == "new-01"
     assert row.new_port == "1/9"           # normalised on the way in
+
+
+def test_the_tools_own_columns_are_not_reported_as_foreign(tmp_path):
+    """The sheet writes VLAN -> I-SID, MLT VLAN -> I-SID and VLAN source for
+    the human at the rack and does not read them back. Counting them as
+    somebody's own additions made every read-back complain about the file the
+    tool had just written."""
+    sheet = CS.load(_written_sheet(tmp_path))
+    assert not [p for p in sheet.problems if "not written by this tool" in p]
+
+
+def test_a_genuinely_foreign_column_is_still_reported(tmp_path):
+    from openpyxl import load_workbook
+    path = _written_sheet(tmp_path)
+    wb = load_workbook(path)
+    ws = wb["Cabling"]
+    ws.cell(row=1, column=ws.max_column + 1).value = "Signed off by"
+    wb.save(path)
+    sheet = CS.load(path)
+    assert any("1 column(s) not written by this tool" in p
+               for p in sheet.problems)

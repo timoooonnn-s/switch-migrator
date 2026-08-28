@@ -136,6 +136,12 @@ _COLUMNS = {
     "vlanuntagged": "sheet_vlan",
     "untaggedvlan": "sheet_vlan",
 }
+# Columns the tool WRITES but does not read back: they exist for the human at
+# the rack, and their content is already carried by the flat VLAN/I-SID columns
+# beside them. Listing them here keeps the sheet from reporting its own
+# headers as "columns not written by this tool".
+_WRITE_ONLY = {"vlanisid", "mltvlanisid", "vlansource"}
+
 _INT_FIELDS = {"new_mlt_id", "new_vlan", "mlt_id"}
 _LIST_INT_FIELDS = {"port_vlans", "port_isids", "mlt_vlans", "mlt_isids"}
 _LIST_STR_FIELDS = {"macs"}
@@ -307,7 +313,8 @@ def _parse_table(where: str, raw: list[list], sheet: Sheet, path: Path) -> None:
         row.sheet = where
         sheet.rows.append(row)
 
-    unknown = [h for h in headers if h and h not in _COLUMNS]
+    unknown = [h for h in headers
+               if h and h not in _COLUMNS and h not in _WRITE_ONLY]
     if unknown:
         # not a problem - people add their own columns - but worth saying once
         sheet.problems.append(

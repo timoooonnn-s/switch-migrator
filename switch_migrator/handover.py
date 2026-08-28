@@ -45,9 +45,12 @@ _DESCRIPTIONS = [
                  "credentials."),
     ("csv-", "The same sheets as CSV, one file each."),
     (".csv", "One report sheet as CSV."),
-    ("config/", "Per-device configuration: a neutralized extract (VOSS) or a "
-                "generated flex-UNI draft plus its I-SID decisions (ERS)."),
 ]
+
+# The config extracts arrive as a whole directory rather than a file, so it is
+# matched by name instead of by a substring of one.
+_CONFIG_DIR_TEXT = ("Per-device configuration: a neutralized extract (VOSS) or "
+                    "a generated flex-UNI draft plus its I-SID decisions (ERS).")
 
 # Which report tables are worth showing on the index page itself. The rest are
 # in the workbook; these three are the ones somebody skims before opening it.
@@ -106,9 +109,12 @@ footer { margin-top: 3rem; color: #6b7883; font-size: .82rem;
 """
 
 
-def _describe(name: str) -> str:
+def _describe(path: Path) -> str:
+    """What this entry in the bundle is for, or '' when nothing fits."""
+    if path.is_dir() and path.name == "config":
+        return _CONFIG_DIR_TEXT
     for marker, text in _DESCRIPTIONS:
-        if marker in name:
+        if marker in path.name:
             return text
     return ""
 
@@ -162,7 +168,7 @@ def _render_index(bundle: Path, files: list[Path], tables: list[Table],
     parts.append("<h2>Files</h2><ul class=\"files\">")
     for path in files:
         rel = path.name
-        blurb = _describe(rel) or _describe(str(path))
+        blurb = _describe(path)
         parts.append(
             f'<li><a href="{html.escape(rel)}">{html.escape(rel)}</a>'
             + (f"<span>{html.escape(blurb)}</span>" if blurb else "")

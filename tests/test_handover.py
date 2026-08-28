@@ -100,3 +100,9 @@ def test_a_missing_file_is_skipped_rather_than_fatal(tmp_path):
                             _audits(), stamp="20260101-000000")
     assert (bundle / "index.html").is_file()
     assert not (bundle / "never-written.xlsx").exists()
+
+
+def test_the_config_directory_gets_a_blurb_like_every_other_entry(tmp_path):
+    _, bundle = _bundle(tmp_path)
+    page = (bundle / "index.html").read_text()
+    assert "Per-device configuration" in page
