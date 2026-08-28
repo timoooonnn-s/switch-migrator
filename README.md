@@ -860,11 +860,26 @@ not failures.
   as `IN_FABRIC_NOT_ATTACHED` — that's the "verify by hand" bucket by
   design. You can add important BEBs to `dvr_controllers`; any VOSS node
   works as an additional state source.
-* **Wrapped port lists.** Both platforms break a long member list after a
-  comma onto a continuation line. Port lists are validated per element and the
-  member parsers absorb continuation lines, so a VLAN whose members wrapped
-  keeps all of them. (Before this, the trailing comma made the whole list
-  fail to parse and the VLAN lost *every* port, not just the wrapped ones.)
+* **Wrapped port lists.** Both platforms break a long member list onto a
+  continuation line, either after a comma (`1/1-1/10,1/12,`) or inside a range
+  (`1/1-1/16,1/17/1-`). Port lists are validated per element, both wrap marks
+  keep the list open, and the member parsers absorb continuation lines - so a
+  VLAN whose members wrapped keeps all of them. (Before this, the first form
+  lost every port of that VLAN and the second was not recognised as a port
+  list at all, which sent the column scan on to *ACTIVE MEMBER* and reported
+  that instead.)
+* **Channelized (breakout) ports.** VOSS prints a breakout range as
+  `1/17/1-1/18/4`. The ports between the endpoints cannot be enumerated from
+  the text alone - the channelization width is not in the output - so it is
+  taken from the range's own last sub-port. Because that is an inference it is
+  used for **VLAN membership only**: a sub-port that does not exist matches no
+  collected port and is dropped, whereas on an MLT an invented member would
+  look like a down leg and fake a degraded aggregation. A range across
+  *different slots* is still left as its two endpoints, and says so in the log.
+* **An unknown VLAN type (ERS/BOSS).** The `Type` keyword anchors the name
+  column, so a release adding a type to the vocabulary would drop the whole
+  VLAN. A fallback anchored on the `PID` column parses the row whatever the
+  type says.
 * **Tagged vs untagged comes only from the running-config.** No `show` command
   states it reliably on either platform. Without the config the tagging columns
   stay empty rather than being guessed, and Coverage reports it.
@@ -898,6 +913,12 @@ pytest -v
 The test suite runs entirely offline against captured CLI fixtures in
 `tests/fixtures/` — including a full end-to-end pipeline test through
 collectors, comparison and report writers.
+
+Two fixture directories are **doc-derived, not captured from a device**:
+`tests/fixtures/voss_9x/` and `tests/fixtures/ers_boss8x/`, each with a README
+saying so. They pin the tolerance behaviour above for shapes no capture exists
+for yet — replace them with real `--save-raw` output when you have it, and
+keep the tests.
 
 `docs/CONNECTIONS.md` documents the connection layer in depth (both platforms,
 its invariants, and how to add a third one).
