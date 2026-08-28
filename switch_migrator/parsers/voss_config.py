@@ -129,8 +129,8 @@ def _parse_isid_block_line(model: VossConfigModel, line: str, isid: int) -> None
     m = re.match(r"c-vid\s+(\d+)\s+(port|mlt)\s+(\S+)", line, re.IGNORECASE)
     if m:
         vid, kind, target = int(m.group(1)), m.group(2).lower(), m.group(3)
-        for tgt in (expand_port_list(target) if kind == "port"
-                    else _vlan_ids(target)):
+        for tgt in (expand_port_list(target, span_subports=True)
+                    if kind == "port" else _vlan_ids(target)):
             model.service(kind, str(tgt), isid).cvids.add(vid)
         return
     # 'untagged-traffic port 1/4' - untagged frames on that port land in this
@@ -139,8 +139,8 @@ def _parse_isid_block_line(model: VossConfigModel, line: str, isid: int) -> None
     m = re.match(r"untagged-traffic\s+(port|mlt)\s+(\S+)", line, re.IGNORECASE)
     if m:
         kind, target = m.group(1).lower(), m.group(2)
-        for tgt in (expand_port_list(target) if kind == "port"
-                    else _vlan_ids(target)):
+        for tgt in (expand_port_list(target, span_subports=True)
+                    if kind == "port" else _vlan_ids(target)):
             model.service(kind, str(tgt), isid).untagged = True
 
 
@@ -193,7 +193,7 @@ def _parse_global_line(model: VossConfigModel, line: str) -> None:
                  line, re.IGNORECASE)
     if m:
         op = (m.group(1) or "add").lower()
-        ports = expand_port_list(m.group(3))
+        ports = expand_port_list(m.group(3), span_subports=True)
         for vid in _vlan_ids(m.group(2)):
             current = model.vlan_members.setdefault(vid, [])
             if op == "remove":

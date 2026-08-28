@@ -59,11 +59,18 @@ def parse_vlans(output: str) -> list[VlanInfo]:
         r"^\s*(\d{1,4})\s+(.*?)\s+(" + "|".join(re.escape(t) for t in _VLAN_TYPES) + r")\b",
         re.IGNORECASE,
     )
+    # Fallback for a VLAN TYPE this build has never heard of: a release that
+    # adds one would otherwise drop the whole row, and a VLAN missing from the
+    # report is far worse than one whose name is a word too long. Anchored on
+    # the columns after the name instead of on the type vocabulary -
+    # '<id> <name...> <type> <protocol> <PID 0x....>' - so the type may be
+    # anything as long as the row still has the shape of a VLAN row.
+    pid_re = re.compile(r"^\s*(\d{1,4})\s+(.+?)\s+(\S+)\s+(\S+)\s+0x[0-9a-fA-F]{4}\b")
     member_re = re.compile(r"Port\s+Members?\s*:\s*(.+?)\s*$", re.IGNORECASE)
     current: VlanInfo | None = None
     raw = ""       # member list still being accumulated across wrapped lines
     for line in output.splitlines():
-        m = type_re.match(line)
+        m = type_re.match(line) or pid_re.match(line)
         if m:
             raw = ""
             vlan_id = int(m.group(1))

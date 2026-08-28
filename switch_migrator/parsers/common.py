@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 from switch_migrator.models import LldpNeighbor
 
 # 1/1  1/1/1  (VSP channelized)  49  2/49 (ERS stack)
 PORT_RE = re.compile(r"^\d+(?:/\d+){0,2}$")
+
+log = logging.getLogger(__name__)
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
@@ -35,9 +38,12 @@ _PORT_CHUNK_RE = re.compile(r"^\d+(?:/\d+){0,2}(?:-\d+(?:/\d+){0,2})?$")
 def is_port_list(raw: str) -> bool:
     """Does this token look like a port list?
 
-    Tolerant of the trailing comma a device leaves behind when it wraps a long
-    list onto a continuation line ('1/1-1/10,1/12,'), which is exactly the case
-    where recognising the token matters most.
+    Tolerant of both marks a device leaves behind when it wraps a long list
+    onto a continuation line - a trailing comma ('1/1-1/10,1/12,') and a
+    trailing hyphen from a break inside a range ('1/1-1/16,1/17/1-'). That is
+    exactly the case where recognising the token matters most: rejecting it
+    does not merely lose the wrapped remainder, it sends the caller's column
+    scan on to the NEXT column and reads that one instead.
     """
     return bool(_port_chunks(raw))
 
@@ -49,10 +55,16 @@ def _port_chunks(raw: str) -> list[str]:
     that wraps a long port list leaves a trailing comma on the first line, and
     rejecting the string outright used to lose every port of that VLAN or MLT,
     not just the wrapped remainder.
+
+    A single trailing hyphen is the other half of that: the break can land
+    inside a range ('1/1-1/16,1/17/1-'), leaving a range with no end. It reads
+    as the range's start, which is what the line actually named.
     """
     raw = raw.strip()
     if not raw or raw.upper() == "NONE":
         return []
+    if raw.endswith("-"):
+        raw = raw[:-1]
     chunks = [c.strip() for c in raw.split(",")]
     chunks = [c for c in chunks if c]
     if not chunks or not all(_PORT_CHUNK_RE.match(c) for c in chunks):
@@ -76,11 +88,47 @@ def name_says_ist(name: str) -> bool:
     return bool(_IST_NAME_RE.search(name or ""))
 
 
-def expand_port_list(raw: str) -> list[str]:
+def _span_channelized(s_parts: list[str], e_parts: list[str]) -> list[str] | None:
+    """Expand a channelized range that crosses parent ports, e.g.
+    '1/17/1-1/18/4' -> 1/17/1..1/17/4, 1/18/1..1/18/4.
+
+    VOSS prints these in `show vlan members` on any box with breakout ports.
+    The channelization width is not in the output, so it is taken from the
+    range's own last sub-port - the notation runs to the end of the final
+    parent port, which makes that the width in every layout Extreme documents.
+
+    Guessing wide is the safe direction here and guessing narrow is not: a
+    sub-port that does not exist matches no collected port and is dropped on
+    the spot, whereas one left out silently loses its VLAN. For that reason
+    this is only ever used for VLAN MEMBERSHIP - never for MLT members, where
+    an invented member would show as a down leg and fake a degraded MLT.
+    """
+    if len(s_parts) != 3 or len(e_parts) != 3 or s_parts[0] != e_parts[0]:
+        return None
+    slot = s_parts[0]
+    p_lo, p_hi = int(s_parts[1]), int(e_parts[1])
+    s_lo, width = int(s_parts[2]), int(e_parts[2])
+    if not 0 < p_hi - p_lo <= 64 or not 0 < width <= 16 or s_lo > width:
+        return None
+    ports = []
+    for parent in range(p_lo, p_hi + 1):
+        first = s_lo if parent == p_lo else 1
+        for sub in range(first, width + 1):
+            ports.append(f"{slot}/{parent}/{sub}")
+    return ports
+
+
+def expand_port_list(raw: str, span_subports: bool = False) -> list[str]:
     """Expand '1/1-1/3,1/10' -> ['1/1','1/2','1/3','1/10'].
 
-    Ranges only expand within the last element (the port number); ranges that
-    cross slots/units are kept as their two endpoints rather than guessed.
+    Ranges expand within the last element (the port number). A range that
+    crosses slots or parent ports cannot be enumerated from the text alone, so
+    it is kept as its two endpoints rather than guessed - and logged, because
+    the ports in between are silently absent from whatever asked for the list.
+    `span_subports` opts into enumerating the channelized case (see
+    `_span_channelized`); callers whose result must not gain a phantom port
+    leave it off.
+
     A trailing comma (a list the device wrapped onto a continuation line) is
     tolerated and expands to the ports named so far.
     """
@@ -98,6 +146,14 @@ def expand_port_list(raw: str) -> list[str]:
                 for n in range(lo, hi + 1):
                     ports.append(f"{prefix}/{n}" if prefix else str(n))
                 continue
+        if span_subports:
+            spanned = _span_channelized(s_parts, e_parts)
+            if spanned is not None:
+                ports.extend(spanned)
+                continue
+        log.info("port range '%s' crosses slots/ports and cannot be enumerated "
+                 "from the output - keeping its endpoints only; the ports "
+                 "between them will be missing", chunk)
         ports.extend([start, end])
     return ports
 

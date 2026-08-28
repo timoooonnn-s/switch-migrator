@@ -361,8 +361,8 @@ def parse_vlan_members(output: str) -> dict[int, list[str]]:
         if (open_vid is not None and tokens
                 and "/" in tokens[0] and is_port_list(tokens[0])):
             raw += tokens[0]
-            result[open_vid] = expand_port_list(raw)
-            if not raw.endswith(","):
+            result[open_vid] = expand_port_list(raw, span_subports=True)
+            if not raw.endswith((",", "-")):
                 open_vid, raw = None, ""
             continue
         open_vid, raw = None, ""
@@ -373,8 +373,11 @@ def parse_vlan_members(output: str) -> dict[int, list[str]]:
             continue
         for t in tokens[1:]:
             if "/" in t and is_port_list(t):
-                result[vid] = expand_port_list(t)
-                if t.endswith(","):
+                # VLAN membership, so a channelized range is enumerated: an
+                # invented sub-port matches no collected port and vanishes,
+                # while a missing one costs that port its VLAN
+                result[vid] = expand_port_list(t, span_subports=True)
+                if t.endswith((",", "-")):
                     open_vid, raw = vid, t
                 break
             if t.upper() == "NONE":

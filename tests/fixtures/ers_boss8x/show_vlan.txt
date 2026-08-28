@@ -1,0 +1,10 @@
+Id   Name                 Type     Protocol         PID    Active IVL/SVL Mgmt
+---- -------------------- -------- ---------------- ------ ------ ------- ----
+1    VLAN #1              Port     None             0x0000 Yes    IVL     Yes
+        Port Members: NONE
+100  Users Floor 1        Port     None             0x0000 Yes    IVL     No
+        Port Members: 1-8,10,26,
+                      30-32,41
+735  Voice VLAN           Voice    None             0x0000 Yes    IVL     No
+        Port Members: 1-8
+Total VLANs: 3
