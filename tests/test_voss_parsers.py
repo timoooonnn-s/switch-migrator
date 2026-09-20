@@ -340,3 +340,50 @@ NUM      INDEX DESCRIPTION         TRAP  LOCK     MTU   ADDRESS           ADMIN 
     ports = {p.port: p for p in voss_parsers.parse_ports(out)}
     assert ports["1/1"].description == "10GbSR"
     assert ports["1/9"].description == ""     # blank media, not 'true'
+
+
+# --------------------------------------------------------------------------- #
+# Wrapped port lists (D1)
+#
+# A long PORT MEMBER list is broken after a comma onto a continuation line.
+# Before the fix the row was truncated at the break AND expand_port_list
+# rejected the trailing comma outright, so the VLAN lost every port.
+# --------------------------------------------------------------------------- #
+
+WRAPPED_MEMBERS = """\
+VLAN     PORT             ACTIVE           STATIC           NOT_ALLOW
+ID       MEMBER           MEMBER           MEMBER           MEMBER
+--------------------------------------------------------------------------------
+1        NONE             NONE             NONE             NONE
+100      1/1-1/10,1/12,   1/1-1/10         1/1-1/10,1/12,
+         1/20-1/22,2/1                     1/20-1/22,2/1
+200      1/2,1/47-1/48    1/47             1/2,1/47-1/48
+
+3 out of 3 Total Num of Vlans displayed
+"""
+
+
+def test_wrapped_vlan_member_list_keeps_the_ports_after_the_break():
+    members = voss_parsers.parse_vlan_members(WRAPPED_MEMBERS)
+    assert members[100] == ["1/1", "1/2", "1/3", "1/4", "1/5", "1/6", "1/7",
+                            "1/8", "1/9", "1/10", "1/12",
+                            "1/20", "1/21", "1/22", "2/1"]
+
+
+def test_wrapping_does_not_leak_into_the_next_vlan():
+    members = voss_parsers.parse_vlan_members(WRAPPED_MEMBERS)
+    assert members[200] == ["1/2", "1/47", "1/48"]
+    assert members[1] == []
+
+
+def test_member_list_wrapped_twice_is_fully_recovered():
+    out = """\
+VLAN     PORT             ACTIVE
+ID       MEMBER           MEMBER
+--------------------------------------------------------------------------------
+300      1/1-1/2,         1/1
+         1/5-1/6,
+         1/9
+"""
+    assert voss_parsers.parse_vlan_members(out)[300] == [
+        "1/1", "1/2", "1/5", "1/6", "1/9"]

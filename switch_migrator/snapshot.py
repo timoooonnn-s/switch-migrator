@@ -37,7 +37,9 @@ from switch_migrator.models import (
     MltState,
     Platform,
     PortState,
+    SourceStatus,
     SwitchAudit,
+    VlanBinding,
     VlanInfo,
 )
 
@@ -110,7 +112,8 @@ def _build(cls, data: dict):
 
 
 _NESTED = {"PortState": PortState, "MltState": MltState, "VlanInfo": VlanInfo,
-           "IstState": IstState, "FabricIsid": FabricIsid}
+           "IstState": IstState, "FabricIsid": FabricIsid,
+           "VlanBinding": VlanBinding, "SourceStatus": SourceStatus}
 
 
 def _coerce(annotation: Any, value: Any) -> Any:

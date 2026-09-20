@@ -387,7 +387,9 @@ def test_excel_tab_names_survive_long_and_illegal_location_names(tmp_path):
         tables.append(t)
     path = tmp_path / "sheets.xlsx"
     write_excel(tables, path)
-    titles = load_workbook(path).sheetnames
+    from switch_migrator.report.excel import STAMP_SHEET
+    # the hidden version stamp is not one of the report tabs
+    titles = [t for t in load_workbook(path).sheetnames if t != STAMP_SHEET]
     assert len(titles) == 3, "a tab was lost to a name collision"
     assert len(set(titles)) == 3
     for title in titles:
@@ -416,3 +418,30 @@ def test_cli_unknown_profile_is_a_config_error(tmp_path):
                  "--profiles-file", str(tmp_path / "profiles.yaml"),
                  "--profile", "nope", "--no-fabric", "--dry-run"])
     assert code == 2
+
+
+def test_a_profiles_output_dir_gets_the_log_too(tmp_path, monkeypatch):
+    """setup_logging ran before the profile was applied, so the reports went to
+    the profile's directory and their log to ./output."""
+    from switch_migrator import cli
+
+    monkeypatch.chdir(tmp_path)
+    raw = tmp_path / "raw"
+    shutil.copytree(FIXTURES / "ers", raw / "acc-01")
+    (tmp_path / "config.yaml").write_text("dvr_controllers: []\n")
+    (tmp_path / "switches.yaml").write_text(
+        "switches:\n  - name: acc-01\n    platform: ers\n")
+    profile_out = tmp_path / "site-a-out"
+    (tmp_path / "profiles.yaml").write_text(
+        "profiles:\n"
+        "  site-a:\n"
+        f"    inventory: {tmp_path / 'switches.yaml'}\n"
+        f"    output_dir: {profile_out}\n")
+
+    cli.main(["-c", str(tmp_path / "config.yaml"), "--profile", "site-a",
+              "--profiles-file", str(tmp_path / "profiles.yaml"),
+              "--offline", str(raw), "--no-fabric"])
+
+    assert (profile_out / "switch-migrator.log").is_file()
+    assert not (tmp_path / "output").exists(), \
+        "the log was written to the default directory, not the profile's"

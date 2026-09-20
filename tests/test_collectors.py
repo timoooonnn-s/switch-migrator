@@ -172,3 +172,29 @@ def test_counter_sections_do_not_reset_has_traffic(tmp_path, cfg):
                            OfflineRunner("sw1", tmp_path), cfg, pull_macs=True)
     port = next(p for p in audit.ports if p.port == "1/1")
     assert port.has_traffic is True
+
+
+def test_an_unparsable_running_config_is_reported_once(tmp_path):
+    """The failure path returned before caching, so the second consumer parsed
+    the config again and appended a duplicate warning and coverage row."""
+    from switch_migrator.collectors import switch as switch_mod
+    from switch_migrator.models import Platform, SwitchAudit
+
+    audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
+                        reachable=True)
+    audit.running_config = "irrelevant"
+    cache: dict = {}
+
+    def _boom(_text):
+        raise ValueError("unparsable")
+
+    original = switch_mod.voss_config.parse_voss_config
+    switch_mod.voss_config.parse_voss_config = _boom
+    try:
+        switch_mod._config_bindings(audit, cache)
+        switch_mod._config_bindings(audit, cache)
+    finally:
+        switch_mod.voss_config.parse_voss_config = original
+
+    assert len(audit.warnings) == 1
+    assert sum(1 for s in audit.sources if s.name == "running-config") == 1

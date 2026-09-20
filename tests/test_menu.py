@@ -116,6 +116,9 @@ def test_collect_once_then_multiple_outputs(env):
     # collect: (no fabric question - config has no DvRs), config? n, macs? y
     M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
     assert s.has_data and len(s.audits) == 2
+    # the MAC/migration-sheet collection reads the running-config for its
+    # tagging, but declining the config extract means the text is not kept -
+    # so the session must not claim to have it
     assert s.collected_macs and not s.collected_config
     collected_at = s.collected_at
 
@@ -422,3 +425,110 @@ def test_profiles_save_then_load_into_a_fresh_session(env):
     # loading only SET values - the session stays fully changeable
     fresh.new_switch = "changed-later"
     assert fresh.new_switch == "changed-later"
+
+
+# ------------------------------ getting out again --------------------------
+
+class _InterruptingConsole(ScriptedConsole):
+    """A console whose input() raises KeyboardInterrupt, like a real Ctrl-C."""
+
+    def __init__(self, times=3):
+        super().__init__([])
+        self.times = times
+        self.count = 0
+
+    def input(self, prompt="", **kw):
+        self.count += 1
+        if self.count <= self.times:
+            raise KeyboardInterrupt
+        raise EOFError("script exhausted")
+
+
+def test_ctrl_c_at_the_main_menu_quits(env):
+    """Ctrl-C at the menu prompt used to be swallowed and the loop continued,
+    so there was no way out of the program short of SIGKILL."""
+    tmp, cfg_path, inv, raw = env
+    console = _InterruptingConsole()
+    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
+                    creds_fn=_offline_creds)
+    assert rc == 0
+    assert console.count == 1, "it should quit on the first Ctrl-C, not loop"
+
+
+def test_x_at_the_main_menu_still_just_reshows_it(env):
+    """'x' abandons an action; at the menu there is no action, so it redraws -
+    only Ctrl-C means quit."""
+    tmp, cfg_path, inv, raw = env
+    console = ScriptedConsole(["x", "0"])
+    assert M.run_menu(cfg_path, inv, tmp / "out", console=console,
+                      creds_fn=_offline_creds) == 0
+    assert len(console.asked) == 2
+
+
+def test_ctrl_c_inside_an_action_returns_to_the_menu(env):
+    """Ctrl-C at a prompt WITHIN an action keeps its documented meaning."""
+    s = _session(env)
+
+    class _OneInterrupt(ScriptedConsole):
+        def input(self, prompt="", **kw):
+            self.asked.append(str(prompt))
+            raise KeyboardInterrupt
+
+    with pytest.raises(M.Abort):
+        M._ask(_OneInterrupt([]), "Choose")
+
+
+# ------------------------------ profiles ------------------------------------
+
+def test_menu_applies_a_named_profile(env, tmp_path):
+    """`--menu --profile X` used to ignore the profile entirely."""
+    tmp, cfg_path, inv, raw = env
+    profiles = tmp / "profiles.yaml"
+    profiles.write_text(
+        "profiles:\n"
+        "  site-a:\n"
+        f"    output_dir: {tmp / 'site-a-out'}\n"
+        "    new_switch: leaf-a-01\n"
+        "    split_by_location: true\n")
+
+    seen = {}
+
+    def _capture(s, console):
+        seen["output_dir"] = s.output_dir
+        seen["new_switch"] = s.new_switch
+        seen["split"] = s.split_by_location
+        raise M.Abort()
+
+    import switch_migrator.menu as menu_mod
+    original = menu_mod.action_select
+    menu_mod.action_select = _capture
+    try:
+        M.run_menu(cfg_path, inv, tmp / "out", console=ScriptedConsole(["1", "0"]),
+                   creds_fn=_offline_creds, profile="site-a",
+                   profiles_file=profiles)
+    finally:
+        menu_mod.action_select = original
+
+    assert seen["output_dir"] == tmp / "site-a-out"
+    assert seen["new_switch"] == "leaf-a-01"
+    assert seen["split"] is True
+
+
+class _RecordingConsole(ScriptedConsole):
+    """A scripted console that also keeps what was printed."""
+
+    def __init__(self, answers):
+        Console.__init__(self, record=True, width=200,
+                         file=open("/dev/null", "w"), force_terminal=False)
+        self._answers = list(answers)
+        self.asked = []
+
+
+def test_menu_says_so_when_the_named_profile_is_missing(env):
+    tmp, cfg_path, inv, raw = env
+    console = _RecordingConsole(["0"])
+    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
+                    creds_fn=_offline_creds, profile="nope",
+                    profiles_file=tmp / "profiles.yaml")
+    assert rc == 0
+    assert "No profile 'nope'" in console.export_text()

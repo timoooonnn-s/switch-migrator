@@ -16,7 +16,7 @@ from rich.console import Console
 from switch_migrator import __version__
 from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
-from switch_migrator.compare import compare_switch
+from switch_migrator.compare import compare_switch, resolve_binding_isids
 from switch_migrator.config_extract import extract_voss_config
 from switch_migrator.config_generate import generate_voss_from_ers
 from switch_migrator.isid import build_worksheet
@@ -42,7 +42,7 @@ from switch_migrator.connection import (
     enable_legacy_ssh_algorithms,
 )
 from switch_migrator.models import FabricState, Platform, SwitchAudit
-from switch_migrator import cabling_sheet, health, location
+from switch_migrator import cabling_sheet, handover, health, location
 from switch_migrator import manifest as manifest_mod
 from switch_migrator import mlt_generate, snapshot as snapshot_mod, verify
 from switch_migrator.report import console as console_report
@@ -59,6 +59,7 @@ from switch_migrator.report.migration import (
     build_cabling_by_location,
     build_commands,
     build_port_info,
+    new_switch_names,
 )
 from switch_migrator.report.excel import write_csv, write_excel
 from switch_migrator.report.tables import build_all
@@ -151,6 +152,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "every command sent and its outcome, what failed, "
                              "which files were produced - an audit trail of the "
                              "pre-migration check")
+    parser.add_argument("--handover", action="store_true",
+                        help="collect this run's output into "
+                             "<output>/handover-<stamp>/ with an index.html "
+                             "tying it together - the folder to hand to a "
+                             "reviewer, a change record or your future self")
     parser.add_argument("--health-check", action="store_true",
                         help="go/no-go check before the migration window: "
                              "flags anything already broken that the migration "
@@ -226,10 +232,26 @@ def make_runner(name: str, host: str, platform: Platform, creds: Credentials,
         return OfflineRunner(name, args.offline,
                              command_overrides=cfg.command_overrides)
     raw_dir = (args.output_dir / "raw" / name) if args.save_raw else None
+    # the sheets read the running-config for its tagging and then drop the
+    # text; capturing it to disk would keep exactly what that discards
+    raw_skip = (() if getattr(args, "extract_config", False)
+                else ("show running-config",))
     return SshRunner(name=name, host=host, platform=platform, creds=creds,
-                     ssh=cfg.ssh, raw_dir=raw_dir,
+                     ssh=cfg.ssh, raw_dir=raw_dir, raw_skip=raw_skip,
                      command_overrides=cfg.command_overrides,
                      console=console, console_server=cfg.console_server)
+
+
+def _needs_config(args: argparse.Namespace) -> bool:
+    """Should this run pull `show running-config`?
+
+    Beyond --extract-config, the migration sheets need it too: it is the only
+    source that says whether a VLAN egresses a port tagged or untagged, which
+    is exactly what gets configured on the new switch. One extra command per
+    device buys the tagging column and authoritative VLAN membership.
+    """
+    return bool(getattr(args, "extract_config", False)
+                or getattr(args, "migration_sheets", False))
 
 
 def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
@@ -261,7 +283,8 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         try:
             audit = collect_switch(
                 target, runner, cfg,
-                pull_config=args.extract_config,
+                pull_config=_needs_config(args),
+                keep_config=bool(getattr(args, "extract_config", False)),
                 # verification needs the learned MACs on the NEW ports - they
                 # are the evidence that the right cable went into the right hole
                 pull_macs=bool(getattr(args, "migration_sheets", False)
@@ -316,7 +339,7 @@ def preview_commands(targets: list[SwitchTarget], cfg: Config,
                               command_overrides=cfg.command_overrides)
         try:
             collect_switch(target, runner, cfg,
-                           pull_config=args.extract_config,
+                           pull_config=_needs_config(args),
                            pull_macs=getattr(args, "migration_sheets", False))
         except Exception:  # noqa: BLE001 - a preview must never fail the run
             log.exception("[%s] dry-run preview incomplete", target.name)
@@ -535,14 +558,29 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
     args = build_arg_parser().parse_args(argv)
     console = Console(stderr=True)
+
+    # The profile can set output_dir, and the log file lives inside it - so it
+    # has to be applied BEFORE logging is set up, or the reports go to the
+    # profile's directory and their log to ./output.
+    if args.profile:
+        try:
+            _apply_cli_profile(args, console)
+        except ConfigError as exc:
+            console.print(f"[bold red]Config error:[/bold red] {exc}")
+            return 2
     setup_logging(args.output_dir, args.debug)
 
     # No arguments at all (or an explicit --menu): open the interactive toolkit
     # menu. Every flag keeps working exactly as before.
     if args.menu or not raw_argv:
         from switch_migrator.menu import run_menu
+        # the profile is handed on by name: the menu session carries settings
+        # the CLI namespace has no place for (location groups, auto-snapshot),
+        # and applying it there sets all of them
         return run_menu(config_path=args.config, inventory_path=args.inventory,
-                        output_dir=args.output_dir)
+                        output_dir=args.output_dir,
+                        profile=args.profile,
+                        profiles_file=args.profiles_file)
 
     # Reporting from a saved snapshot: no config, no credentials, no device is
     # touched - every sheet below is a pure function of the collected state.
@@ -550,8 +588,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # generating MLT blocks reads a sheet, not a fabric; a snapshot run
         # compares nothing. Neither needs the DvR/I-SID sections to be present.
-        if args.profile:
-            _apply_cli_profile(args, console)
         cfg = load_config(args.config,
                           require_fabric=(not args.no_fabric
                                           and not from_snapshot
@@ -677,12 +713,19 @@ def main(argv: list[str] | None = None) -> int:
     # 3) Compare (skipped entirely in no-fabric mode)
     comparisons = {} if args.no_fabric else {
         a.name: compare_switch(a, fabric, cfg) for a in audits if a.reachable}
+    # the comparison is the only thing that knows which I-SID a VLAN without a
+    # local binding lands on - push that answer back into the port/MLT bindings
+    # so the migration sheets can show it instead of an empty cell
+    resolve_binding_isids(audits, comparisons,
+                          fabric_checked=not args.no_fabric)
 
     # 4) Report
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
     if args.migration_sheets:
         assign_port_uids(audits)
-        tables += [build_port_info(audits), build_cabling(audits)]
+        targets = new_switch_names(args.new_switch)
+        tables += [build_port_info(audits),
+                   build_cabling(audits, targets)]
 
     if args.migration_sheets and (args.split_by_location or args.location_group):
         rules = cfg.locations
@@ -695,7 +738,8 @@ def main(argv: list[str] | None = None) -> int:
         # fill-in document, and one link on two sheets means one set of
         # answers gets lost
         tables = [t for t in tables if t.title != "Cabling"]
-        tables += build_cabling_by_location(audits, rules)
+        tables += build_cabling_by_location(
+            audits, rules, new_switch_names(args.new_switch))
         console.print("Cabling sheet split by location:")
         for line in location.describe(rules, [a.name for a in audits]):
             console.print(f"  {line}")
@@ -766,6 +810,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in written:
         console.print(f"Report written: [bold]{path}[/bold]")
 
+
     # Exit code mirrors the worst finding so the tool is scriptable
     severities = [t for table in tables for t in table.severities]
     unreachable = [a for a in audits if not a.reachable]
@@ -784,6 +829,19 @@ def main(argv: list[str] | None = None) -> int:
                                written, commands_by_device,
                                config_path=args.config, exit_code=code))
         console.print(f"Run manifest: [bold]{path}[/bold]")
+        written.append(path)
+
+    # last, so the folder contains everything the run produced - the manifest
+    # included, which is the file a change record actually wants
+    if args.handover:
+        bundle = handover.build(
+            args.output_dir, written, tables, audits,
+            meta={"started": started.isoformat(timespec="seconds"),
+                  "config": str(args.config),
+                  "switches": ", ".join(a.name for a in audits)},
+            stamp=stamp)
+        console.print(f"Handover bundle: [bold]{bundle}[/bold]\n"
+                      f"  open [bold]{bundle / 'index.html'}[/bold]")
     return code
 
 

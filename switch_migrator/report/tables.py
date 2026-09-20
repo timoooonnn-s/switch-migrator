@@ -25,6 +25,24 @@ class Table:
     # Excel and CSV always get every column; None means "show them all".
     console_columns: list[str] | None = None
 
+    # --- presentation hints, honoured by the Excel writer -------------------
+    # Columns whose content is long enough to need wrapping rather than being
+    # cut off at the column width (VLAN pair lists, MAC lists, evidence).
+    wrap_columns: list[str] = field(default_factory=list)
+    # Columns a human fills in by hand. They are left unlocked when the sheet
+    # is protected, and shaded so the eye finds them on a printed page.
+    manual_columns: list[str] = field(default_factory=list)
+    # {column: allowed values} - a dropdown, so a switch name is picked rather
+    # than typed at 3am.
+    choice_columns: dict[str, list[str]] = field(default_factory=dict)
+    # Columns that must hold a whole number if they hold anything.
+    int_columns: list[str] = field(default_factory=list)
+    # Start a new printed page whenever this column's value changes, so one
+    # rack's rows never straddle two sheets of paper.
+    page_break_column: str = ""
+    # How many leading columns stay on screen while scrolling right.
+    freeze_columns: int = 0
+
     def add(self, row: list, severity: str | None = None):
         self.rows.append(row)
         self.severities.append(severity)
@@ -199,6 +217,65 @@ def build_issues(audits: list[SwitchAudit], fabric: FabricState,
     return t
 
 
+def build_coverage(audits: list[SwitchAudit]) -> Table:
+    """How complete the collected data actually is, per switch.
+
+    Several sources are optional: a release that rejects `show vlan members`,
+    or a run without the running-config, still produces a full-looking sheet -
+    with thinner VLAN columns. That difference used to be invisible, which is
+    how a cabling sheet reached a data centre missing VLANs nobody knew were
+    missing. This sheet makes it a number you can look at before the window.
+
+    Severities feed the process exit code, so they have to mean something
+    actionable. A switch with spare ports is not a finding - most of a 48-port
+    box is usually dark - and neither is missing tagging on a plain audit run,
+    which never reads the running-config in the first place. What IS a finding:
+    a source that was tried and failed, and a port that is UP with no VLAN data
+    behind it, because that is a hole in exactly what the sheet is for.
+    """
+    t = Table("Coverage", [
+        "Switch", "Reachable", "Ports", "Ports with VLANs", "VLAN coverage",
+        "Up ports missing VLANs", "Ports with I-SIDs", "Ports with tagging",
+        "VLANs", "MLTs", "MLTs with VLANs",
+        "Sources that answered", "Sources that did not",
+    ])
+    t.wrap_columns = ["Sources that answered", "Sources that did not"]
+    for audit in sorted(audits, key=lambda a: a.name):
+        total = len(audit.ports)
+        # Bindings are the current shape, but a snapshot written by an older
+        # build carries only the flat lists. Counting bindings alone reported
+        # complete data as zero coverage and failed the run on --from-snapshot.
+        with_vlans = sum(1 for p in audit.ports if p.bindings or p.vlans)
+        with_isids = sum(1 for p in audit.ports
+                         if any(b.isid is not None for b in p.bindings)
+                         or p.isids)
+        with_tagging = sum(1 for p in audit.ports
+                           if any(b.tagging for b in p.bindings) or p.tagging)
+        mlts_with_vlans = sum(1 for m in audit.mlts if m.bindings or m.vlans)
+        blind_up = sum(1 for p in audit.ports
+                       if p.oper_up and not (p.bindings or p.vlans))
+        ok = [s.name for s in audit.sources if s.ok]
+        missing = [f"{s.name} ({s.detail})" if s.detail else s.name
+                   for s in audit.sources if not s.ok]
+        pct = f"{with_vlans * 100 // total}%" if total else "-"
+        # a reachable switch with ports and NO VLAN data at all is a collection
+        # that failed, whatever it says elsewhere
+        severity = "ok"
+        if not audit.reachable:
+            severity = "error"
+        elif total and not with_vlans:
+            severity = "error"
+        elif missing or blind_up:
+            severity = "warn"
+        t.add([
+            audit.name, "yes" if audit.reachable else "NO", total, with_vlans,
+            pct, blind_up, with_isids, with_tagging, len(audit.vlans),
+            len(audit.mlts), mlts_with_vlans,
+            ", ".join(ok) or "-", ", ".join(missing) or "-",
+        ], severity)
+    return t
+
+
 def build_all(audits: list[SwitchAudit], fabric: FabricState,
               comparisons: dict[str, list[VlanComparison]],
               no_fabric: bool = False) -> list[Table]:
@@ -209,6 +286,7 @@ def build_all(audits: list[SwitchAudit], fabric: FabricState,
             build_vlan_inventory(audits),
             build_ports(audits),
             build_mlts(audits),
+            build_coverage(audits),
             build_issues(audits, fabric, comparisons),
         ]
     return [
@@ -217,5 +295,6 @@ def build_all(audits: list[SwitchAudit], fabric: FabricState,
         build_ports(audits),
         build_mlts(audits),
         build_fabric(fabric),
+        build_coverage(audits),
         build_issues(audits, fabric, comparisons),
     ]

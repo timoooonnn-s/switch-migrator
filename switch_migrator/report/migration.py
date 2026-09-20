@@ -11,8 +11,25 @@ from __future__ import annotations
 from switch_migrator import location, usage
 from switch_migrator.config_extract import extract_voss_config
 from switch_migrator.location import LocationRules
-from switch_migrator.models import Platform, PortState, SwitchAudit
+from switch_migrator.models import (
+    BOTH,
+    UNTAGGED,
+    Platform,
+    PortState,
+    SwitchAudit,
+    tagging_summary,
+)
 from switch_migrator.report.tables import Table
+
+
+def new_switch_names(value: str) -> list[str]:
+    """The NEW switches this window targets, from the --new-switch value.
+
+    One name is the common case; several, comma-separated, is a consolidation
+    onto more than one box. The list becomes the dropdown on the sheet's NEW
+    switch column, so a technician picks a target instead of typing one.
+    """
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
 def assign_port_uids(audits: list[SwitchAudit], prefix: str = "P") -> None:
@@ -63,21 +80,68 @@ def _fmt_bool(v: bool | None, true: str, false: str) -> str:
     return "?" if v is None else (true if v else false)
 
 
+def _pairs_cell(bindings) -> str:
+    """The VLAN<->I-SID pairs of one port or MLT, as one self-contained cell.
+
+    Untagged first, because that is the one a technician looking at an access
+    port cares about, then by VLAN id. Every binding is printed - including the
+    ones whose I-SID could not be resolved, which show '?' rather than being
+    dropped, because a missing I-SID is a task and a blank cell is a trap.
+    """
+    ordered = sorted(bindings, key=lambda b: (
+        0 if b.tagging in (UNTAGGED, BOTH) else 1, b.vlan is None, b.vlan or 0))
+    return ", ".join(b.render() for b in ordered)
+
+
+def _untagged_vlan(port: PortState) -> int | str:
+    """The port's untagged (native/access) VLAN, or '' when it has none.
+
+    Replaces the old leading column, which printed the numerically lowest VLAN
+    on the port - meaningless on a trunk. This one is only ever filled in when
+    a source actually said the VLAN egresses untagged.
+    """
+    for binding in port.bindings:
+        if binding.tagging in (UNTAGGED, BOTH) and binding.vlan is not None:
+            return binding.vlan
+    return ""
+
+
+def _tagging(port: PortState) -> str:
+    """The port's tagging, from the bindings the same row prints.
+
+    Falls back to the stored field for a port that has no bindings at all, so
+    data restored from an older snapshot still shows what it knew.
+    """
+    return tagging_summary(port.bindings) or port.tagging
+
+
+def _sources_cell(holder) -> str:
+    """Where this row's VLAN/I-SID cell came from.
+
+    Provenance matters because an empty cell has two very different meanings -
+    'the port carries nothing' and 'nothing we could read said what it
+    carries'. The source list tells them apart at a glance.
+    """
+    return holder.binding_sources or ("no VLAN source" if not holder.bindings else "")
+
+
 def build_port_info(audits: list[SwitchAudit]) -> Table:
     """Sheet 1: every port with everything needed during the migration."""
     t = Table("Port Info", [
         "Port ID", "Switch", "Port", "Device on port", "Neighbor IP",
-        "MAC addresses", "Tagging", "VLAN IDs", "I-SIDs", "Admin", "Oper",
+        "MAC addresses", "Untagged VLAN", "Tagging", "VLAN -> I-SID",
+        "VLAN IDs", "I-SIDs", "Admin", "Oper",
         "LACP", "MLT ID", "MLT name", "Transceiver", "Media", "Uplink",
-        "Usage", "Why",
+        "Usage", "Why", "VLAN source",
     ])
     t.console_columns = ["Port ID", "Switch", "Port", "Device on port",
-                         "VLAN IDs", "Oper", "MLT ID", "Usage"]
+                         "VLAN -> I-SID", "Oper", "MLT ID", "Usage"]
+    t.wrap_columns = ["VLAN -> I-SID", "MAC addresses", "Why"]
     for audit in sorted(audits, key=lambda a: a.name):
         for p in audit.ports:
             t.add([
                 p.uid, audit.name, p.port, _neighbor(p), p.lldp_neighbor_ip,
-                _macs_cell(p), p.tagging,
+                _macs_cell(p), _untagged_vlan(p), _tagging(p), _pairs_cell(p.bindings),
                 ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
                 _fmt_bool(p.admin_up, "enable", "disable"),
                 _fmt_bool(p.oper_up, "up", "down"),
@@ -85,14 +149,15 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
                 p.mlt_id if p.mlt_id is not None else "",
                 p.mlt_name, p.transceiver, p.media,
                 "yes" if p.is_uplink else "",
-                p.usage, p.usage_evidence,
+                p.usage, p.usage_evidence, _sources_cell(p),
             ], "warn" if (p.usage == usage.DEGRADED
                           or (p.is_uplink and not p.oper_up)) else None)
     return t
 
 
 def build_cabling_by_location(audits: list[SwitchAudit],
-                              rules: LocationRules) -> list[Table]:
+                              rules: LocationRules,
+                              new_switches: list[str] | None = None) -> list[Table]:
     """One cabling worksheet per location group.
 
     Deliberately NOT accompanied by a combined sheet. This is a document people
@@ -107,32 +172,60 @@ def build_cabling_by_location(audits: list[SwitchAudit],
     by_name = {a.name: a for a in audits}
     tables = []
     for group, names in groups.items():
-        table = build_cabling([by_name[n] for n in names])
+        table = build_cabling([by_name[n] for n in names], new_switches)
         table.title = f"Cabling {group}"
         tables.append(table)
     return tables
 
 
-def build_cabling(audits: list[SwitchAudit]) -> Table:
+def build_cabling(audits: list[SwitchAudit],
+                  new_switches: list[str] | None = None) -> Table:
     """Sheet 2: the DC cabling worksheet - connected ports only, with empty
     columns the technicians fill in as they re-patch.
 
+    Laid out in the order the work actually happens: what the link is, where it
+    is now (rack, switch, port), where it goes (rack, switch, port), and only
+    then the detail needed to configure it. The rack columns are deliberately
+    empty - no switch knows which rack it is in, so a human writes it once and
+    every later row for that switch is easy to find on the floor.
+
     Deliberately WIDE ("one big paper"): every row is self-contained, carrying
-    both the port's own VLANs/I-SIDs and, when the port is an MLT member, the
-    MLT's id, name and its VLANs/I-SIDs - so nobody has to cross-reference a
-    second sheet while standing at the rack.
+    both the port's own VLAN<->I-SID pairs and, when the port is an MLT member,
+    the MLT's id, name and pairs - so nobody has to cross-reference a second
+    sheet while standing at the rack.
+
+    Deliberately NOT accompanied by a combined sheet when split by location:
+    this is a document people write into by hand, and if the same link appeared
+    twice, one set of answers would be lost.
     """
     t = Table("Cabling", [
-        "VLAN", "Type", "Port ID", "End device / neighbor",
+        "Port ID", "Usage", "Type", "Untagged VLAN", "End device / neighbor",
+        # where the link is today
+        "Rack (old)", "Old switch", "Old port",
         # filled in by the technician / planner during the migration
-        "NEW switch", "NEW port", "NEW MLT ID", "NEW MLT name", "NEW VLAN",
-        "Old switch", "Old port",
-        "MLT ID", "MLT name", "MLT VLANs", "MLT I-SIDs",
-        "Port VLANs", "Port I-SIDs",
-        "MAC addresses", "Media", "Usage", "Why",
+        "Rack (new)", "NEW switch", "NEW port", "NEW MLT ID", "NEW MLT name",
+        "NEW VLAN",
+        # what has to end up configured on the new port
+        "Tagging", "VLAN -> I-SID",
+        "MLT ID", "MLT name", "MLT VLAN -> I-SID",
+        "Port VLANs", "Port I-SIDs", "MLT VLANs", "MLT I-SIDs",
+        "MAC addresses", "Media", "Why", "VLAN source",
     ])
-    t.console_columns = ["VLAN", "Type", "Port ID", "End device / neighbor",
-                         "Old switch", "Old port", "MLT ID", "Usage"]
+    t.console_columns = ["Port ID", "Usage", "Type", "Untagged VLAN",
+                         "End device / neighbor", "Old switch", "Old port",
+                         "MLT ID"]
+    t.manual_columns = ["Rack (old)", "Rack (new)", "NEW switch", "NEW port",
+                        "NEW MLT ID", "NEW MLT name", "NEW VLAN"]
+    t.int_columns = ["NEW MLT ID", "NEW VLAN"]
+    t.wrap_columns = ["VLAN -> I-SID", "MLT VLAN -> I-SID", "MAC addresses",
+                      "Why", "End device / neighbor"]
+    t.page_break_column = "Old switch"
+    # Port ID, Usage, Type and the neighbour stay visible while the technician
+    # scrolls right into the columns they are filling in
+    t.freeze_columns = 5
+    if new_switches:
+        t.choice_columns = {"NEW switch": sorted(set(new_switches))}
+
     for audit in sorted(audits, key=lambda a: a.name):
         mlt_by_id = {m.mlt_id: m for m in audit.mlts}
         # in-use ports first so the techs work top-down; likely-dead ports stay
@@ -140,24 +233,21 @@ def build_cabling(audits: list[SwitchAudit]) -> Table:
         for p in sorted(audit.ports, key=lambda x: (_usage_rank(x), x.port)):
             if not _connected(p) and not p.usage:
                 continue
-            first_vlan = p.vlans[0] if p.vlans else ""
             kind = "uplink" if p.is_uplink else ("mlt" if p.mlt_id is not None
                                                  else "access")
             mlt = mlt_by_id.get(p.mlt_id) if p.mlt_id is not None else None
-            # an MLT member's traffic is the union of the MLT's VLANs; fall back
-            # to the MLT's list when the port itself has no per-port bindings
-            if not first_vlan and mlt is not None and mlt.vlans:
-                first_vlan = mlt.vlans[0]
             t.add([
-                first_vlan, kind, p.uid, _neighbor(p),
-                "", "", "", "", "",         # NEW switch/port/MLT id/MLT name/VLAN
-                audit.name, p.port,
+                p.uid, p.usage, kind, _untagged_vlan(p), _neighbor(p),
+                "", audit.name, p.port,             # Rack (old) is filled in by hand
+                "", "", "", "", "", "",             # rack/switch/port/MLT/VLAN: theirs
+                _tagging(p), _pairs_cell(p.bindings),
                 p.mlt_id if p.mlt_id is not None else "",
                 p.mlt_name,
+                _pairs_cell(mlt.bindings) if mlt else "",
+                ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
                 ",".join(map(str, mlt.vlans)) if mlt else "",
                 ",".join(map(str, mlt.isids)) if mlt else "",
-                ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
-                _macs_cell(p), p.media, p.usage, p.usage_evidence,
+                _macs_cell(p), p.media, p.usage_evidence, _sources_cell(p),
             ], "warn" if p.usage == usage.DEGRADED else None)
     return t
 
