@@ -1,3 +1,6 @@
+# what a bundle installed (tools/make-bundle.py)
+.switch-migrator-files
+
 # Python
 __pycache__/
 *.py[cod]

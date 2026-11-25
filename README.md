@@ -97,6 +97,46 @@ pip install .            # or: pip install -r requirements.txt
 switch-migrator --version
 ```
 
+### One-file bundle (no git on the target)
+
+For a jump host that cannot reach the repository, pack the tool into one
+self-extracting text file and send that instead:
+
+```bash
+python3 tools/make-bundle.py     # -> dist/switch-migrator-bundle-<version>.py
+```
+
+On the target, with Python 3.8+ for the unpacking (3.10+ for the tool):
+
+```bash
+python3 switch-migrator-bundle-1.0.0.py          # new ./switch-migrator, or update the copy you are in
+python3 switch-migrator-bundle-1.0.0.py --list   # what is inside
+```
+
+It prints what to do next: the `pip install -e .` into a `.venv` on the first
+unpack, again only when an update changed the dependencies, and which example
+configs to copy. The Python packages themselves still come from pip (PyPI or
+your mirror).
+
+* **Updates in place.** Running a newer bundle inside an existing copy rewrites
+  only what changed and removes files an earlier bundle installed that the new
+  version no longer has (listed in `.switch-migrator-files`). It never writes or
+  removes the site's own files: `config.yaml`, `switches.yaml`, inventories,
+  `profiles.yaml`, `output/`, snapshots, `.venv`, `.git`. An older bundle asks
+  before it downgrades.
+* **Damage is caught.** The payload carries a SHA-256; a mangled attachment stops
+  before anything is written.
+* **What goes in:** every file git tracks, as it is on disk (uncommitted edits
+  are listed while building; untracked files are listed and left out), minus
+  `council/`. Commit first to ship a new file.
+* **One name, one content.** The name carries `__version__`, which must match
+  `pyproject.toml`. Building the same contents again is a no-op; different
+  contents under an existing name are refused until you bump the version
+  (`--force` overrides).
+* **The MAC check** needs migration-check in the same venv: send the
+  pre-migration-checker bundle along (it carries fabric-weft too) and install it
+  with the line this bundle prints.
+
 ## Configuration
 
 ```bash
