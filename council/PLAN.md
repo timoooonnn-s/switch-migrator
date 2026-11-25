@@ -21,6 +21,14 @@ Three verbs for the field engineer: **collect**, **plan**, **verify**.
 
 Each phase ends with something usable on a real migration, tests green.
 
+### Done 2026-11-25 — review round 2 (D12)
+
+Extract leaves out ZTP-owned lines, ERS draft numbering by stack unit and
+access range, I-SID worksheet without pre-filled choices, version check,
+stable port IDs across re-plans, the three verbs. Lint and types at the
+strictest setting with no suppressions. Still open: the PortState split (now
+planned for phase 2, see D12).
+
 ### Done 2026-11-23 — migration-check integrated (D9)
 
 `--mac-snapshot` (baseline on the collection's own sessions), `--mac-baseline`

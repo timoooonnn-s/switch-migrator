@@ -16,10 +16,13 @@ import json
 import platform as py_platform
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from switch_migrator import __version__
+from switch_migrator.connection import CommandEntry
 from switch_migrator.models import FabricState, SwitchAudit
 
 # CLI options that carry no information worth recording
@@ -33,7 +36,7 @@ _SKIP_ARGS = {"debug", "verbose", "menu"}
 _SECRET_ARG = re.compile(r"pass|secret|token|credential|auth|key", re.IGNORECASE)
 
 
-def _device_entry(audit: SwitchAudit, commands: list[dict]) -> dict:
+def _device_entry(audit: SwitchAudit, commands: list[CommandEntry]) -> dict[str, Any]:
     sent = len(commands)
     rejected = sum(1 for c in commands if not c["ok"])
     return {
@@ -58,13 +61,27 @@ def _device_entry(audit: SwitchAudit, commands: list[dict]) -> dict:
     }
 
 
-def build(audits: list[SwitchAudit], fabric: FabricState, args,
-          started: datetime, finished: datetime, written: list[Path],
-          commands_by_device: dict[str, list[dict]] | None = None,
-          config_path: Path | None = None, exit_code: int | None = None) -> dict:
-    commands_by_device = commands_by_device or {}
+@dataclass
+class RunRecord:
+    """One run, as the manifest records it."""
+    # what the run was asked to do: the parsed flags of the command line, or the
+    # menu's settings - a mapping, or anything with vars()
+    options: Any
+    started: datetime
+    finished: datetime
+    written: list[Path] = field(default_factory=list)
+    commands: dict[str, list[CommandEntry]] = field(default_factory=dict)
+    config_path: Path | None = None
+    exit_code: int | None = None
+
+
+def build(audits: list[SwitchAudit], fabric: FabricState, run: RunRecord) -> dict[str, Any]:
+    """The manifest of one run: what it was asked, what it sent, what it wrote."""
+    started, finished, config_path = run.started, run.finished, run.config_path
+    commands_by_device, written, exit_code = run.commands, run.written, run.exit_code
+    raw = run.options if isinstance(run.options, dict) else vars(run.options)
     options = {}
-    for key, value in sorted(vars(args).items()):
+    for key, value in sorted(raw.items()):
         if key in _SKIP_ARGS or value in (None, False, [], ""):
             continue
         if _SECRET_ARG.search(key):
@@ -102,7 +119,7 @@ def build(audits: list[SwitchAudit], fabric: FabricState, args,
     }
 
 
-def write(path: Path, data: dict) -> Path:
+def write(path: Path, data: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return path

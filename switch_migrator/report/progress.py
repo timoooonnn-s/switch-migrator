@@ -20,6 +20,7 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TextColumn,
     TimeElapsedColumn,
 )
@@ -30,11 +31,11 @@ from switch_migrator.models import SwitchAudit
 class NullProgress:
     """Same interface, no output."""
 
-    def __enter__(self):
+    def __enter__(self) -> NullProgress:
         return self
 
-    def __exit__(self, *exc):
-        return False
+    def __exit__(self, *exc: object) -> None:
+        return None
 
     def fabric_done(self, name: str, ok: bool) -> None:
         pass
@@ -53,7 +54,7 @@ class CollectionProgress(NullProgress):
     def __init__(self, console: Console, switches: int, dvrs: int = 0):
         self._console = console
         self._lock = threading.Lock()
-        self._tasks: dict[str, int] = {}
+        self._tasks: dict[str, TaskID] = {}
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -65,10 +66,10 @@ class CollectionProgress(NullProgress):
         )
         self._switches = switches
         self._dvrs = dvrs
-        self._overall = None
-        self._fabric = None
+        self._overall: TaskID | None = None
+        self._fabric: TaskID | None = None
 
-    def __enter__(self):
+    def __enter__(self) -> CollectionProgress:
         self._progress.start()
         if self._dvrs:
             self._fabric = self._progress.add_task(
@@ -77,9 +78,8 @@ class CollectionProgress(NullProgress):
             f"Auditing {self._switches} switch(es)", total=self._switches)
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
         self._progress.stop()
-        return False
 
     def fabric_done(self, name: str, ok: bool) -> None:
         with self._lock:

@@ -74,6 +74,9 @@ def _compress(ports: list[str] | list[int]) -> str:
     return ",".join(out)
 
 
+# without plan.ports/plan.uplinks in the config, the usual 48 copper ports
+ASSUMED_ACCESS_PORTS = 48
+
 _HEADER = """\
 # ==========================================================================
 # GENERATED VOSS flex-UNI config from ERS - REVIEW, this is a DRAFT
@@ -82,7 +85,7 @@ _HEADER = """\
 #
 # What was translated: VLAN -> I-SID (elan), tagged member -> c-vid,
 #   PVID/untagged member -> untagged-traffic, access ports -> flex-UNI.
-# Old ERS port numbers kept as 1/N.
+# {numbering}
 #
 # YOU MUST VERIFY:
 #   - tagged vs untagged per port (c-vid vs untagged-traffic) against the
@@ -110,91 +113,54 @@ def _uplink_note(ers: ErsModel) -> list[str]:
     return out
 
 
+@dataclass(frozen=True)
+class _ErsSource:
+    """The ERS config being translated, and where its ports land."""
+    ers: ErsModel
+    uplink: frozenset[str]       # members of any ERS MLT: carried by the fabric
+    access_ports: int            # the new model's access ports: 1/1-1/N
+
+
+def _port_order(p: str) -> tuple[int, int]:
+    return _split(p) or (0, 0)
+
+
 def generate_voss_from_ers(ers: ErsModel, cfg: Config,
                            matched_by_vlan: dict[int, int] | None = None,
                            device_name: str = "") -> ErsGenerateResult:
+    """The ERS -> VOSS translation, one config section after the other."""
     matched_by_vlan = matched_by_vlan or {}
-    uplink: set[str] = set()
-    for m in ers.mlts:
-        uplink.update(m.members)
+    # the new model's access ports, when the config names its layout
+    ports, uplinks = cfg.plan.ports, cfg.plan.uplinks
+    layout_known = ports is not None and uplinks is not None
+    access_ports = (ports - uplinks if ports is not None and uplinks is not None
+                    else ASSUMED_ACCESS_PORTS)
+    source = _ErsSource(ers, frozenset(p for m in ers.mlts for p in m.members),
+                        access_ports)
 
     decisions: list[IsidDecision] = []
     services: list[str] = []
     access_used: set[str] = set()
-
-    def _order(p: str) -> tuple[int, int]:
-        return _split(p) or (0, 0)
-
     for vid in sorted(ers.vlans):
-        vlan = ers.vlans[vid]
-        d = resolve(vid, vlan.name, cfg, matched_by_vlan.get(vid))
+        d = resolve(vid, ers.vlans[vid].name, cfg, matched_by_vlan.get(vid))
         decisions.append(d)
         if d.excluded:
             continue
-        # ports 1-48 are the copper access ports that map 1:1 onto the new box;
-        # anything above is the SFP cage, which has no equivalent port number
-        low: list[str] = []
-        high: list[str] = []
-        for p in vlan.members:
-            if p in uplink:
-                continue
-            sp = _split(p)
-            if sp is None:
-                continue
-            (low if sp[1] <= 48 else high).append(p)
-        low.sort(key=_order)
-        high.sort(key=_order)
+        low, high = _split_members(source, ers.vlans[vid].members)
         if not low and not high:
             continue  # VLAN lives only on the uplink -> carried by the fabric
-
-        # untagged-traffic only for a genuine access port: PVID matches AND the
-        # port is not an 802.1Q trunk ('tagging tagAll'). On a trunk the PVID
-        # VLAN still egresses tagged, so it must stay a c-vid.
-        untagged = [p for p in low
-                    if p in ers.ports and ers.ports[p].pvid == vid
-                    and not ers.ports[p].tagged]
-        tagged = [p for p in low if p not in untagged]
         access_used.update(low)
+        services.append(_service_block(source, vid, d, low, high))
 
-        name = f' ({vlan.name})' if vlan.name else ""
-        block: list[str] = []
-        if d.needs_decision:
-            cand = " / ".join(map(str, d.candidates)) or "(no offsets configured)"
-            block.append(f"# [REVIEW] VLAN {vid}{name}: I-SID undecided - "
-                         f"candidates {cand}. Set it, then uncomment:")
-            prefix = "# "
-        else:
-            block.append(f"# VLAN {vid}{name} -> I-SID {d.isid} (from {d.source})")
-            prefix = ""
-        isid = d.isid if d.isid is not None else "<ISID>"
-        block.append(f"{prefix}i-sid {isid} elan")
-        if tagged:
-            block.append(f"{prefix}c-vid {vid} port {_compress(tagged)}")
-        if untagged:
-            block.append(f"{prefix}untagged-traffic port {_compress(untagged)}")
-        block.append(f"{prefix}exit")
-        if high:
-            block.append(f"# [REVIEW] VLAN {vid} also on ERS port(s) "
-                         f"{','.join(high)} (SFP/high) - no 1/N "
-                         f"equivalent, remap to the new hardware")
-        services.append("\n".join(block))
-
-    # flex-UNI access ports
-    ports_out: list[str] = []
-    for port_id in sorted(access_used, key=_order):
-        p = ers.ports.get(port_id)
-        ports_out.append(f"interface GigabitEthernet {_voss_port(port_id)}")
-        ports_out.append("default-vlan-id 0")
-        if p and p.name:
-            ports_out.append(f'name "{p.name}"')
-        ports_out.append("flex-uni enable")
-        ports_out.append("shutdown" if (p and p.shutdown) else "no shutdown")
-        ports_out.append("slpp-guard enable timeout 0")
-        ports_out.append("spanning-tree mstp edge-port true")
-        ports_out.append("exit")
-
+    ports_out = _flex_uni_ports(ers, cfg, access_used)
     src = f"Source switch : {device_name}" if device_name else "Source: ERS switch"
-    parts = [_HEADER.format(src=src).rstrip()]
+    numbering = (f"Stack unit 1's ports 1-{access_ports} keep their number as 1/N; "
+                 f"other units and higher ports are\n#   flagged. For a move or "
+                 f"a consolidation use --plan (config/new/<switch>.cfg).")
+    if not layout_known:
+        numbering += ("\n# Access ports ASSUMED 1-48: set plan.ports / plan.uplinks "
+                      "in config.yaml for the real model.")
+    parts = [_HEADER.format(src=src, numbering=numbering).rstrip()]
     parts += _uplink_note(ers)
     parts.append("\n#\n# I-SID SERVICE CONFIGURATION\n#")
     parts.append("\n".join(services) if services else "# (no services generated)")
@@ -202,3 +168,74 @@ def generate_voss_from_ers(ers: ErsModel, cfg: Config,
     parts.append("\n".join(ports_out) if ports_out else "# (no access ports)")
     text = "\n".join(parts).rstrip() + "\n"
     return ErsGenerateResult(text=text, decisions=decisions)
+
+
+def _split_members(source: _ErsSource, members: list[str]) -> tuple[list[str], list[str]]:
+    """(ports that keep their number, ports that are flagged). Only stack unit
+    1's access ports keep their number on a standalone new switch; another
+    unit, or a port above the access range (the SFP cage), has no equivalent
+    and is flagged, never renumbered by guess."""
+    low: list[str] = []
+    high: list[str] = []
+    for p in members:
+        if p in source.uplink:
+            continue
+        sp = _split(p)
+        if sp is None:
+            continue
+        unit, number = sp
+        (low if unit == 1 and number <= source.access_ports else high).append(p)
+    return sorted(low, key=_port_order), sorted(high, key=_port_order)
+
+
+def _service_block(source: _ErsSource, vid: int, d: IsidDecision,
+                   low: list[str], high: list[str]) -> str:
+    ers = source.ers
+    # untagged-traffic only for a genuine access port: PVID matches AND the
+    # port is not an 802.1Q trunk ('tagging tagAll'). On a trunk the PVID
+    # VLAN still egresses tagged, so it must stay a c-vid.
+    untagged = [p for p in low
+                if p in ers.ports and ers.ports[p].pvid == vid
+                and not ers.ports[p].tagged]
+    tagged = [p for p in low if p not in untagged]
+
+    vlan_name = ers.vlans[vid].name
+    name = f' ({vlan_name})' if vlan_name else ""
+    block: list[str] = []
+    if d.needs_decision:
+        cand = " / ".join(map(str, d.candidates)) or "(no offsets configured)"
+        block.append(f"# [REVIEW] VLAN {vid}{name}: I-SID undecided - "
+                     f"candidates {cand}. Set it, then uncomment:")
+        prefix = "# "
+    else:
+        block.append(f"# VLAN {vid}{name} -> I-SID {d.isid} (from {d.source})")
+        prefix = ""
+    isid = d.isid if d.isid is not None else "<ISID>"
+    block.append(f"{prefix}i-sid {isid} elan")
+    if tagged:
+        block.append(f"{prefix}c-vid {vid} port {_compress(tagged)}")
+    if untagged:
+        block.append(f"{prefix}untagged-traffic port {_compress(untagged)}")
+    block.append(f"{prefix}exit")
+    if high:
+        block.append(f"# [REVIEW] VLAN {vid} also on ERS port(s) "
+                     f"{','.join(high)} - another stack unit or above the "
+                     f"{source.access_ports} access ports: no 1/N equivalent; "
+                     f"place them with --plan")
+    return "\n".join(block)
+
+
+def _flex_uni_ports(ers: ErsModel, cfg: Config, access_used: set[str]) -> list[str]:
+    """The flex-UNI access ports."""
+    ports_out: list[str] = []
+    for port_id in sorted(access_used, key=_port_order):
+        ers_port = ers.ports.get(port_id)
+        ports_out.append(f"interface GigabitEthernet {_voss_port(port_id)}")
+        ports_out.append("default-vlan-id 0")
+        if ers_port and ers_port.name:
+            ports_out.append(f'name "{ers_port.name}"')
+        ports_out.append("flex-uni enable")
+        ports_out.append("shutdown" if (ers_port and ers_port.shutdown) else "no shutdown")
+        ports_out += cfg.plan.port_lines
+        ports_out.append("exit")
+    return ports_out

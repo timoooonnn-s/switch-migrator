@@ -16,7 +16,7 @@ nothing to keep - correct) or an isolated VLAN-only box alike.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Section-banner names (normalized to UPPER, single-spaced) whose content is the
 # port / MLT / VLAN / I-SID configuration we want. Exact match - NOT substring -
@@ -110,11 +110,30 @@ def _annotate_uplinks(lines: list[str]) -> list[str]:
     return out
 
 
+# Lines a ZTP'd new switch already has, or that only make sense on the OLD
+# hardware: the B-VLANs (part of the fabric identity ZTP sets up) and taking
+# VLAN 1 off the old box's port ranges ('1/1-1/48,2/1-2/6' is that chassis).
+_ZTP_OWNED = (
+    re.compile(r"^\s*vlan create\s+\d+\s.*\btype\s+spbm-bvlan\b", re.IGNORECASE),
+    re.compile(r"^\s*vlan members remove\s+1\s", re.IGNORECASE),
+)
+
+
+def _drop_ztp_owned(lines: list[str]) -> tuple[list[str], list[str]]:
+    """(lines to keep, lines left out because ZTP owns them)."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for line in lines:
+        (dropped if any(p.match(line) for p in _ZTP_OWNED) else kept).append(line)
+    return kept, dropped
+
+
 @dataclass
 class VossConfigExtract:
     text: str
     kept: list[str]
     omitted_with_content: list[str]
+    ztp_owned: list[str] = field(default_factory=list)   # lines left out for ZTP
 
 
 def _parse_meta(text: str) -> dict[str, str]:
@@ -127,8 +146,8 @@ def _parse_meta(text: str) -> dict[str, str]:
     return meta
 
 
-def _header(device_name: str, meta: dict, kept: list[str],
-            omitted: list[str]) -> str:
+def _header(device_name: str, meta: dict[str, str], kept: list[str],
+            omitted: list[str], ztp_owned: list[str]) -> str:
     bar = "# " + "=" * 74
     out = [bar, "# Neutralized config extract for migration - REVIEW BEFORE USE"]
     if device_name:
@@ -145,7 +164,16 @@ def _header(device_name: str, meta: dict, kept: list[str],
         "# Neutralized by construction - device identity & secrets are NOT here",
         "#   (mgmt/OOB, SNMP, RADIUS/TACACS, SSH/cert, syslog/NTP, boot flags,",
         "#    SPB/IS-IS core identity: nick-name, system-id, manual-area).",
+        "#",
+        "# Port numbers are the OLD switch's: right for a 1:1 replacement on the",
+        "# same model. For a move or a consolidation use --plan, which writes",
+        "# config/new/<switch>.cfg on the new port numbers.",
     ]
+    if ztp_owned:
+        out.append("#")
+        out.append("# LEFT OUT - a ZTP'd switch already has these, or they name the old")
+        out.append("# hardware's ports:")
+        out += [f"#   - {line.strip()}" for line in ztp_owned]
     if omitted:
         out.append("#")
         out.append("# OMITTED but present - configure separately on the new box:")
@@ -163,6 +191,7 @@ def extract_voss_config(running_config: str,
     meta = _parse_meta(running_config)
     kept: list[str] = []
     omitted: list[str] = []
+    ztp_owned: list[str] = []
     body: list[str] = []
     for sec in sections:
         if not sec.name:
@@ -171,10 +200,15 @@ def extract_voss_config(running_config: str,
             kept.append(sec.name)
             body += ["#", f"# {sec.name}", "#"]
             lines = sec.lines
+            if _norm(sec.name) == "VLAN CONFIGURATION":
+                lines, dropped = _drop_ztp_owned(lines)
+                ztp_owned += dropped
             if "PORT" in _norm(sec.name):
                 lines = _annotate_uplinks(lines)
             body += lines
         elif sec.has_content:
             omitted.append(sec.name)
-    text = _header(device_name, meta, kept, omitted) + "\n".join(body).rstrip() + "\n"
-    return VossConfigExtract(text=text, kept=kept, omitted_with_content=omitted)
+    text = (_header(device_name, meta, kept, omitted, ztp_owned)
+            + "\n".join(body).rstrip() + "\n")
+    return VossConfigExtract(text=text, kept=kept, omitted_with_content=omitted,
+                             ztp_owned=ztp_owned)

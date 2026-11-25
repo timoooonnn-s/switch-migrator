@@ -16,6 +16,9 @@ from switch_migrator.report.tables import build_all
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+USERS_VLAN, USERS_ISID = 100, 10100   # the VOSS fixture's 'Users' VLAN
+
+
 @pytest.fixture
 def cfg() -> Config:
     return Config(dvr_controllers=[], core_switch_patterns=["dvr-*"],
@@ -53,11 +56,11 @@ def test_no_fabric_tables_have_inventory_not_comparison(tmp_path: Path, cfg: Con
     # the VLAN <-> I-SID overview: mapping columns present, no DvR/verdict
     assert vlans.headers == ["Switch", "VLAN", "Name", "I-SID", "I-SID name",
                              "Member ports", "# ports"]
-    row100 = next(r for r in vlans.rows if r[1] == 100)
+    row100 = next(r for r in vlans.rows if r[1] == USERS_VLAN)
     # VLAN name (from 'show vlan basic') and I-SID name are shown SEPARATELY:
     # real VLAN name 'Users' vs I-SID name 'Server-VLAN-100'
     assert row100[2] == "Users"                # VLAN name
-    assert row100[3] == 10100                   # I-SID
+    assert row100[3] == USERS_ISID            # I-SID
     assert row100[4] == "Server-VLAN-100"       # I-SID name
     assert row100[5] == "1/1,1/2,2/1/1"         # member ports from show vlan members
 

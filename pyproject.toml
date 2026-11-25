@@ -20,6 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "types-PyYAML",
 ]
 
 [project.scripts]
@@ -30,3 +33,28 @@ include = ["switch_migrator*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+# the same rule families as pre-migration-checker
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "C4", "PIE", "RET", "PT"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["switch_migrator"]
+strict = true
+
+[[tool.mypy.overrides]]
+# third-party packages without type information
+module = ["netmiko", "netmiko.*", "paramiko", "paramiko.*", "openpyxl", "openpyxl.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# optional, Python 3.11+ (it uses enum.StrEnum): not checkable against 3.10
+module = ["migration_check", "migration_check.*", "fabric_weft", "fabric_weft.*"]
+follow_imports = "skip"
+ignore_missing_imports = true

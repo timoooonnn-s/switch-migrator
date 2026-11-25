@@ -7,21 +7,56 @@ column layout shifts between VOSS releases.
 from __future__ import annotations
 
 import re
+from typing import TypedDict
 
-from switch_migrator.models import IstState, MltState, PortState, VlanInfo
+from switch_migrator.models import IstState, MltState, PortIsidRow, PortState, VlanInfo
 from switch_migrator.parsers.common import (
     PORT_RE,
     expand_port_list,
     is_port_list,
+    is_vlan_id,
     name_says_ist,
     parse_updown,
 )
+
+# fields a data row of each table has at least, and the columns read by index
+MEDIA_COLUMN = 2            # Port Interface: PORT NUM | INDEX | DESCRIPTION
+ADMIN_AND_OPER = 2          # the two up/down tokens of a port row
+MIN_MLT_FIELDS = 3
+MIN_PORT_STATE_FIELDS = 3
+STATE_REASON_COLUMN = 3
+MIN_PORT_ISID_FIELDS = 5
+VIST_FIELDS = 4             # peer-ip | vlan | enabled | session
+MIN_VLAN_MEMBERS_FIELDS = 2
+MIN_ISID_ROW_FIELDS = 2     # I-SID id | type
+ISID_VLAN_COLUMN = 2        # ... | VLANID
+MIN_DVR_FIELDS = 5
+MIN_SPBM_ISID_FIELDS = 4
 
 _UPDOWN_TOKEN = re.compile(r"^(up|down|testing)$", re.IGNORECASE)
 
 
 _MAC_TOKEN = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
 
+
+
+class LocalIsid(TypedDict):
+    """One I-SID of `show i-sid`: the c-vids attached here, and its name."""
+    cvids: set[int]
+    name: str
+
+
+class DvrInterfaceRow(TypedDict):
+    """One L2 I-SID <-> VLAN pair of `show dvr interfaces`."""
+    l2isid: int
+    vlan: int
+
+
+class SpbmIsidRow(TypedDict):
+    """One row of `show isis spbm i-sid all`."""
+    isid: int
+    type: str
+    host: str
 
 def _media(tokens: list[str]) -> str:
     """DESCRIPTION column of the Port Interface table ('10GbSR', '1000BaseTX').
@@ -31,9 +66,9 @@ def _media(tokens: list[str]) -> str:
     actually looks like a description and not like the LINK TRAP / MTU / MAC
     columns that slide into its place.
     """
-    if len(tokens) <= 2:
+    if len(tokens) <= MEDIA_COLUMN:
         return ""
-    tok = tokens[2]
+    tok = tokens[MEDIA_COLUMN]
     if tok.lower() in ("true", "false") or tok.isdigit() or _MAC_TOKEN.match(tok):
         return ""
     return tok
@@ -68,7 +103,7 @@ def parse_ports(output: str) -> list[PortState]:
         if not tokens or not PORT_RE.match(tokens[0]) or tokens[0] in seen:
             continue
         updown = [t for t in tokens if _UPDOWN_TOKEN.match(t)]
-        if len(updown) < 2:
+        if len(updown) < ADMIN_AND_OPER:
             continue
         seen.add(tokens[0])
         ports.append(PortState(
@@ -105,12 +140,12 @@ def parse_mlt(output: str) -> list[MltState]:
         tokens = line.split()
         # a line of bare VLAN ids continues the previous row's VLAN IDS column
         if (current is not None and tokens
-                and all(t.isdigit() and 1 <= int(t) <= 4094 for t in tokens)):
+                and all(t.isdigit() and is_vlan_id(int(t)) for t in tokens)):
             current.vlans.extend(int(t) for t in tokens
                                  if int(t) not in current.vlans)
             continue
         current = None
-        if len(tokens) < 3 or not tokens[0].isdigit():
+        if len(tokens) < MIN_MLT_FIELDS or not tokens[0].isdigit():
             continue
         mlt_id = int(tokens[0])
         rest = tokens[1:]
@@ -134,7 +169,7 @@ def parse_mlt(output: str) -> list[MltState]:
         seen.add(mlt_id)
         # everything after the PORT MEMBERS column is the VLAN IDS list
         vlans = ([int(t) for t in rest[members_at + 1:]
-                  if t.isdigit() and 1 <= int(t) <= 4094]
+                  if t.isdigit() and is_vlan_id(int(t))]
                  if members_at is not None else [])
         mlt = MltState(
             mlt_id=mlt_id,
@@ -252,12 +287,13 @@ def parse_port_state(output: str) -> list[PortState]:
     ports: list[PortState] = []
     for line in output.splitlines():
         tokens = line.split()
-        if len(tokens) < 3 or not PORT_RE.match(tokens[0]):
+        if len(tokens) < MIN_PORT_STATE_FIELDS or not PORT_RE.match(tokens[0]):
             continue
         admin, oper = parse_updown(tokens[1]), parse_updown(tokens[2])
         if admin is None or oper is None:
             continue
-        reason = tokens[3] if len(tokens) > 3 and tokens[3] != "--" else ""
+        reason = (tokens[STATE_REASON_COLUMN] if len(tokens) > STATE_REASON_COLUMN
+                  and tokens[STATE_REASON_COLUMN] != "--" else "")
         # trailing DATE column = when the port last changed state. Free, and
         # the single best evidence for "is this port actually used": down since
         # May is decommissioned, down since 10 minutes ago is a link flap.
@@ -273,22 +309,22 @@ def parse_port_state(output: str) -> list[PortState]:
     return ports
 
 
-def parse_port_isid(output: str) -> list[dict]:
+def parse_port_isid(output: str) -> list[PortIsidRow]:
     """`show interfaces gigabitEthernet i-sid`
 
     Data lines: <port> <ifindex> <isid> <vlanid|N/A> <c-vid|N/A> <type> ...
     Returns [{"port": str, "isid": int, "vlan": int|None}, ...]; the VLAN is
     taken from VLANID, falling back to C-VID for switched-UNI rows.
     """
-    rows: list[dict] = []
+    rows: list[PortIsidRow] = []
     for line in output.splitlines():
         tokens = line.split()
-        if len(tokens) < 5 or not PORT_RE.match(tokens[0]) \
+        if len(tokens) < MIN_PORT_ISID_FIELDS or not PORT_RE.match(tokens[0]) \
                 or not tokens[1].isdigit() or not tokens[2].isdigit():
             continue
         vlan = None
         for candidate in (tokens[3], tokens[4]):
-            if candidate.isdigit() and 1 <= int(candidate) <= 4094:
+            if candidate.isdigit() and is_vlan_id(int(candidate)):
                 vlan = int(candidate)
                 break
         rows.append({"port": tokens[0], "isid": int(tokens[2]), "vlan": vlan})
@@ -302,7 +338,7 @@ def parse_virtual_ist(output: str) -> IstState | None:
     """
     for line in output.splitlines():
         tokens = line.split()
-        if len(tokens) >= 4 and re.match(r"^\d+\.\d+\.\d+\.\d+$", tokens[0]):
+        if len(tokens) >= VIST_FIELDS and re.match(r"^\d+\.\d+\.\d+\.\d+$", tokens[0]):
             return IstState(
                 peer_ip=tokens[0],
                 vlan=int(tokens[1]) if tokens[1].isdigit() else None,
@@ -326,7 +362,7 @@ def parse_vlan_isid(output: str) -> list[VlanInfo]:
         if not m:
             continue
         vlan_id = int(m.group(1))
-        if not 1 <= vlan_id <= 4094:
+        if not is_vlan_id(vlan_id):
             continue
         isid = int(m.group(2)) if m.group(2) else None
         # the third column is the I-SID NAME, not the VLAN name - keep them
@@ -349,9 +385,9 @@ def parse_vlan_members(output: str) -> dict[int, list[str]]:
     A long PORT MEMBER list wraps onto continuation lines, broken after a
     comma. The open list is therefore carried across lines while it still ends
     in one: PORT MEMBER is the leftmost port column, so its continuation is the
-    first port-list token of the next line, whatever the other columns do. A
-    VLAN whose members wrapped used to be truncated at the break - on a
-    48-port box with wide VLANs that silently dropped ports from the sheets.
+    first port-list token of the next line, whatever the other columns do.
+    Stopping at the break would silently drop ports from the sheets on any
+    48-port box with wide VLANs.
     """
     result: dict[int, list[str]] = {}
     open_vid: int | None = None   # row whose PORT MEMBER list is still open
@@ -366,10 +402,10 @@ def parse_vlan_members(output: str) -> dict[int, list[str]]:
                 open_vid, raw = None, ""
             continue
         open_vid, raw = None, ""
-        if len(tokens) < 2 or not tokens[0].isdigit():
+        if len(tokens) < MIN_VLAN_MEMBERS_FIELDS or not tokens[0].isdigit():
             continue
         vid = int(tokens[0])
-        if not 1 <= vid <= 4094:
+        if not is_vlan_id(vid):
             continue
         for t in tokens[1:]:
             if "/" in t and is_port_list(t):
@@ -401,12 +437,12 @@ def parse_vlan_basic(output: str) -> dict[int, str]:
         if re.search(r"\bout of\b", line, re.IGNORECASE):
             continue
         m = re.match(r"^\s*(\d{1,4})\s+(\S+)\s+(\S+)\s+(\d+)\b", line)
-        if m and 1 <= int(m.group(1)) <= 4094:
+        if m and is_vlan_id(int(m.group(1))):
             result[int(m.group(1))] = m.group(2)
     return result
 
 
-def parse_isid_local(output: str) -> dict[int, dict]:
+def parse_isid_local(output: str) -> dict[int, LocalIsid]:
     """`show i-sid` on a DvR controller/BEB.
 
     Returns {isid: {"cvids": set[int], "name": str}}. Rows are anchored on a
@@ -419,24 +455,25 @@ def parse_isid_local(output: str) -> dict[int, dict]:
     arbitrary words ('quarantaine', 'cvlan-x') - only structural tokens
     (CONFIG/DISCOVER/-/N/A, ports, numbers, c<vid>: markers) are excluded.
     """
-    result: dict[int, dict] = {}
+    result: dict[int, LocalIsid] = {}
     current: int | None = None
     for line in output.splitlines():
         tokens = line.split()
         if not tokens:
             continue
-        if re.fullmatch(r"\d{1,9}", tokens[0]) and len(tokens) >= 2 \
+        if re.fullmatch(r"\d{1,9}", tokens[0]) and len(tokens) >= MIN_ISID_ROW_FIELDS \
                 and not tokens[1].isdigit():
             if "out of" in line.lower():
                 current = None  # 'N out of M Total Num ...' footer
                 continue
             current = int(tokens[0])
             entry = result.setdefault(current, {"cvids": set(), "name": ""})
-            if len(tokens) >= 3 and tokens[2].isdigit() \
-                    and 1 <= int(tokens[2]) <= 4094:
-                entry["cvids"].add(int(tokens[2]))  # VLANID column
+            if len(tokens) > ISID_VLAN_COLUMN and tokens[ISID_VLAN_COLUMN].isdigit() \
+                    and is_vlan_id(int(tokens[ISID_VLAN_COLUMN])):
+                entry["cvids"].add(int(tokens[ISID_VLAN_COLUMN]))
             tail = tokens[-1]
-            if len(tokens) > 2 and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
+            if len(tokens) > ISID_VLAN_COLUMN \
+                    and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
                     and not re.match(r"^c\d{1,4}:", tail) \
                     and not PORT_RE.match(tail) and not tail.isdigit():
                 entry["name"] = tail
@@ -447,7 +484,7 @@ def parse_isid_local(output: str) -> dict[int, dict]:
     return result
 
 
-def parse_dvr_interfaces(output: str) -> list[dict]:
+def parse_dvr_interfaces(output: str) -> list[DvrInterfaceRow]:
     """`show dvr interfaces` on a DvR controller.
 
     Data lines: <ip> <mask> <l3isid> <vrfid> <l2isid> <vlan> <gw-ipv4> ...
@@ -456,32 +493,32 @@ def parse_dvr_interfaces(output: str) -> list[dict]:
     (L2ISID, VLAN, GW). Returns [{"l2isid": int, "vlan": int}, ...].
     """
     ipv4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-    rows: list[dict] = []
+    rows: list[DvrInterfaceRow] = []
     for line in output.splitlines():
         tokens = line.split()
-        if len(tokens) < 5 or not ipv4.match(tokens[0]):
+        if len(tokens) < MIN_DVR_FIELDS or not ipv4.match(tokens[0]):
             continue
         for i in range(1, len(tokens) - 2):
             if tokens[i].isdigit() and tokens[i + 1].isdigit() \
                     and ipv4.match(tokens[i + 2]):
                 l2isid, vlan = int(tokens[i]), int(tokens[i + 1])
-                if l2isid > 0 and 1 <= vlan <= 4094:
+                if l2isid > 0 and is_vlan_id(vlan):
                     rows.append({"l2isid": l2isid, "vlan": vlan})
                     break
     return rows
 
 
-def parse_isis_spbm_isid(output: str) -> list[dict]:
+def parse_isis_spbm_isid(output: str) -> list[SpbmIsidRow]:
     """`show isis spbm i-sid all`
 
     Lines: <isid> <source-name> <b-vlan> <sysid> <type> <host_name>
     Returns [{"isid": int, "type": str, "host": str}, ...]. The VLAN column is
     the B-VLAN, NOT a customer VLAN - intentionally ignored.
     """
-    rows: list[dict] = []
+    rows: list[SpbmIsidRow] = []
     for line in output.splitlines():
         tokens = line.split()
-        if len(tokens) < 4 or not re.match(r"^\d{1,9}$", tokens[0]):
+        if len(tokens) < MIN_SPBM_ISID_FIELDS or not re.match(r"^\d{1,9}$", tokens[0]):
             continue
         typ = next((t for t in tokens if t.lower() in ("config", "discover")), "")
         if not typ:

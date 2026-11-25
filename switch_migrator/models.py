@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TypedDict
 
 
 class Platform(str, Enum):
@@ -44,11 +45,11 @@ _ISID_NOTES = {"local": "(local)", "excluded": "(excluded)",
 class VlanBinding:
     """One VLAN carried on a port or MLT, with its I-SID and how it egresses.
 
-    Kept as a pair rather than two parallel lists because the sheets used to
-    print 'VLANs 200,4000' beside 'I-SIDs 10200' and leave the reader to guess
-    which was which - and to silently drop any VLAN whose I-SID was unknown.
-    `isid is None` is therefore a real state ('local VLAN' or 'not resolved'),
-    distinguished by `isid_note`, never an omission.
+    A pair, not two parallel lists: 'VLANs 200,4000' beside 'I-SIDs 10200'
+    leaves the reader to guess which belongs to which, and a VLAN whose I-SID
+    is unknown would simply be missing from the second list. `isid is None` is
+    therefore a real state ('local VLAN' or 'not resolved'), distinguished by
+    `isid_note`, never an omission.
     """
     vlan: int | None = None       # None = untagged traffic with no c-vid of its own
     isid: int | None = None
@@ -72,9 +73,9 @@ class VlanBinding:
 def tagging_summary(bindings: list[VlanBinding]) -> str:
     """One word for a whole port or MLT, derived from its bindings.
 
-    Only says something when the bindings do. The rule this replaced - one
-    VLAN means untagged, several mean tagged - called a trunk carrying a
-    single tagged VLAN 'untagged', which is a wrong port on the new switch.
+    Only says something when the bindings do. It is never inferred from the
+    VLAN count: 'one VLAN means untagged' would call a trunk carrying a single
+    tagged VLAN untagged, which is a wrong port on the new switch.
     """
     kinds = {b.tagging for b in bindings if b.tagging}
     if not kinds:
@@ -193,6 +194,13 @@ class VlanInfo:
     members: list[str] = field(default_factory=list)  # configured port members
 
 
+class PortIsidRow(TypedDict):
+    """One row of `show interfaces gigabitEthernet i-sid`."""
+    port: str
+    isid: int
+    vlan: int | None
+
+
 @dataclass
 class SwitchAudit:
     """Everything collected from one to-be-migrated switch."""
@@ -208,7 +216,7 @@ class SwitchAudit:
     uptime_days: int | None = None  # how long counters have accumulated
     # rows from `show interfaces gigabitEthernet i-sid`, kept so the per-port
     # VLAN/I-SID columns need no second call
-    port_isid_rows: list[dict] = field(default_factory=list)
+    port_isid_rows: list[PortIsidRow] = field(default_factory=list)
     # which sources answered on this device, for the coverage report
     sources: list[SourceStatus] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -275,11 +283,14 @@ class FabricState:
 
 class CompStatus(str, Enum):
     OK = "OK"                                    # convention & DvR attachment agree
-    OK_NONSTANDARD = "OK_NONSTANDARD"            # found via DvR attachment, but no convention match
-    IN_FABRIC_NOT_ATTACHED = "IN_FABRIC_NOT_ATTACHED"  # convention I-SID exists, no c-vid seen on DvR controllers
+    # found via DvR attachment, but no convention match
+    OK_NONSTANDARD = "OK_NONSTANDARD"
+    # convention I-SID exists, no c-vid seen on DvR controllers
+    IN_FABRIC_NOT_ATTACHED = "IN_FABRIC_NOT_ATTACHED"
     AMBIGUOUS = "AMBIGUOUS"                      # multiple candidate I-SIDs match
     MISSING_ON_DVR = "MISSING_ON_DVR"            # nothing found in fabric
-    LOCAL_ONLY = "LOCAL_ONLY"                    # VOSS VLAN with no I-SID binding: local L2 by design, not a fabric service
+    # VOSS VLAN with no I-SID binding: local L2 by design, not a fabric service
+    LOCAL_ONLY = "LOCAL_ONLY"
     LOCAL_ISID_NOT_IN_FABRIC = "LOCAL_ISID_NOT_IN_FABRIC"
     LOCAL_BINDING_CONFLICT = "LOCAL_BINDING_CONFLICT"  # switch and DvR disagree
     EXCLUDED = "EXCLUDED"

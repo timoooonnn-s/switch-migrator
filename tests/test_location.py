@@ -123,18 +123,19 @@ def test_a_mistyped_group_is_refused_not_silently_empty():
 # --------------------------- config ----------------------------------------
 
 def test_locations_load_from_config(tmp_path):
+    segments = 3
     path = tmp_path / "config.yaml"
     path.write_text(
         "locations:\n"
         "  patterns:\n"
         "    'gx-11-*': Frankfurt DC1\n"
         "    'gx-12-*': Frankfurt DC2\n"
-        "  fallback_segments: 3\n"
+        f"  fallback_segments: {segments}\n"
         "  groups:\n"
         "    Frankfurt: ['Frankfurt DC1', 'Frankfurt DC2']\n")
     cfg = load_config(path, require_fabric=False)
     assert cfg.locations.patterns["gx-11-*"] == "Frankfurt DC1"
-    assert cfg.locations.fallback_segments == 3
+    assert cfg.locations.fallback_segments == segments
     assert cfg.locations.groups == {"Frankfurt": ["Frankfurt DC1",
                                                   "Frankfurt DC2"]}
     assert L.group_of_switch("gx-12-s01-p9", cfg.locations) == "Frankfurt"
@@ -178,8 +179,8 @@ def test_the_cabling_sheet_splits_into_one_table_per_group():
     audits = [_audit("gx-11-s72-p1"), _audit("gx-12-s01-p9"), _audit("mu-01-a")]
     tables = build_cabling_by_location(audits, RULES)
     assert [t.title for t in tables] == ["Cabling Frankfurt", "Cabling Munich"]
-    assert len(tables[0].rows) == 4          # two switches, two ports each
-    assert len(tables[1].rows) == 2
+    # two switches with two ports each in Frankfurt, one in Munich
+    assert [len(t.rows) for t in tables] == [4, 2]
 
 
 def test_no_link_appears_on_two_sheets():

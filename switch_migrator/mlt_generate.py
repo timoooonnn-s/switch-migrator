@@ -36,10 +36,14 @@ failure wearing the costume of a redundant one.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from switch_migrator import usage
 from switch_migrator.cabling_sheet import CablingRow, Sheet
 from switch_migrator.parsers.common import port_sort_key
+
+# the far end of an SMLT is a vIST pair: two neighbours
+SMLT_PAIR = 2
 
 
 @dataclass
@@ -74,24 +78,38 @@ class MltGenerateResult:
         return out
 
 
-def _old_key(row: CablingRow) -> tuple[str, int] | None:
-    """Which old aggregation does this link belong to?"""
-    return (row.old_switch, row.mlt_id) if row.mlt_id is not None else None
+class _GroupKey(NamedTuple):
+    """One aggregation-to-be on one new switch."""
+    switch: str          # the NEW switch
+    mlt_id: int
+    old_switch: str      # '' when the planner's NEW MLT ID is what groups it
+
+    @property
+    def from_sheet(self) -> bool:
+        return not self.old_switch
+
+    @property
+    def order(self) -> str:
+        """Blocks come out sheet-numbered first, then by switch and id - kept
+        as the text order the file has always had."""
+        if self.from_sheet:
+            return str(("new", self.switch, self.mlt_id))
+        return str(("old", self.switch, self.old_switch, self.mlt_id))
 
 
-def _group(rows: list[CablingRow]) -> dict[tuple, list[CablingRow]]:
+def _group(rows: list[CablingRow]) -> dict[_GroupKey, list[CablingRow]]:
     """Group migrated links into the aggregations they will form.
 
     The planner's NEW MLT ID wins when they set one - that is the whole point
     of the column, and it is how two old MLTs get consolidated onto one new
     one. Otherwise links stay grouped by the old MLT they came from.
     """
-    groups: dict[tuple, list[CablingRow]] = {}
+    groups: dict[_GroupKey, list[CablingRow]] = {}
     for row in rows:
         if row.new_mlt_id is not None:
-            key = ("new", row.new_switch, row.new_mlt_id)
+            key = _GroupKey(row.new_switch, row.new_mlt_id, "")
         elif row.mlt_id is not None:
-            key = ("old", row.new_switch, row.old_switch, row.mlt_id)
+            key = _GroupKey(row.new_switch, row.mlt_id, row.old_switch)
         else:
             continue                    # a plain access port is not an MLT
         groups.setdefault(key, []).append(row)
@@ -130,13 +148,10 @@ def plan(sheet: Sheet, smlt: bool = True, lacp: bool | None = None,
             "those in as the links are re-patched, then run this again")
         return result
 
-    for key, members in sorted(_group(rows).items(), key=lambda kv: str(kv[0])):
-        switch = key[1]
+    for key, members in sorted(_group(rows).items(), key=lambda kv: kv[0].order):
+        switch, mlt_id = key.switch, key.mlt_id
         first = members[0]
-        if key[0] == "new":
-            mlt_id, id_source = key[2], "sheet"
-        else:
-            mlt_id, id_source = key[3], f"carried over from {first.old_switch}"
+        id_source = "sheet" if key.from_sheet else f"carried over from {first.old_switch}"
         name, name_source = _pick_name(members, mlt_id)
 
         old_mlts = sorted({f"{r.old_switch} MLT {r.mlt_id}" for r in members
@@ -218,11 +233,11 @@ def _member_warnings(members: list[CablingRow]) -> list[str]:
     # problem: an MLT has to terminate on one logical device.
     neighbors = sorted({r.neighbor for r in members if r.neighbor})
     uplink = any(r.kind == "uplink" for r in members)
-    if len(neighbors) > 2:
+    if len(neighbors) > SMLT_PAIR:
         out.append(f"members face {len(neighbors)} different neighbors "
                    f"({', '.join(neighbors)}) - an aggregation must terminate "
                    f"on ONE device, or on ONE SMLT pair")
-    elif len(neighbors) == 2 and not uplink:
+    elif len(neighbors) == SMLT_PAIR and not uplink:
         out.append(f"members face two neighbors ({', '.join(neighbors)}) - "
                    f"correct if they are a vIST/SMLT pair, wrong if they are "
                    f"two independent devices")

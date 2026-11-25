@@ -13,6 +13,7 @@ The bugs these guard against:
             because no port state could be read.
 """
 
+import shutil
 from pathlib import Path
 
 from switch_migrator.collectors.switch import collect_switch
@@ -24,6 +25,12 @@ from switch_migrator.models import CompStatus, FabricState, Platform
 FIXTURES = Path(__file__).parent / "fixtures"
 PROD = FIXTURES / "voss_prod"
 DEVICE = "gx-11-s72-p1"
+
+
+VIST_ISID = 1531100       # VLAN 31's infrastructure I-SID in the prod capture
+PROD_PORTS = 54           # 48 + 6 x 40G
+PROD_PORTS_UP = 15
+MLT_35_MEMBERS = 4        # 1/1,1/2,1/23,1/24
 
 
 def _cfg() -> Config:
@@ -87,7 +94,6 @@ def test_prod_populated_mlts_not_flagged_as_zero_up():
 
 def test_prod_datapath_none_is_flagged_when_port_state_missing(tmp_path):
     # take the real capture but force MLT 196 out of the data path
-    import shutil
     dev = tmp_path / DEVICE
     shutil.copytree(PROD / DEVICE, dev)
     mlt = (dev / "show_mlt.txt").read_text().replace(
@@ -123,7 +129,7 @@ def test_prod_bound_vlan_still_verified_against_fabric():
     res = {c.vlan_id: c for c in compare_switch(audit, _fabric_from_switch(audit), _cfg())}
     # VLAN 31 binds I-SID 1531100 which the fabric confirms -> not local-only
     assert res[31].status is not CompStatus.LOCAL_ONLY
-    assert res[31].matched_isid == 1531100
+    assert res[31].matched_isid == VIST_ISID
 
 
 # --------------------------------------------------------------------------- #
@@ -150,11 +156,12 @@ def test_priv_ports_come_from_interface_variant_fallback():
     # no `state` capture on purpose: the chain must fall back to
     # `show interfaces gigabitEthernet interface` and parse the real table
     audit = _priv_audit()
-    assert len(audit.ports) == 54          # 48 + 6 x 40G
-    assert audit.ports_up == 15
+    assert len(audit.ports) == PROD_PORTS
+    assert audit.ports_up == PROD_PORTS_UP
     assert not audit.errors
     by_port = {p.port: p for p in audit.ports}
-    assert by_port["1/4"].admin_up is True and by_port["1/4"].oper_up is False
+    assert by_port["1/4"].admin_up is True
+    assert by_port["1/4"].oper_up is False
     assert by_port["2/6"].admin_up is False
 
 
@@ -180,7 +187,7 @@ def test_priv_mlts_fully_up_and_uplink_detected():
     assert all(m.members_up == m.members_total for m in audit.mlts)
     assert not [w for w in audit.warnings if "member ports up" in w]
     # MLT 35 (1/1,1/2,1/23,1/24) faces the new gx-11-s74-* BEBs -> uplink
-    assert by_id[35].members_up == 4
+    assert by_id[35].members_up == MLT_35_MEMBERS
     assert by_id[35].is_uplink
     # single-port server MLTs are not uplinks
     assert not by_id[196].is_uplink

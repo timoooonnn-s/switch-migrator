@@ -27,7 +27,10 @@ import json
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, TypeVar, get_origin
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 from switch_migrator import __version__
 from switch_migrator.models import (
@@ -45,6 +48,8 @@ from switch_migrator.models import (
 
 SNAPSHOT_FORMAT = 1
 
+
+_T = TypeVar("_T", bound="DataclassInstance")
 
 class SnapshotError(Exception):
     pass
@@ -70,7 +75,7 @@ def _plain(value: Any) -> Any:
 
 
 def to_dict(audits: list[SwitchAudit], fabric: FabricState,
-            meta: dict | None = None) -> dict:
+            meta: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "format": SNAPSHOT_FORMAT,
         "tool_version": __version__,
@@ -82,7 +87,7 @@ def to_dict(audits: list[SwitchAudit], fabric: FabricState,
 
 
 def save(path: Path, audits: list[SwitchAudit], fabric: FabricState,
-         meta: dict | None = None) -> Path:
+         meta: dict[str, Any] | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(to_dict(audits, fabric, meta), indent=2),
                     encoding="utf-8")
@@ -93,7 +98,7 @@ def save(path: Path, audits: list[SwitchAudit], fabric: FabricState,
 # reading
 # --------------------------------------------------------------------------
 
-def _build(cls, data: dict):
+def _build(cls: type[_T], data: dict[str, Any]) -> _T:
     """Rebuild a dataclass from a plain dict.
 
     Fields the snapshot does not carry keep their default (an older file), and
@@ -142,6 +147,11 @@ def _coerce(annotation: Any, value: Any) -> Any:
         if text.startswith("list[") or get_origin(annotation) is list:
             return [_build(cls, v) for v in value]
         return _build(cls, value)
+    return _coerce_container(text, value)
+
+
+def _coerce_container(text: str, value: Any) -> Any:
+    """JSON has no sets and only string keys: put both back."""
     if text.startswith("set["):
         return set(value)
     if text.startswith("dict[int"):
@@ -149,7 +159,7 @@ def _coerce(annotation: Any, value: Any) -> Any:
     return value
 
 
-def _fabric_from(data: dict) -> FabricState:
+def _fabric_from(data: dict[str, Any]) -> FabricState:
     fabric = FabricState()
     for key, rec in (data.get("isids") or {}).items():
         isid = _build(FabricIsid, rec)
@@ -164,7 +174,7 @@ def _fabric_from(data: dict) -> FabricState:
     return fabric
 
 
-def load(path: Path) -> tuple[list[SwitchAudit], FabricState, dict]:
+def load(path: Path) -> tuple[list[SwitchAudit], FabricState, dict[str, Any]]:
     """Read a snapshot -> (audits, fabric, meta). Raises SnapshotError."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -188,7 +198,7 @@ def load(path: Path) -> tuple[list[SwitchAudit], FabricState, dict]:
     return audits, fabric, meta
 
 
-def describe(meta: dict, audits: list[SwitchAudit]) -> str:
+def describe(meta: dict[str, Any], audits: list[SwitchAudit]) -> str:
     """One line for the console when a snapshot is loaded."""
     when = meta.get("created", "unknown time")
     reachable = sum(1 for a in audits if a.reachable)

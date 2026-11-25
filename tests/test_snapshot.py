@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from switch_migrator import snapshot
-from switch_migrator.collectors.switch import collect_switch
+from switch_migrator.collectors.switch import Reads, collect_switch
 from switch_migrator.config import Config, SshSettings, SwitchTarget
 from switch_migrator.connection import OfflineRunner
 from switch_migrator.models import FabricState, Platform, SwitchAudit
@@ -28,9 +28,9 @@ def collected(tmp_path, cfg):
     shutil.copytree(FIXTURES / "ers", tmp_path / "sw2")
     audits = [
         collect_switch(SwitchTarget("sw1", "sw1", Platform.VOSS),
-                       OfflineRunner("sw1", tmp_path), cfg, pull_macs=True),
+                       OfflineRunner("sw1", tmp_path), cfg, Reads(macs=True)),
         collect_switch(SwitchTarget("sw2", "sw2", Platform.ERS),
-                       OfflineRunner("sw2", tmp_path), cfg, pull_macs=True),
+                       OfflineRunner("sw2", tmp_path), cfg, Reads(macs=True)),
     ]
     fabric = FabricState()
     rec = fabric.get_or_create(10100)
@@ -61,12 +61,17 @@ def test_types_survive_json(tmp_path, collected):
     voss = next(a for a in back if a.name == "sw1")
     assert isinstance(voss, SwitchAudit)
     assert voss.platform is Platform.VOSS
-    assert voss.ports and isinstance(voss.ports[0].vlans, list)
-    assert voss.mlts and isinstance(voss.mlts[0].members, list)
-    assert voss.ist is not None and voss.ist.enabled is True
-    assert voss.vlans and voss.vlans[0].vlan_id == 1
+    assert voss.ports
+    assert isinstance(voss.ports[0].vlans, list)
+    assert voss.mlts
+    assert isinstance(voss.mlts[0].members, list)
+    assert voss.ist is not None
+    assert voss.ist.enabled is True
+    assert voss.vlans
+    assert voss.vlans[0].vlan_id == 1
     isid = back_fabric.isids[10100]
-    assert isid.cvids == {100} and isid.seen_on == {"dvr-01"}
+    assert isid.cvids == {100}
+    assert isid.seen_on == {"dvr-01"}
     assert back_fabric.dvrs_ok == ["dvr-01"]
     # derived properties still work on the rebuilt objects
     assert voss.ports_up == sum(1 for p in voss.ports if p.oper_up)
@@ -79,7 +84,8 @@ def test_usage_classification_survives(tmp_path, collected):
               for a in audits for p in a.ports}
     after = {(a.name, p.port): (p.usage, p.usage_evidence, p.last_change_days)
              for a in back for p in a.ports}
-    assert before == after and before
+    assert before == after
+    assert before
 
 
 def test_missing_fields_fall_back_to_defaults(tmp_path):
@@ -94,9 +100,12 @@ def test_missing_fields_fall_back_to_defaults(tmp_path):
     path = tmp_path / "thin.json"
     path.write_text(json.dumps(thin))
     audits, fabric, meta = snapshot.load(path)
-    assert audits[0].name == "old" and audits[0].platform is Platform.ERS
-    assert audits[0].ports == [] and audits[0].reachable is False
-    assert fabric.isids == {} and meta["tool_version"] == "0.9.0"
+    assert audits[0].name == "old"
+    assert audits[0].platform is Platform.ERS
+    assert audits[0].ports == []
+    assert audits[0].reachable is False
+    assert fabric.isids == {}
+    assert meta["tool_version"] == "0.9.0"
 
 
 def test_unknown_fields_are_ignored(tmp_path, collected):

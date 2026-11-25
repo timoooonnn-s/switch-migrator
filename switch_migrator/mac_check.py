@@ -22,21 +22,36 @@ migration-check is optional; without it, the MAC options say how to install it.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextlib
 import json
 import logging
 import sys
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any
 
 from switch_migrator.cabling_sheet import Sheet
 from switch_migrator.config import ConfigError, MacCheckSettings, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError, looks_like_error
 from switch_migrator.models import Platform
 
-if TYPE_CHECKING:
-    from migration_check.compare import Comparison, LoadedSnapshot
+# migration-check is optional and needs Python 3.11+: everything this module
+# uses from it is imported here, once; when that fails, problem() says why and
+# no function below is reached (require() runs before any switch is touched)
+_IMPORT_ERROR: ImportError | None = None
+try:
+    import migration_check
+    from migration_check.capture import looks_rejected
+    from migration_check.compare import Comparison, LoadedSnapshot, Verdict, compare, load
+    from migration_check.model import Platform as CheckPlatform
+    from migration_check.platforms import ADAPTERS
+    from migration_check.report import render_text, to_json, trend_line
+    from migration_check.snapshot import CommandStatus, SnapshotWriter
+    from migration_check.watch import round_folder
+    from migration_check.watch import watch as run_watch
+except ImportError as exc:
+    _IMPORT_ERROR = exc
 
 log = logging.getLogger(__name__)
 
@@ -67,10 +82,9 @@ def problem() -> str | None:
     if sys.version_info < MIN_PYTHON:
         return (f"migration-check needs Python {'.'.join(map(str, MIN_PYTHON))}+, "
                 f"this is {sys.version_info.major}.{sys.version_info.minor}")
-    try:
-        import migration_check
-    except ImportError:
-        return f"migration-check is not installed: {INSTALL_HINT}"
+    if _IMPORT_ERROR is not None:
+        return (f"migration-check is not installed, or too old to have what this "
+                f"needs ({_IMPORT_ERROR}): {INSTALL_HINT}")
     found = getattr(migration_check, "__version__", "0")
     if _version(found) < MIN_VERSION:
         return (f"migration-check {found} is too old, "
@@ -109,10 +123,8 @@ def commands_for(platform: Platform) -> tuple[str, ...]:
     """migration-check's command list for one platform. Read-only by its own
     contract; checked here as well, because this tool's read-only claim covers
     every command it sends, whoever chose it."""
-    from migration_check.model import Platform as CheckPlatform
-    from migration_check.platforms import ADAPTERS
 
-    commands = ADAPTERS[CheckPlatform.from_name(platform.value)].commands
+    commands: tuple[str, ...] = ADAPTERS[CheckPlatform.from_name(platform.value)].commands
     rogue = [c for c in commands if not c.strip().lower().startswith("show ")]
     if rogue:
         raise ConfigError(f"migration-check asks for non-show command(s) {rogue} - refused")
@@ -176,10 +188,8 @@ def send_remaining(platform: Platform, runner: BaseRunner, memo: AnswerMemo) -> 
     """Send migration-check's commands the collection has not sent yet, discarding
     the answers (`--dry-run`: what the MAC snapshot would add to the list)."""
     for command in commands_for(platform):
-        try:
+        with contextlib.suppress(CommandError):
             _answer(runner, memo, command)
-        except CommandError:
-            pass
 
 
 class SnapshotRecorder:
@@ -192,7 +202,6 @@ class SnapshotRecorder:
 
     def __init__(self, path: Path, label: str,
                  only: Collection[str] | None = None):
-        from migration_check.snapshot import SnapshotWriter
 
         self.path = path
         self.only = set(only) if only is not None else None
@@ -203,9 +212,6 @@ class SnapshotRecorder:
 
     def record(self, target: SwitchTarget, runner: BaseRunner,
                memo: AnswerMemo | None = None) -> None:
-        from migration_check.capture import looks_rejected
-        from migration_check.model import Platform as CheckPlatform
-        from migration_check.snapshot import CommandStatus
 
         if not self.wants(target.name):
             return
@@ -227,8 +233,6 @@ class SnapshotRecorder:
     def unreachable(self, target: SwitchTarget, reason: str) -> None:
         """A switch the collection could not reach is in the snapshot too, with every
         command failed - so the report says so instead of the switch just missing."""
-        from migration_check.model import Platform as CheckPlatform
-        from migration_check.snapshot import CommandStatus
 
         if not self.wants(target.name):
             return
@@ -252,7 +256,7 @@ def capture(targets: list[SwitchTarget], folder: Path,
     def one(target: SwitchTarget) -> None:
         try:
             runner = open_runner(target)
-        except Exception as exc:  # noqa: BLE001 - one dead switch must not cost the round
+        except Exception as exc:  # broad on purpose: one dead switch must not cost the round
             recorder.unreachable(target, f"{exc.__class__.__name__}: {exc}")
             return
         try:
@@ -274,8 +278,8 @@ def after_snapshot_path(output_dir: Path, stamp: str, watching: bool) -> Path:
     the first of several rounds, in migration-check's round layout."""
     after = output_dir / f"mac-check-{stamp}" / "after"
     if watching:
-        from migration_check.watch import round_folder
-        return round_folder(after, 1)
+        first: Path = round_folder(after, 1)
+        return first
     return after
 
 
@@ -294,7 +298,6 @@ class MacCheck:
 
     @property
     def summary(self) -> str:
-        from migration_check.compare import Verdict
 
         worst_first = (Verdict.MISSING, Verdict.WRONG_VLAN, Verdict.OTHER_PORT,
                        Verdict.ELSEWHERE)
@@ -308,82 +311,105 @@ class MacCheck:
 
 
 def load_baselines(baselines: list[Path]) -> list[LoadedSnapshot]:
-    from migration_check.compare import load
 
     return [load(path) for path in baselines]
 
 
-def check(baselines: list[Path], after: Path, sheet: Sheet,
-          output_dir: Path, stamp: str, *,
-          watch: MacCheckSettings | None = None,
-          targets: list[SwitchTarget] | None = None,
-          open_runner: Callable[[SwitchTarget], BaseRunner] | None = None,
-          workers: int = 4,
-          on_round: Callable[[str], None] = lambda line: None) -> MacCheck:
+def _ignore_line(line: str) -> None:
+    """The default round callback: say nothing."""
+
+
+@dataclass
+class MacCheckJob:
+    """What one MAC check compares, and where its report goes."""
+    baselines: list[Path]
+    after: Path                  # the new switches' snapshot, taken during verification
+    sheet: Sheet
+    output_dir: Path
+    stamp: str
+
+
+@dataclass
+class Watching:
+    """How --mac-watch re-reads the new switches between rounds."""
+    settings: MacCheckSettings
+    targets: list[SwitchTarget]
+    open_runner: Callable[[SwitchTarget], BaseRunner]
+    workers: int = 4
+    on_round: Callable[[str], None] = _ignore_line
+
+
+@dataclass
+class _Outcome:
+    comparison: Comparison
+    last: Path                   # the after snapshot the result comes from
+    trend: list[str] = field(default_factory=list)
+    stopped: str = ""
+
+
+def check(job: MacCheckJob, watch: Watching | None = None) -> MacCheck:
     """Compare the baseline(s) with the after snapshot that was recorded during the
     verification and write the report.
 
-    With `watch`, `after` is round 1 and the new switches are read again on fresh
-    sessions every interval until everything is back, the number not back stops
-    falling, or the round limit is reached (migration-check decision 0011).
+    With `watch`, `job.after` is round 1 and the new switches are read again on
+    fresh sessions every interval until everything is back, the number not back
+    stops falling, or the round limit is reached (migration-check decision 0011).
     """
-    from migration_check.compare import compare, load
-    from migration_check.report import render_text, to_json, trend_line
-    from migration_check.watch import watch as run_watch
-
-    before = load_baselines(baselines)
-    mapping = port_map(sheet)
-    trend: list[str] = []
-    stopped = ""
+    before = load_baselines(job.baselines)
+    mapping = port_map(job.sheet)
     if watch is None:
-        comparison = compare(before, load(after), port_map=mapping)
-        last = after
+        outcome = _Outcome(compare(before, load(job.after), port_map=mapping), job.after)
     else:
-        if targets is None or open_runner is None:
-            raise ValueError("watching needs the targets and a way to open a runner")
+        outcome = _watch(job, watch, before, mapping)
+    return _write_report(job, outcome)
 
-        def take(folder: Path) -> None:
-            if folder != after:          # round 1 was recorded during the verification
-                capture(targets, folder, open_runner, label="after", workers=workers)
 
-        done: list = []
+def _watch(job: MacCheckJob, watch: Watching, before: list[LoadedSnapshot],
+           mapping: dict[tuple[str, str], tuple[str, str]]) -> _Outcome:
+    trend: list[str] = []
+    done: list[Any] = []          # migration-check's watch rounds
 
-        def on(rounds) -> None:
-            done[:] = rounds
-            line = trend_line(rounds)
-            trend.append(line)
-            on_round(line)
+    def take(folder: Path) -> None:
+        if folder != job.after:      # round 1 was recorded during the verification
+            capture(watch.targets, folder, watch.open_runner, label="after",
+                    workers=watch.workers)
 
-        try:
-            result = run_watch(
-                take_snapshot=take,
-                compare_round=lambda folder: compare(before, load(folder), port_map=mapping),
-                out=after.parent,
-                interval_seconds=watch.interval_seconds,
-                max_rounds=watch.max_rounds,
-                stable_rounds=watch.stable_rounds,
-                on_round=on)
-        except KeyboardInterrupt:
-            # Ctrl-C ends the watch, not the run: the last finished round is the
-            # result, and the verification's other reports still get written
-            if done:
-                comparison, last = done[-1].comparison, done[-1].path
-                stopped = f"stopped after round {done[-1].number}: interrupted"
-            else:
-                comparison, last = compare(before, load(after), port_map=mapping), after
-                stopped = "stopped in round 1: interrupted"
-        else:
-            comparison, last = result.last.comparison, result.last.path
-            stopped = f"stopped after round {result.last.number}: {result.reason.value}"
+    def on(rounds: tuple[Any, ...]) -> None:
+        done[:] = rounds
+        line = trend_line(rounds)
+        trend.append(line)
+        watch.on_round(line)
 
-    text = output_dir / f"mac-check-{stamp}.txt"
-    head = "".join(f"{line}\n" for line in trend)
-    if stopped:
-        head += f"{stopped}\n\n"
-    text.write_text(head + render_text(comparison), encoding="utf-8")
-    json_path = output_dir / f"mac-check-{stamp}.json"
-    payload = to_json(comparison)
-    if trend:
-        payload["watch"] = {"rounds": trend, "stopped": stopped}
+    settings = watch.settings
+    try:
+        result = run_watch(
+            take_snapshot=take,
+            compare_round=lambda folder: compare(before, load(folder), port_map=mapping),
+            out=job.after.parent, interval_seconds=settings.interval_seconds,
+            max_rounds=settings.max_rounds, stable_rounds=settings.stable_rounds,
+            on_round=on)
+    except KeyboardInterrupt:
+        # Ctrl-C ends the watch, not the run: the last finished round is the
+        # result, and the verification's other reports still get written
+        if done:
+            return _Outcome(done[-1].comparison, done[-1].path, trend,
+                            f"stopped after round {done[-1].number}: interrupted")
+        return _Outcome(compare(before, load(job.after), port_map=mapping), job.after,
+                        trend, "stopped in round 1: interrupted")
+    return _Outcome(result.last.comparison, result.last.path, trend,
+                    f"stopped after round {result.last.number}: {result.reason.value}")
+
+
+def _write_report(job: MacCheckJob, outcome: _Outcome) -> MacCheck:
+    text = job.output_dir / f"mac-check-{job.stamp}.txt"
+    head = "".join(f"{line}\n" for line in outcome.trend)
+    if outcome.stopped:
+        head += f"{outcome.stopped}\n\n"
+    text.write_text(head + render_text(outcome.comparison), encoding="utf-8")
+    json_path = job.output_dir / f"mac-check-{job.stamp}.json"
+    payload = to_json(outcome.comparison)
+    if outcome.trend:
+        payload["watch"] = {"rounds": outcome.trend, "stopped": outcome.stopped}
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return MacCheck(comparison, last, text, json_path, trend, stopped)
+    return MacCheck(outcome.comparison, outcome.last, text, json_path, outcome.trend,
+                    outcome.stopped)

@@ -15,6 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+# a convention I-SID: three prefix digits, four VLAN digits
+ISID_DIGITS = 7
+# a slot/port id
+SLOT_PORT_PARTS = 2
+# 4xx encodes the port in two digits
+MAX_MLT_PORT = 99
+
 
 class ConventionError(ValueError):
     """The value cannot be expressed under the estate's conventions."""
@@ -78,7 +85,7 @@ class IsidClassification:
 def classify_isid(isid: int) -> IsidClassification:
     """Take an existing I-SID apart. Unknown shapes are described, not rejected."""
     text = str(isid)
-    if len(text) != 7:
+    if len(text) != ISID_DIGITS:
         return IsidClassification(isid, 0, None, None, False,
                                   f"not 7 digits, cannot decompose ({text})")
     prefix, tail = int(text[:3]), int(text[3:])
@@ -116,7 +123,7 @@ DEFAULT_MLT_NAME = "f{slot}{port}"
 
 def _slot_port(port_id: str) -> tuple[int, int]:
     parts = port_id.strip().split("/")
-    if len(parts) != 2:
+    if len(parts) != SLOT_PORT_PARTS:
         raise ConventionError(
             f"the 4xx MLT rule is only defined for slot/port ids; {port_id!r} "
             f"needs an explicit MLT id")
@@ -129,7 +136,7 @@ def _slot_port(port_id: str) -> tuple[int, int]:
 def mlt_id_for_new_lag(first_port: str) -> int:
     """MLT id for a NEW LAG whose first member is `first_port`: 1/10 -> 410."""
     _, port = _slot_port(first_port)
-    if not 1 <= port <= 99:
+    if not 1 <= port <= MAX_MLT_PORT:
         raise ConventionError(f"the 4xx rule only encodes ports 1-99; port {port} "
                               f"needs an explicit MLT id")
     return MLT_NEW_BASE + port

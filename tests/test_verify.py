@@ -3,8 +3,6 @@
 import csv
 from pathlib import Path
 
-import pytest
-
 from switch_migrator import cabling_sheet as CS
 from switch_migrator import verify
 from switch_migrator.models import Platform, PortState, SwitchAudit
@@ -43,14 +41,16 @@ def _one(tmp_path, row: dict, ports: list[PortState], **kw):
 def test_link_up_and_an_expected_mac_is_a_pass(tmp_path):
     """The strongest evidence available that the right cable went into the
     right hole: the same machine is talking on the new port."""
+    sheet_macs = ["00:11:22:33:44:55", "00:11:22:33:44:56"]
     v = _one(tmp_path,
              {"Port ID": "P0001", "Old switch": "gx-01", "Old port": "1/7",
               "NEW switch": "leaf-01", "NEW port": "1/9",
-              "MAC addresses": "00:11:22:33:44:55,00:11:22:33:44:56"},
+              "MAC addresses": ",".join(sheet_macs)},
              [PortState(port="1/9", oper_up=True,
                         macs=["00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"])])
     assert v.result == verify.PASS
-    assert v.macs_found == 1 and v.macs_expected == 2
+    assert v.macs_found == 1
+    assert v.macs_expected == len(sheet_macs)
     assert "1 of 2 expected MAC(s)" in v.why
 
 
@@ -71,7 +71,8 @@ def test_a_down_link_fails(tmp_path):
               "NEW port": "1/9", "MAC addresses": "00:11:22:33:44:55"},
              [PortState(port="1/9", oper_up=False, state_reason="SSH")])
     assert v.result == verify.FAIL
-    assert "DOWN" in v.why and "SSH" in v.why
+    assert "DOWN" in v.why
+    assert "SSH" in v.why
 
 
 def test_a_port_that_does_not_exist_fails(tmp_path):
@@ -80,7 +81,8 @@ def test_a_port_that_does_not_exist_fails(tmp_path):
               "NEW port": "1/99"},
              [PortState(port="1/9", oper_up=True)])
     assert v.result == verify.FAIL
-    assert "does not exist" in v.why and v.link == "not found"
+    assert "does not exist" in v.why
+    assert v.link == "not found"
 
 
 def test_an_unreachable_new_switch_fails(tmp_path):
@@ -88,7 +90,8 @@ def test_an_unreachable_new_switch_fails(tmp_path):
              {"Old switch": "gx-01", "Old port": "1/7", "NEW switch": "leaf-01",
               "NEW port": "1/9"},
              [], reachable=False)
-    assert v.result == verify.FAIL and v.link == "unreachable"
+    assert v.result == verify.FAIL
+    assert v.link == "unreachable"
 
 
 def test_a_switch_that_was_never_collected_fails_with_advice(tmp_path):
@@ -131,7 +134,8 @@ def test_the_wrong_neighbor_downgrades_a_mac_pass_to_a_warn(tmp_path):
              [PortState(port="1/9", oper_up=True, macs=["00:11:22:33:44:55"],
                         lldp_neighbor="srv-esx-99")])
     assert v.result == verify.WARN
-    assert "srv-esx-99" in v.why and "srv-esx-01" in v.why
+    assert "srv-esx-99" in v.why
+    assert "srv-esx-01" in v.why
 
 
 def test_neighbor_identity_is_matched_loosely(tmp_path):
@@ -164,7 +168,8 @@ def test_the_planners_new_vlan_is_what_gets_checked(tmp_path):
               "MAC addresses": "00:11:22:33:44:55"},
              [PortState(port="1/9", oper_up=True, macs=["00:11:22:33:44:55"],
                         vlans=[800])])
-    assert v.result == verify.PASS and v.vlans_expected == [800]
+    assert v.result == verify.PASS
+    assert v.vlans_expected == [800]
 
 
 def test_wrong_mlt_membership_is_a_warn(tmp_path):
@@ -175,7 +180,8 @@ def test_wrong_mlt_membership_is_a_warn(tmp_path):
              [PortState(port="1/9", oper_up=True, macs=["00:11:22:33:44:55"],
                         mlt_id=36)])
     assert v.result == verify.WARN
-    assert "is in MLT 36" in v.why and "sheet says MLT 35" in v.why
+    assert "is in MLT 36" in v.why
+    assert "sheet says MLT 35" in v.why
 
 
 def test_a_port_missing_from_its_mlt_is_a_warn(tmp_path):
@@ -184,7 +190,8 @@ def test_a_port_missing_from_its_mlt_is_a_warn(tmp_path):
               "NEW port": "1/9", "NEW MLT ID": "35",
               "MAC addresses": "00:11:22:33:44:55"},
              [PortState(port="1/9", oper_up=True, macs=["00:11:22:33:44:55"])])
-    assert v.result == verify.WARN and "not in any MLT" in v.why
+    assert v.result == verify.WARN
+    assert "not in any MLT" in v.why
 
 
 def test_mac_comparison_ignores_case_and_separator(tmp_path):

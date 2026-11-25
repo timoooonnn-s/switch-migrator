@@ -7,11 +7,11 @@ tagging / PVID / name / admin state, and MLTs. Everything else is ignored.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from switch_migrator.models import BOTH, TAGGED, UNTAGGED, VlanBinding
 from switch_migrator.parsers.common import expand_port_list
-
 
 # 'vlan ports X tagging <mode>'. ERS spells the four combinations out:
 #   untagAll       every frame egresses untagged (the default)
@@ -79,69 +79,90 @@ def parse_ers_config(text: str) -> ErsModel:
         s = raw.strip()
         if not s or s.startswith("!"):
             continue
-
-        mm = re.match(r"vlan create\s+(\S+)\s+type", s)
-        if mm:
-            for vid in _ids(mm.group(1)):
-                m.vlan(vid)
-            continue
-
-        mm = re.match(r'vlan name\s+(\d+)\s+"(.*)"', s)
-        if mm:
-            m.vlan(int(mm.group(1))).name = mm.group(2)
-            continue
-
-        mm = re.match(r"vlan members(?:\s+(add|remove))?\s+(\S+)\s+(\S+)", s)
-        if mm:
-            op, idspec, portspec = mm.groups()
-            ports = [] if portspec.upper() == "NONE" else expand_port_list(portspec)
-            for vid in _ids(idspec):
-                vlan = m.vlan(vid)
-                if op == "remove":
-                    vlan.members = [p for p in vlan.members if p not in ports]
-                else:
-                    vlan.members += [p for p in ports if p not in vlan.members]
-            continue
-
-        mm = re.match(r"vlan ports\s+(\S+)\s+tagging\s+(\S+)", s)
-        if mm and mm.group(2).lower() in _TAGGING_MODES:
-            mode = _TAGGING_MODES[mm.group(2).lower()]
-            for p in expand_port_list(mm.group(1)):
-                m.port(p).tagging_mode = mode
-            continue
-
-        mm = re.match(r"vlan ports\s+(\S+)\s+pvid\s+(\d+)", s)
-        if mm:
-            for p in expand_port_list(mm.group(1)):
-                m.port(p).pvid = int(mm.group(2))
-            continue
-
-        # port ids are flat on a standalone ('5') and unit-qualified on a
-        # stack ('1/5') - both forms appear in the same commands
-        mm = re.match(r'name port\s+(\S+)\s+"(.*)"', s)
-        if mm:
-            for p in expand_port_list(mm.group(1)):
-                m.port(p).name = mm.group(2)
-            continue
-
-        mm = re.match(r"shutdown port\s+(\S+)", s)
-        if mm:
-            for p in expand_port_list(mm.group(1)):
-                m.port(p).shutdown = True
-            continue
-
-        # 'mlt 1 name "x" enable member 49-50' - skip 'mlt spanning-tree ...'
-        mm = re.match(r"mlt\s+(\d+)\b(.*)", s)
-        if mm and "member" in mm.group(2):
-            rest = mm.group(2)
-            name_m = re.search(r'name\s+"([^"]*)"', rest)
-            mem_m = re.search(r"member\s+(\S+)", rest)
-            m.mlts.append(ErsMlt(
-                mlt_id=int(mm.group(1)),
-                name=name_m.group(1) if name_m else "",
-                members=expand_port_list(mem_m.group(1)) if mem_m else []))
-            continue
+        # the first rule whose pattern matches AND that takes the line wins
+        for pattern, apply in _LINE_RULES:
+            mm = pattern.match(s)
+            if mm and apply(m, mm):
+                break
     return m
+
+
+def _vlan_create(m: ErsModel, mm: re.Match[str]) -> bool:
+    for vid in _ids(mm.group(1)):
+        m.vlan(vid)
+    return True
+
+
+def _vlan_name(m: ErsModel, mm: re.Match[str]) -> bool:
+    m.vlan(int(mm.group(1))).name = mm.group(2)
+    return True
+
+
+def _vlan_members(m: ErsModel, mm: re.Match[str]) -> bool:
+    op, idspec, portspec = mm.groups()
+    ports = [] if portspec.upper() == "NONE" else expand_port_list(portspec)
+    for vid in _ids(idspec):
+        vlan = m.vlan(vid)
+        if op == "remove":
+            vlan.members = [p for p in vlan.members if p not in ports]
+        else:
+            vlan.members += [p for p in ports if p not in vlan.members]
+    return True
+
+
+def _vlan_tagging(m: ErsModel, mm: re.Match[str]) -> bool:
+    mode = _TAGGING_MODES.get(mm.group(2).lower())
+    if mode is None:
+        return False
+    for p in expand_port_list(mm.group(1)):
+        m.port(p).tagging_mode = mode
+    return True
+
+
+def _vlan_pvid(m: ErsModel, mm: re.Match[str]) -> bool:
+    for p in expand_port_list(mm.group(1)):
+        m.port(p).pvid = int(mm.group(2))
+    return True
+
+
+def _port_name(m: ErsModel, mm: re.Match[str]) -> bool:
+    for p in expand_port_list(mm.group(1)):
+        m.port(p).name = mm.group(2)
+    return True
+
+
+def _port_shutdown(m: ErsModel, mm: re.Match[str]) -> bool:
+    for p in expand_port_list(mm.group(1)):
+        m.port(p).shutdown = True
+    return True
+
+
+def _mlt(m: ErsModel, mm: re.Match[str]) -> bool:
+    rest = mm.group(2)
+    if "member" not in rest:
+        return False            # 'mlt spanning-tree ...' and the like
+    name_m = re.search(r'name\s+"([^"]*)"', rest)
+    mem_m = re.search(r"member\s+(\S+)", rest)
+    m.mlts.append(ErsMlt(
+        mlt_id=int(mm.group(1)),
+        name=name_m.group(1) if name_m else "",
+        members=expand_port_list(mem_m.group(1)) if mem_m else []))
+    return True
+
+
+# port ids are flat on a standalone ('5') and unit-qualified on a stack
+# ('1/5') - both forms appear in the same commands
+_LINE_RULES: tuple[tuple[re.Pattern[str], Callable[[ErsModel, re.Match[str]], bool]], ...] = (
+    (re.compile(r"vlan create\s+(\S+)\s+type"), _vlan_create),
+    (re.compile(r'vlan name\s+(\d+)\s+"(.*)"'), _vlan_name),
+    (re.compile(r"vlan members(?:\s+(add|remove))?\s+(\S+)\s+(\S+)"), _vlan_members),
+    (re.compile(r"vlan ports\s+(\S+)\s+tagging\s+(\S+)"), _vlan_tagging),
+    (re.compile(r"vlan ports\s+(\S+)\s+pvid\s+(\d+)"), _vlan_pvid),
+    (re.compile(r'name port\s+(\S+)\s+"(.*)"'), _port_name),
+    (re.compile(r"shutdown port\s+(\S+)"), _port_shutdown),
+    # 'mlt 1 name "x" enable member 49-50'
+    (re.compile(r"mlt\s+(\d+)\b(.*)"), _mlt),
+)
 
 
 SOURCE = "running-config"

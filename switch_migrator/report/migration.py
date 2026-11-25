@@ -17,6 +17,7 @@ from switch_migrator.models import (
     Platform,
     PortState,
     SwitchAudit,
+    VlanBinding,
     tagging_summary,
 )
 from switch_migrator.parsers.common import port_sort_key
@@ -34,18 +35,35 @@ def new_switch_names(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
-def assign_port_uids(audits: list[SwitchAudit], prefix: str = "P") -> None:
-    """Assign stable sequential migration IDs across all audited switches.
+def assign_port_uids(audits: list[SwitchAudit], prefix: str = "P",
+                     keep: dict[tuple[str, str], str] | None = None) -> None:
+    """Assign sequential migration IDs across all audited switches.
 
     Deterministic: switches in name order, ports in faceplate order, so a
     re-run of the same inventory produces the same IDs and they ascend along
     the front of the switch.
+
+    `keep` holds the IDs an earlier sheet already gave, {(switch, port): id}:
+    those ports keep them, so a switch added to the inventory does not shift
+    every ID after it - IDs that may already be on a printed rack sheet. Ports
+    new since then are numbered after the highest ID in use; none is reused.
     """
-    n = 0
+    keep = keep or {}
+    used = [_uid_number(uid, prefix) for uid in keep.values()]
+    n = max((u for u in used if u is not None), default=0)
     for audit in sorted(audits, key=lambda a: a.name):
         for port in sorted(audit.ports, key=lambda x: port_sort_key(x.port)):
+            kept = keep.get((audit.name, port.port))
+            if kept:
+                port.uid = kept
+                continue
             n += 1
             port.uid = f"{prefix}{n:04d}"
+
+
+def _uid_number(uid: str, prefix: str) -> int | None:
+    rest = uid[len(prefix):] if uid.startswith(prefix) else ""
+    return int(rest) if rest.isdigit() else None
 
 
 def _connected(p: PortState) -> bool:
@@ -83,7 +101,7 @@ def _fmt_bool(v: bool | None, true: str, false: str) -> str:
     return "?" if v is None else (true if v else false)
 
 
-def _pairs_cell(bindings) -> str:
+def _pairs_cell(bindings: list[VlanBinding]) -> str:
     """The VLAN<->I-SID pairs of one port or MLT, as one self-contained cell.
 
     Untagged first, because that is the one a technician looking at an access
@@ -118,7 +136,7 @@ def _tagging(port: PortState) -> str:
     return tagging_summary(port.bindings) or port.tagging
 
 
-def _sources_cell(holder) -> str:
+def _sources_cell(holder: PortState) -> str:
     """Where this row's VLAN/I-SID cell came from.
 
     Provenance matters because an empty cell has two very different meanings -

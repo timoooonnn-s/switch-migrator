@@ -64,7 +64,8 @@ def test_voss_9x_vlan_members_with_channelized_and_wrapped_lists():
     assert members[100] == ["1/17/1", "1/17/2", "1/17/3", "1/17/4",
                             "1/18/1", "1/18/2", "1/18/3", "1/18/4"]
     # VLAN 1 wraps mid-range: the break lands inside '1/17/1-1/18/4'
-    assert "1/16" in members[1] and "2/1" in members[1]
+    assert "1/16" in members[1]
+    assert "2/1" in members[1]
     assert members[1].count("1/17/2") == 1
     assert len(members[1]) == 16 + 8 + 1
     # and the row after the wrap is not swallowed by it

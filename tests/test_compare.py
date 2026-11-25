@@ -7,17 +7,24 @@ from switch_migrator.models import (
     SwitchAudit,
     VlanInfo,
 )
+from switch_migrator.report.tables import build_vlan_comparison
+
+# make_config's offsets are 10000 and 20000: VLAN 100 -> 10100 or 20100
+ISID_VLAN_100 = 10100
+ISID_VLAN_200 = 10200
+NONSTANDARD_ISID = 77777
+EXPLICIT_ISID = 55555
 
 
 def make_config(**overrides) -> Config:
-    defaults = dict(
-        dvr_controllers=[],
-        core_switch_patterns=["dvr-*"],
-        isid_offsets=[10000, 20000],
-        isid_explicit={},
-        excluded_vlans={1, 4000},
-        ssh=SshSettings(),
-    )
+    defaults = {
+        "dvr_controllers": [],
+        "core_switch_patterns": ["dvr-*"],
+        "isid_offsets": [10000, 20000],
+        "isid_explicit": {},
+        "excluded_vlans": {1, 4000},
+        "ssh": SshSettings(),
+    }
     defaults.update(overrides)
     return Config(**defaults)
 
@@ -53,7 +60,7 @@ def test_ers_convention_confirmed_by_dvr():
     audit = make_audit(Platform.ERS, [VlanInfo(100, "Users")])
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[100].status is CompStatus.OK
-    assert res[100].matched_isid == 10100
+    assert res[100].matched_isid == ISID_VLAN_100
 
 
 def test_ers_dvr_only_nonstandard():
@@ -62,7 +69,7 @@ def test_ers_dvr_only_nonstandard():
     audit = make_audit(Platform.ERS, [VlanInfo(100)])
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[100].status is CompStatus.OK_NONSTANDARD
-    assert res[100].matched_isid == 77777
+    assert res[100].matched_isid == NONSTANDARD_ISID
 
 
 def test_ers_in_fabric_not_attached():
@@ -71,7 +78,7 @@ def test_ers_in_fabric_not_attached():
     audit = make_audit(Platform.ERS, [VlanInfo(100)])
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[100].status is CompStatus.IN_FABRIC_NOT_ATTACHED
-    assert res[100].matched_isid == 10100
+    assert res[100].matched_isid == ISID_VLAN_100
 
 
 def test_ers_ambiguous_multiple_candidates():
@@ -120,7 +127,7 @@ def test_explicit_mapping_wins():
     audit = make_audit(Platform.ERS, [VlanInfo(100)])
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[100].status is CompStatus.OK
-    assert res[100].matched_isid == 55555
+    assert res[100].matched_isid == EXPLICIT_ISID
 
 
 def test_voss_local_binding_ok():
@@ -172,7 +179,7 @@ def test_voss_vlan_without_isid_falls_back_to_derivation():
     audit = make_audit(Platform.VOSS, [VlanInfo(200, isid=None)])
     res = by_vlan(compare_switch(audit, fabric, cfg))
     assert res[200].status is CompStatus.OK
-    assert res[200].matched_isid == 10200
+    assert res[200].matched_isid == ISID_VLAN_200
 
 
 def test_voss_vlan_without_isid_and_nothing_in_fabric_is_local_only():
@@ -207,7 +214,6 @@ def test_voss_no_isid_but_convention_in_fabric_is_not_local_only():
 
 
 def test_isid_name_propagates_to_comparison_and_table():
-    from switch_migrator.report.tables import build_vlan_comparison
     cfg = make_config()
     fabric = make_fabric({10100: {"cvids": [100]}})
     audit = make_audit(Platform.VOSS,
@@ -216,6 +222,7 @@ def test_isid_name_propagates_to_comparison_and_table():
     assert res[0].vlan_name == "Users"            # VLAN name
     assert res[0].vlan_isid_name == "ISID-Users"  # I-SID name, kept separate
     table = build_vlan_comparison({"sw": res})
-    assert "Name" in table.headers and "I-SID name" in table.headers
+    assert "Name" in table.headers
+    assert "I-SID name" in table.headers
     assert table.rows[0][table.headers.index("Name")] == "Users"
     assert table.rows[0][table.headers.index("I-SID name")] == "ISID-Users"

@@ -109,6 +109,7 @@ def _same_neighbor(expected: str, found: str) -> bool:
 
 def _verify_row(row: CablingRow, audit: SwitchAudit | None,
                 ports: dict[str, PortState]) -> PortVerdict:
+    """The verdict ladder for one link, strongest evidence first."""
     v = PortVerdict(uid=row.uid, old_switch=row.old_switch,
                     old_port=row.old_port, new_switch=row.new_switch,
                     new_port=row.new_port, result=FAIL,
@@ -152,7 +153,13 @@ def _verify_row(row: CablingRow, audit: SwitchAudit | None,
         v.reasons.append("port state could not be read on the new switch")
         return v
 
-    # link is up: how much of the old identity came with it?
+    v.reasons = _identity_notes(row, v, overlap)
+    return v
+
+
+def _identity_notes(row: CablingRow, v: PortVerdict, overlap: set[str]) -> list[str]:
+    """The link is up: how much of the old identity came with it? Sets the
+    verdict's result as it goes."""
     notes: list[str] = []
     if row.macs and overlap:
         v.result = PASS
@@ -171,6 +178,13 @@ def _verify_row(row: CablingRow, audit: SwitchAudit | None,
         notes.append("link up, but the old port had no learned MAC to match "
                      "against")
 
+    _check_neighbor(row, v, notes)
+    _check_vlans(row, v, notes)
+    _check_mlt(v, notes)
+    return notes
+
+
+def _check_neighbor(row: CablingRow, v: PortVerdict, notes: list[str]) -> None:
     if row.neighbor:
         if _same_neighbor(row.neighbor, v.neighbor_found):
             notes.append(f"LLDP neighbor matches ({v.neighbor_found})")
@@ -185,6 +199,8 @@ def _verify_row(row: CablingRow, audit: SwitchAudit | None,
         else:
             notes.append(f"no LLDP neighbor seen (sheet says '{row.neighbor}')")
 
+
+def _check_vlans(row: CablingRow, v: PortVerdict, notes: list[str]) -> None:
     expected_vlans = set(row.expected_vlans)
     if expected_vlans:
         missing = sorted(expected_vlans - set(v.vlans_found))
@@ -196,6 +212,8 @@ def _verify_row(row: CablingRow, audit: SwitchAudit | None,
             notes.append(f"no VLAN binding read on the new port (expected "
                          f"{','.join(map(str, sorted(expected_vlans)))})")
 
+
+def _check_mlt(v: PortVerdict, notes: list[str]) -> None:
     if v.mlt_expected is not None:
         if v.mlt_found is None:
             notes.append(f"expected to be a member of MLT {v.mlt_expected}, "
@@ -205,9 +223,6 @@ def _verify_row(row: CablingRow, audit: SwitchAudit | None,
             notes.append(f"is in MLT {v.mlt_found}, the sheet says "
                          f"MLT {v.mlt_expected}")
             v.result = WARN
-
-    v.reasons = notes
-    return v
 
 
 def verify(sheet: Sheet, audits: list[SwitchAudit]) -> VerifyReport:

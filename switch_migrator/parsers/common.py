@@ -7,11 +7,29 @@ import re
 
 from switch_migrator.models import LldpNeighbor
 
+MIN_VLAN_ID = 1
+MAX_VLAN_ID = 4094
+# a slot/port id ('1/7') and a channelized one ('1/17/1')
+SLOT_PORT_PARTS = 2
+SUBPORT_PARTS = 3
+# ranges wider than these are not port lists but garbage, and are not expanded
+MAX_RANGE_SPAN = 512
+MAX_CHANNELIZED_PARENTS = 64
+MAX_SUBPORTS = 16
+MAC_HEX_DIGITS = 12
+# the ERS port column is a bare number, ambiguous with the VLAN column next to it
+VLAN_AND_PORT = 2
+
+
+def is_vlan_id(value: int) -> bool:
+    """Is this a usable 802.1Q VLAN id (1-4094)?"""
+    return MIN_VLAN_ID <= value <= MAX_VLAN_ID
+
 # 1/1  1/1/1  (VSP channelized)  49  2/49 (ERS stack)
 PORT_RE = re.compile(r"^\d+(?:/\d+){0,2}$")
 
 
-def port_sort_key(port: str) -> tuple:
+def port_sort_key(port: str) -> tuple[int, tuple[int, ...], str]:
     """Faceplate order: '1/2' before '1/10', '2' before '10', unit by unit.
 
     Every run of digits compares as a number, so slot/port, channelized
@@ -64,7 +82,7 @@ def _port_chunks(raw: str) -> list[str]:
 
     Empty elements are dropped rather than failing the whole list: a device
     that wraps a long port list leaves a trailing comma on the first line, and
-    rejecting the string outright used to lose every port of that VLAN or MLT,
+    rejecting the string outright would lose every port of that VLAN or MLT,
     not just the wrapped remainder.
 
     A single trailing hyphen is the other half of that: the break can land
@@ -114,12 +132,14 @@ def _span_channelized(s_parts: list[str], e_parts: list[str]) -> list[str] | Non
     this is only ever used for VLAN MEMBERSHIP - never for MLT members, where
     an invented member would show as a down leg and fake a degraded MLT.
     """
-    if len(s_parts) != 3 or len(e_parts) != 3 or s_parts[0] != e_parts[0]:
+    if len(s_parts) != SUBPORT_PARTS or len(e_parts) != SUBPORT_PARTS \
+            or s_parts[0] != e_parts[0]:
         return None
     slot = s_parts[0]
     p_lo, p_hi = int(s_parts[1]), int(e_parts[1])
     s_lo, width = int(s_parts[2]), int(e_parts[2])
-    if not 0 < p_hi - p_lo <= 64 or not 0 < width <= 16 or s_lo > width:
+    if not 0 < p_hi - p_lo <= MAX_CHANNELIZED_PARENTS or not 0 < width <= MAX_SUBPORTS \
+            or s_lo > width:
         return None
     ports = []
     for parent in range(p_lo, p_hi + 1):
@@ -153,7 +173,7 @@ def expand_port_list(raw: str, span_subports: bool = False) -> list[str]:
         if len(s_parts) == len(e_parts) and s_parts[:-1] == e_parts[:-1]:
             prefix = "/".join(s_parts[:-1])
             lo, hi = int(s_parts[-1]), int(e_parts[-1])
-            if 0 <= hi - lo <= 512:
+            if 0 <= hi - lo <= MAX_RANGE_SPAN:
                 for n in range(lo, hi + 1):
                     ports.append(f"{prefix}/{n}" if prefix else str(n))
                 continue
@@ -177,9 +197,9 @@ def normalize_mac(raw: str) -> str:
     """'00:11:22:33:44:55' / '0011.2233.4455' / '00-11-22-33-44-55' -> lower
     colon form, so MACs from different platforms compare and sort alike."""
     hexs = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
-    if len(hexs) != 12:
+    if len(hexs) != MAC_HEX_DIGITS:
         return raw.strip().lower()
-    return ":".join(hexs[i:i + 2] for i in range(0, 12, 2))
+    return ":".join(hexs[i:i + 2] for i in range(0, MAC_HEX_DIGITS, 2))
 
 
 # tokens that are status/flag words, never an interface
@@ -224,41 +244,47 @@ def parse_mac_table(output: str) -> dict[str, list[tuple[str, int | None]]]:
         mac = normalize_mac(macs[0])
         rest = [t for t in tokens if not MAC_RE.match(t)]
 
-        iface: str | None = None
-        for t in rest:                                   # (1) labelled column
-            m = _IFACE_PORT_RE.match(t)
-            if m:
-                iface = m.group(1)
-                break
-            m = _IFACE_MLT_RE.match(t)
-            if m:
-                iface = f"mlt:{m.group(1)}"
-                break
-        if iface is None:                                # 'mlt 35' / 'Trunk 1'
-            for i, t in enumerate(rest[:-1]):
-                if t.lower() in ("mlt", "trunk") and rest[i + 1].isdigit():
-                    iface = f"mlt:{rest[i + 1]}"
-                    break
-        if iface is None:                                # (2) bare slot/port
-            slots = [t for t in rest if PORT_RE.match(t) and "/" in t]
-            if slots:
-                iface = slots[-1]
         numbers = [t for t in rest if t.isdigit()]
-        if iface is None and len(numbers) >= 2:          # (3) ERS bare numbers
-            iface = numbers[-1]
-        if iface is None:                                # (4) an MLT name
-            names = [t for t in rest
-                     if not t.isdigit() and t.lower() not in _FDB_KEYWORDS
-                     and not PORT_RE.match(t)]
-            if names:
-                iface = f"name:{names[0]}"
+        iface = _fdb_interface(rest, numbers)
         if iface is None:
             continue
         # the VLAN is the first small integer that is not the interface itself
         vlan = next((int(t) for t in numbers
-                     if t != iface and 1 <= int(t) <= 4094), None)
+                     if t != iface and is_vlan_id(int(t))), None)
         result.setdefault(iface, []).append((mac, vlan))
     return result
+
+
+def _labelled_interface(rest: list[str]) -> str | None:
+    """(1) An explicitly labelled column: 'Port-1/7', 'Mlt-35', 'mlt 35'."""
+    for t in rest:
+        m = _IFACE_PORT_RE.match(t)
+        if m:
+            return m.group(1)
+        m = _IFACE_MLT_RE.match(t)
+        if m:
+            return f"mlt:{m.group(1)}"
+    for i, t in enumerate(rest[:-1]):                    # 'mlt 35' / 'Trunk 1'
+        if t.lower() in ("mlt", "trunk") and rest[i + 1].isdigit():
+            return f"mlt:{rest[i + 1]}"
+    return None
+
+
+def _fdb_interface(rest: list[str], numbers: list[str]) -> str | None:
+    """The interface of one FDB row, in order of decreasing certainty (see
+    parse_mac_table)."""
+    iface = _labelled_interface(rest)
+    if iface is not None:
+        return iface
+    slots = [t for t in rest if PORT_RE.match(t) and "/" in t]   # (2) bare slot/port
+    if slots:
+        return slots[-1]
+    if len(numbers) >= VLAN_AND_PORT:                    # (3) ERS bare numbers
+        return numbers[-1]
+    names = [t for t in rest                             # (4) an MLT name
+             if not t.isdigit() and t.lower() not in _FDB_KEYWORDS
+             and not PORT_RE.match(t)]
+    return f"name:{names[0]}" if names else None
 
 
 def parse_lldp_neighbors_summary(output: str) -> dict[str, LldpNeighbor]:
@@ -278,32 +304,38 @@ def parse_lldp_neighbors_summary(output: str) -> dict[str, LldpNeighbor]:
     for line in output.splitlines():
         if cols is None:
             if re.search(r"sysname", line, re.IGNORECASE):
-                words = [(mm.group(), mm.start()) for mm in re.finditer(r"\S+", line)]
-                starts = sorted(s for _, s in words)
-
-                def bound(name: str) -> tuple[int, int | None]:
-                    for w, s in words:
-                        if w.upper() == name:
-                            after = [x for x in starts if x > s]
-                            return s, (min(after) if after else None)
-                    return -1, None
-
-                cols = {c: bound(c) for c in ("ADDR", "SYSNAME", "SYSDESCR")}
+                cols = _column_bounds(line, ("ADDR", "SYSNAME", "SYSDESCR"))
             continue
         tokens = line.split()
         if not tokens or not PORT_RE.match(tokens[0]):
             continue
-
-        def cell(name: str) -> str:
-            s, e = cols[name]
-            if s < 0:
-                return ""
-            return (line[s:e] if e is not None else line[s:]).strip()
-
-        sysname = cell("SYSNAME").split()[0] if cell("SYSNAME") else ""
+        name = _cell(line, cols["SYSNAME"])
         neighbors.setdefault(tokens[0], LldpNeighbor(
-            sysname=sysname, ip=_clean_ip(cell("ADDR")), sys_descr=cell("SYSDESCR")))
+            sysname=name.split()[0] if name else "",
+            ip=_clean_ip(_cell(line, cols["ADDR"])),
+            sys_descr=_cell(line, cols["SYSDESCR"])))
     return neighbors
+
+
+def _column_bounds(header: str, names: tuple[str, ...]
+                   ) -> dict[str, tuple[int, int | None]]:
+    """{column: (start, end)} from a fixed-width header line: a column runs from
+    its header word to the next header word. (-1, None) for a missing column."""
+    words = [(m.group(), m.start()) for m in re.finditer(r"\S+", header)]
+    starts = sorted(s for _, s in words)
+    bounds: dict[str, tuple[int, int | None]] = {}
+    for name in names:
+        start = next((s for w, s in words if w.upper() == name), -1)
+        after = [x for x in starts if x > start] if start >= 0 else []
+        bounds[name] = (start, min(after) if after else None)
+    return bounds
+
+
+def _cell(line: str, bounds: tuple[int, int | None]) -> str:
+    start, end = bounds
+    if start < 0:
+        return ""
+    return (line[start:end] if end is not None else line[start:]).strip()
 
 
 def parse_lldp_neighbors(output: str) -> dict[str, LldpNeighbor]:
@@ -320,8 +352,8 @@ def parse_lldp_neighbors(output: str) -> dict[str, LldpNeighbor]:
     real one); the block that actually advertises a SysName wins, else one with
     an IP, else the first - fields are never mixed across neighbors.
     """
-    by_port: dict[str, list[dict]] = {}
-    cur: dict | None = None
+    by_port: dict[str, list[dict[str, str]]] = {}
+    cur: dict[str, str] | None = None
     for line in output.splitlines():
         m = re.match(r"^\s*Port\s*:\s*(\S+)", line)
         if m:

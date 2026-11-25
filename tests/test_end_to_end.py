@@ -1,11 +1,13 @@
 """End-to-end: replay the fixture CLI outputs through the real collectors,
 comparison engine and report writers using the OfflineRunner."""
 
+import csv
 import shutil
 from pathlib import Path
 
 import pytest
 
+from switch_migrator.cli import main
 from switch_migrator.collectors.dvr import collect_dvr
 from switch_migrator.collectors.switch import collect_switch
 from switch_migrator.compare import compare_switch
@@ -16,6 +18,13 @@ from switch_migrator.report.excel import write_csv, write_excel
 from switch_migrator.report.tables import build_all
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+# from the fixtures: VLAN 100 rides I-SID 10100, VLAN 300 rides 20300
+USERS_VLAN, USERS_ISID = 100, 10100
+VLAN_300, ISID_VLAN_300 = 300, 20300
+VOSS_PORTS_UP = 3
+UPLINK_MEMBERS = 2        # ERS MLT 1: ports 49 and 50
 
 
 @pytest.fixture
@@ -44,8 +53,8 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     assert fabric.dvrs_ok == ["dvr-01"]
     # from show dvr interfaces + show isis spbm i-sid all + show i-sid + show vlan i-sid
     assert {10100, 10200, 20300, 20400, 77777, 1501050} <= set(fabric.isids)
-    assert 100 in fabric.isids[10100].cvids
-    assert 300 in fabric.isids[20300].cvids
+    assert USERS_VLAN in fabric.isids[USERS_ISID].cvids
+    assert VLAN_300 in fabric.isids[ISID_VLAN_300].cvids
     # DvR interface data: L2ISID 1501050 carries VLAN 1050 domain-wide
     assert fabric.isids[1501050].cvids == {1050}
     assert "dvr" in fabric.isids[10100].sources
@@ -56,9 +65,10 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     ers = collect_switch(ers_target, OfflineRunner("old-access-01", raw_root), cfg)
 
     # VOSS switch state (ports from `show int gig state`, incl. down reason)
-    assert voss.ports_up == 3
+    assert voss.ports_up == VOSS_PORTS_UP
     assert {p.port: p.state_reason for p in voss.ports}["1/48"] == "SSH"
-    assert voss.ist and voss.ist.session_up is True
+    assert voss.ist
+    assert voss.ist.session_up is True
     assert [m.mlt_id for m in voss.mlts] == [1, 2, 10]  # no phantom footer MLT
     ist_mlt = voss.mlts[0]
     assert ist_mlt.members_up == 1  # 1/47 up, 1/48 down
@@ -71,7 +81,7 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
     assert [p.port for p in uplinks] == ["49", "50"]
     uplink_mlt = next(m for m in ers.mlts if m.mlt_id == 1)
     assert uplink_mlt.is_uplink
-    assert uplink_mlt.members_up == 2
+    assert uplink_mlt.members_up == UPLINK_MEMBERS
     # MLT 2 has no members: flagged as dead, nothing to recreate
     assert any("MLT 2" in w and "DEAD MLT" in w for w in ers.warnings)
 
@@ -100,8 +110,7 @@ def test_full_pipeline(raw_root: Path, cfg: Config, tmp_path: Path):
 def test_snapshot_run_reproduces_the_live_reports_exactly(tmp_path):
     """The promise of a snapshot: the sheets you get from the file are the
     sheets you would have got from the switches."""
-    import shutil
-    from switch_migrator.cli import main
+
 
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -115,7 +124,7 @@ def test_snapshot_run_reproduces_the_live_reports_exactly(tmp_path):
               "-s", "sw-ers:ers", "--no-fabric", "--migration-sheets",
               "--csv", "--no-excel"]
     snap = tmp_path / "snap.json"
-    main(common + ["-o", str(live), "--save-snapshot", str(snap)])
+    main([*common, "-o", str(live), "--save-snapshot", str(snap)])
     assert snap.is_file()
 
     replay = tmp_path / "replay"
@@ -125,14 +134,14 @@ def test_snapshot_run_reproduces_the_live_reports_exactly(tmp_path):
     live_csv = next(live.glob("csv-*"))
     replay_csv = next(replay.glob("csv-*"))
     produced = sorted(p.name for p in live_csv.glob("*.csv"))
-    assert "cabling.csv" in produced and "port_info.csv" in produced
+    assert "cabling.csv" in produced
+    assert "port_info.csv" in produced
     for name in produced:
         assert (live_csv / name).read_text() == (replay_csv / name).read_text(), name
 
 
 def _filled_sheet(path: Path, rows: list[dict]) -> Path:
     """A cabling sheet as it comes back from the data centre."""
-    import csv
     headers = ["Port ID", "Type", "End device / neighbor", "NEW switch",
                "NEW port", "NEW MLT ID", "NEW MLT name", "Old switch",
                "Old port", "MLT ID", "MLT name", "Port VLANs", "MAC addresses",
@@ -148,9 +157,7 @@ def _filled_sheet(path: Path, rows: list[dict]) -> Path:
 def test_the_whole_migration_arc(tmp_path):
     """Health check before, MLT blocks from the sheet, verification after -
     driven through the real CLI the way a migration night would."""
-    import csv
-    import shutil
-    from switch_migrator.cli import main
+
 
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -161,8 +168,7 @@ def test_the_whole_migration_arc(tmp_path):
 
     # 1) before the window: the fixture switch has MLTs with a down member,
     #    so the health check must refuse to call it clean
-    code = main(common + ["-o", str(tmp_path / "pre"), "-s", "gx-01:voss",
-                          "--health-check"])
+    code = main([*common, "-o", str(tmp_path / "pre"), "-s", "gx-01:voss", "--health-check"])
     assert code == 1, "a degraded MLT has to be a non-zero exit"
 
     # 2) the sheet comes back filled in; generate the new switch's MLT blocks
@@ -184,7 +190,8 @@ def test_the_whole_migration_arc(tmp_path):
     blocks = (out / "config" / "mlt-blocks.cfg").read_text()
     assert 'mlt 42 enable name "new-lag"' in blocks
     assert "mlt 42 member 1/1,1/2" in blocks
-    assert "interface mlt 42" in blocks and "smlt" in blocks
+    assert "interface mlt 42" in blocks
+    assert "smlt" in blocks
 
     # 3) after the window: verify against the (replayed) new switch. The
     #    switches to check come from the sheet itself.

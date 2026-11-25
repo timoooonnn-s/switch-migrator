@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 
 from switch_migrator.models import BOTH, TAGGED, UNTAGGED, VlanBinding
-from switch_migrator.parsers.common import expand_port_list
+from switch_migrator.parsers.common import MAX_VLAN_ID, expand_port_list, is_vlan_id
 
 SOURCE = "running-config"
 
@@ -52,18 +52,17 @@ class VossConfigModel:
 def _vlan_ids(spec: str) -> list[int]:
     """'100' / '4051-4052' / '100,200' -> the VLAN ids they name."""
     ids: list[int] = []
-    for chunk in spec.split(","):
-        chunk = chunk.strip()
-        if not chunk:
+    for part in (chunk.strip() for chunk in spec.split(",")):
+        if not part:
             continue
-        if "-" in chunk:
-            lo, _, hi = chunk.partition("-")
-            if lo.isdigit() and hi.isdigit() and 0 <= int(hi) - int(lo) <= 4094:
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            if lo.isdigit() and hi.isdigit() and 0 <= int(hi) - int(lo) <= MAX_VLAN_ID:
                 ids.extend(range(int(lo), int(hi) + 1))
             continue
-        if chunk.isdigit():
-            ids.append(int(chunk))
-    return [v for v in ids if 1 <= v <= 4094]
+        if part.isdigit():
+            ids.append(int(part))
+    return [v for v in ids if is_vlan_id(v)]
 
 
 def parse_voss_config(text: str) -> VossConfigModel:
@@ -192,26 +191,33 @@ def _parse_global_line(model: VossConfigModel, line: str) -> None:
     m = re.match(r"vlan members(?:\s+(add|remove))?\s+(\S+)\s+(\S+)",
                  line, re.IGNORECASE)
     if m:
-        op = (m.group(1) or "add").lower()
-        ports = expand_port_list(m.group(3), span_subports=True)
-        for vid in _vlan_ids(m.group(2)):
-            current = model.vlan_members.setdefault(vid, [])
-            if op == "remove":
-                model.vlan_members[vid] = [p for p in current if p not in ports]
-            else:
-                current.extend(p for p in ports if p not in current)
+        _vlan_members(model, m)
         return
 
     # 'mlt 197 enable name "srv-lag"' / 'mlt 35 member 1/11,1/12'
     m = re.match(r"mlt\s+(\d+)\s+(.*)", line, re.IGNORECASE)
     if m:
-        mlt_id, rest = int(m.group(1)), m.group(2)
-        name = re.search(r'name\s+"([^"]*)"', rest)
-        if name:
-            model.mlt_names[mlt_id] = name.group(1)
-        members = re.search(r"member\s+(\S+)", rest)
-        if members:
-            model.mlt_members[mlt_id] = expand_port_list(members.group(1))
+        _mlt(model, int(m.group(1)), m.group(2))
+
+
+def _vlan_members(model: VossConfigModel, m: re.Match[str]) -> None:
+    op = (m.group(1) or "add").lower()
+    ports = expand_port_list(m.group(3), span_subports=True)
+    for vid in _vlan_ids(m.group(2)):
+        current = model.vlan_members.setdefault(vid, [])
+        if op == "remove":
+            model.vlan_members[vid] = [p for p in current if p not in ports]
+        else:
+            current.extend(p for p in ports if p not in current)
+
+
+def _mlt(model: VossConfigModel, mlt_id: int, rest: str) -> None:
+    name = re.search(r'name\s+"([^"]*)"', rest)
+    if name:
+        model.mlt_names[mlt_id] = name.group(1)
+    members = re.search(r"member\s+(\S+)", rest)
+    if members:
+        model.mlt_members[mlt_id] = expand_port_list(members.group(1))
 
 
 def _flex_bindings(services: dict[int, FlexService]) -> list[VlanBinding]:

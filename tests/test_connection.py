@@ -7,12 +7,13 @@ import pytest
 from paramiko.transport import Transport
 
 from switch_migrator import connection
-from switch_migrator.config import Credentials, SshSettings
+from switch_migrator.config import ConsoleServerSettings, Credentials, SshSettings
 from switch_migrator.connection import (
     _LEGACY_CIPHERS,
     _LEGACY_KEX,
     _LEGACY_KEYS,
     CommandError,
+    DryRunRunner,
     SshRunner,
     enable_legacy_ssh_algorithms,
     looks_like_error,
@@ -33,6 +34,12 @@ _ERS_CLASS = connection._patient_ers_class()
 needs_ers_class = pytest.mark.skipif(
     _ERS_CLASS is None,
     reason="netmiko not installed - run the suite against the project venv")
+
+
+PAGING_SPELLINGS = connection._PAGING_DISABLE[connection.Platform.VOSS]
+PARAMIKO_WITHOUT_DSS = 4  # the first paramiko major without ssh-dss host keys
+PROMPT_MISSES = 2         # tries that miss the prompt before one finds it
+FAILURES_TO_TRIP = 2      # transport failures before the session is abandoned
 
 
 def test_looks_like_error_plain():
@@ -120,7 +127,7 @@ def test_paging_disable_falls_back_to_abbreviated_form():
     runner = _make_runner(conn)
     runner._ensure_paging_disabled()
     assert runner.setup_warnings == []
-    assert conn.calls == 2
+    assert conn.calls == len(PAGING_SPELLINGS)
 
 
 def test_already_privileged_prompt_skips_enable():
@@ -175,7 +182,7 @@ def test_circuit_breaker_abandons_dead_session():
     conn = _FakeConn(OSError("socket closed"))
     runner = _make_runner(conn)
     runner.ssh = SshSettings(command_retries=0)
-    for _ in range(2):
+    for _ in range(FAILURES_TO_TRIP):
         with pytest.raises(CommandError):
             runner.run("show mlt")
     assert runner._dead
@@ -183,7 +190,7 @@ def test_circuit_breaker_abandons_dead_session():
     with pytest.raises(CommandError) as excinfo:
         runner.run("show vlan")
     assert "abandoned" in excinfo.value.output
-    assert conn.calls == 2
+    assert conn.calls == FAILURES_TO_TRIP
 
 
 def test_circuit_breaker_resets_on_success():
@@ -200,7 +207,7 @@ def test_circuit_breaker_resets_on_success():
 
 @pytest.fixture(autouse=True)
 def reset_legacy_flag(monkeypatch):
-    monkeypatch.setattr(connection, "_legacy_enabled", False)
+    monkeypatch.setattr(connection._LEGACY, "enabled", False)
 
 
 @pytest.fixture(autouse=True)
@@ -259,7 +266,7 @@ def test_paramiko_pin_still_excludes_the_release_that_dropped_ssh_dss():
 
 def test_installed_paramiko_supports_ers_host_keys():
     major = int(paramiko.__version__.split(".")[0])
-    if major >= 4:
+    if major >= PARAMIKO_WITHOUT_DSS:
         pytest.skip(f"paramiko {paramiko.__version__} installed, but the "
                     f"project pins <4 - run the suite against the project venv")
     assert "ssh-dss" in Transport._key_info
@@ -275,7 +282,7 @@ def test_patient_ers_class_retries_then_succeeds(monkeypatch):
 
     def flaky_set_base_prompt():
         calls["n"] += 1
-        if calls["n"] < 3:            # miss the prompt on the first two tries
+        if calls["n"] <= PROMPT_MISSES:
             raise TimeoutError("Pattern not detected: (?:\\#|>)")
 
     inst.set_base_prompt = flaky_set_base_prompt
@@ -285,7 +292,7 @@ def test_patient_ers_class_retries_then_succeeds(monkeypatch):
     inst.write_channel = lambda _d: None
     inst.RETURN = "\n"
     inst.session_preparation()        # must not raise
-    assert calls["n"] == 3
+    assert calls["n"] == PROMPT_MISSES + 1
 
 
 @needs_ers_class
@@ -315,7 +322,8 @@ def test_fail_keeps_banner_out_of_report_but_logs_it(caplog):
         err = runner._fail(TimeoutError("Pattern not detected: (?:\\#|>)\n\n"
                                         "Things you might try...\n1. ...\n2. ..."))
     msg = str(err)
-    assert "MOTD" not in msg and "Welcome" not in msg   # banner not in report
+    assert "MOTD" not in msg
+    assert "Welcome" not in msg
     assert "Things you might try" not in msg            # netmiko blob trimmed
     assert "Ctrl-Y" in msg                              # concise actionable hint
     assert "MOTD" in caplog.text                        # banner IS in the log
@@ -345,7 +353,7 @@ def test_patient_ers_special_login_presses_ctrl_y(monkeypatch):
     inst.RETURN = "\n"
     inst.username, inst.password = "admin", "secret"
     writes: list[str] = []
-    inst.write_channel = lambda d: writes.append(d)
+    inst.write_channel = writes.append
     # device: silent, then the Ctrl-Y banner, then finally a prompt
     reads = iter([TimeoutError("silent"),
                   "\nEnter Ctrl-Y to begin\n",
@@ -375,7 +383,7 @@ def test_paging_disable_exception_still_tries_the_fallback_spelling():
     conn = _FlakyConn(None)
     runner = _make_runner(conn)
     runner._ensure_paging_disabled()
-    assert conn.calls == 2                    # the fallback WAS sent
+    assert conn.calls == len(PAGING_SPELLINGS)   # the fallback WAS sent
     assert runner.setup_warnings == []        # and it was accepted
 
 
@@ -383,7 +391,7 @@ def test_paging_disable_all_spellings_failing_is_one_warning():
     conn = _FakeConn(TimeoutError("Pattern not detected"))
     runner = _make_runner(conn)
     runner._ensure_paging_disabled()
-    assert conn.calls == 2                    # both spellings were tried
+    assert conn.calls == len(PAGING_SPELLINGS)   # both spellings were tried
     assert len(runner.setup_warnings) == 1
     assert "may stall" in runner.setup_warnings[0]
 
@@ -400,7 +408,6 @@ def test_command_overrides_apply_at_the_runner_choke_point():
 
 
 def test_dry_run_runner_publishes_the_overridden_spelling():
-    from switch_migrator.connection import DryRunRunner
     runner = DryRunRunner("sw", connection.Platform.VOSS,
                           command_overrides={"show mlt": "show mlt all"})
     runner.run("show mlt")
@@ -409,7 +416,6 @@ def test_dry_run_runner_publishes_the_overridden_spelling():
 
 
 def test_console_server_resolution_is_template_driven():
-    from switch_migrator.config import ConsoleServerSettings
     cs = ConsoleServerSettings(host="tsserver",
                                username_template="{username}:70{port}")
     assert cs.resolve("admin", "15") == ("admin:7015", 22)
@@ -436,7 +442,6 @@ class _FakeConsoleChannel:
 
 
 def test_drive_console_login_answers_the_switch_login():
-    from switch_migrator.config import ConsoleServerSettings, Credentials
     runner = _make_runner(_FakeConn(None))
     runner.console = "03"
     runner.console_server = ConsoleServerSettings(host="tsserver")
@@ -452,7 +457,6 @@ def test_drive_console_login_answers_the_switch_login():
 
 
 def test_drive_console_login_gives_up_with_a_named_error():
-    from switch_migrator.config import ConsoleServerSettings, Credentials
     runner = _make_runner(_FakeConn(None))
     runner.console = "03"
     runner.console_server = ConsoleServerSettings(host="tsserver")
@@ -509,7 +513,6 @@ def test_quick_auth_check_enables_the_legacy_algorithms(monkeypatch):
         def close(self):
             pass
 
-    import paramiko
     monkeypatch.setattr(paramiko, "SSHClient", _Client)
 
     ssh = SshSettings(legacy_algorithms=True,
@@ -534,7 +537,6 @@ def test_quick_auth_check_leaves_the_algorithms_alone_when_disabled(monkeypatch)
         def close(self):
             pass
 
-    import paramiko
     monkeypatch.setattr(paramiko, "SSHClient", _Client)
     connection.quick_auth_check("host", Credentials("u", "p"),
                                 SshSettings(legacy_algorithms=False))

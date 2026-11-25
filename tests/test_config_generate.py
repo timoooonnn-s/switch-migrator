@@ -1,7 +1,9 @@
 """ERS running-config parse + VOSS flex-UNI generation (slice 3)."""
 
+import shutil
 from pathlib import Path
 
+from switch_migrator.cli import main
 from switch_migrator.config import Config, SshSettings
 from switch_migrator.config_generate import _compress, generate_voss_from_ers
 from switch_migrator.parsers.ers_config import parse_ers_config
@@ -9,15 +11,18 @@ from switch_migrator.parsers.ers_config import parse_ers_config
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+ACCESS_VLAN = 695         # port 7's PVID in the ERS fixture
+
+
 def _ers():
     return parse_ers_config((FIXTURES / "ers" / "show_running_config.txt").read_text())
 
 
 def _cfg(**over) -> Config:
-    base = dict(dvr_controllers=[], core_switch_patterns=[],
-                isid_offsets=[2500000, 2510000], isid_explicit={},
-                excluded_vlans=set(), excluded_vlan_names=["quarant*"],
-                ssh=SshSettings())
+    base = {"dvr_controllers": [], "core_switch_patterns": [],
+                "isid_offsets": [2500000, 2510000], "isid_explicit": {},
+                "excluded_vlans": set(), "excluded_vlan_names": ["quarant*"],
+                "ssh": SshSettings()}
     base.update(over)
     return Config(**base)
 
@@ -35,11 +40,15 @@ def test_parse_ers_vlans_members_names():
 
 def test_parse_ers_port_attributes():
     m = _ers()
-    assert m.ports["49"].tagged and m.ports["10"].tagged
+    assert m.ports["49"].tagged
+    assert m.ports["10"].tagged
     assert not m.ports["7"].tagged
-    assert m.ports["7"].pvid == 695 and m.ports["7"].name == "srv-esx-01"
-    assert m.ports["2"].shutdown and m.ports["11"].shutdown
-    assert m.mlts[0].mlt_id == 1 and m.mlts[0].members == ["49", "50"]
+    assert m.ports["7"].pvid == ACCESS_VLAN
+    assert m.ports["7"].name == "srv-esx-01"
+    assert m.ports["2"].shutdown
+    assert m.ports["11"].shutdown
+    assert m.mlts[0].mlt_id == 1
+    assert m.mlts[0].members == ["49", "50"]
 
 
 def test_compress_ranges():
@@ -61,7 +70,8 @@ def test_generate_maps_vlan_to_isid_service():
     # uplink ports 49-50 excluded
     assert "i-sid 2500695 elan" in text
     assert "untagged-traffic port 1/7-1/8" in text
-    assert "1/49" not in text and "1/50" not in text     # uplinks never UNI ports
+    assert "1/49" not in text
+    assert "1/50" not in text
     # 735 explicit
     assert "i-sid 2510735 elan" in text
 
@@ -81,7 +91,8 @@ def test_excluded_vlan_is_not_generated():
     res = generate_voss_from_ers(m, _cfg(), device_name="ers-access-01")
     # quarantine (99) excluded by name -> no service, and its access ports
     # (2,11-13,51-52) are not emitted solely for it
-    assert "i-sid 2500099" not in res.text and "c-vid 99 " not in res.text
+    assert "i-sid 2500099" not in res.text
+    assert "c-vid 99 " not in res.text
 
 
 def test_high_sfp_ports_flagged_not_silently_dropped():
@@ -90,7 +101,8 @@ def test_high_sfp_ports_flagged_not_silently_dropped():
     m.vlans[735].members.append("51")   # ERS SFP port on an access VLAN
     m.ports["51"].pvid = 735
     res = generate_voss_from_ers(m, _cfg(isid_explicit={735: 2510735}))
-    assert "ERS port(s) 51" in res.text and "no 1/N equivalent" in res.text
+    assert "ERS port(s) 51" in res.text
+    assert "no 1/N equivalent" in res.text
 
 
 def test_flex_uni_access_port_blocks_generated():
@@ -110,8 +122,7 @@ def test_flex_uni_access_port_blocks_generated():
 def test_cli_extract_config_ers_end_to_end(tmp_path):
     # --extract-config on an ERS box writes a generated .cfg AND an I-SID
     # decision worksheet, offline, no-fabric.
-    import shutil
-    from switch_migrator.cli import main
+
     raw = tmp_path / "raw"
     shutil.copytree(FIXTURES / "ers", raw / "ers-access-01")
     (tmp_path / "config.yaml").write_text(
@@ -148,20 +159,30 @@ mlt 1 name "uplink" enable member 1/49-1/50
 """
 
 
-def test_stacked_ers_port_ids_do_not_crash_and_keep_their_unit():
-    """A stack numbers its ports '<unit>/<port>'. Feeding those through the
-    generator used to raise ValueError on int('1/1') and abort the whole run."""
+def test_a_stacked_ers_keeps_unit_1_and_flags_the_other_units():
+    """A stack numbers its ports '<unit>/<port>'. A standalone new switch has
+    no slot 2, so only unit 1 keeps its numbers; unit 2 and the SFP cage are
+    flagged for --plan, never renumbered by guess (council review, FA2)."""
     m = parse_ers_config(_STACKED)
     res = generate_voss_from_ers(m, _cfg(isid_explicit={100: 2510100}),
                                  device_name="ers-stack-01")
     text = res.text
-    assert "untagged-traffic port 1/5-1/6,2/5" in text
+    assert "untagged-traffic port 1/5-1/6" in text
     assert "interface GigabitEthernet 1/5" in text
-    assert "interface GigabitEthernet 2/5" in text
-    assert 'name "srv-a"' in text
-    # 2/49 is above the copper range -> flagged for remapping, not emitted
-    assert "2/49 (SFP/high)" in text
+    assert "interface GigabitEthernet 2/5" not in text
     assert "interface GigabitEthernet 2/49" not in text
+    assert "port(s) 2/5 - another stack unit or above the 48 access ports" in text
+    assert "port(s) 2/49 - another stack unit or above the 48 access ports" in text
+    assert "Access ports ASSUMED 1-48" in text
+
+
+def test_the_layout_from_the_config_sets_the_access_range():
+    m = parse_ers_config(_STACKED)
+    cfg = _cfg(isid_explicit={100: 2510100})
+    cfg.plan.ports, cfg.plan.uplinks = 28, 4
+    text = generate_voss_from_ers(m, cfg, device_name="ers-stack-01").text
+    assert "ASSUMED" not in text
+    assert "1-24 keep their number" in text
 
 
 def test_compress_never_bridges_a_range_across_units():

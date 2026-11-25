@@ -1,5 +1,10 @@
 from switch_migrator.parsers import voss_parsers
 from switch_migrator.parsers.common import name_says_ist, parse_lldp_neighbors
+from switch_migrator.parsers.common import parse_lldp_neighbors as p
+
+FIXTURE_PORTS = 5         # rows of the VOSS port fixtures
+IST_VLAN = 4000
+ISID_VLAN_100, ISID_VLAN_200, NONSTANDARD_ISID = 10100, 10200, 77777
 
 
 def test_parse_ports(fixture):
@@ -7,10 +12,12 @@ def test_parse_ports(fixture):
     # Port Name and Port Config sections - only the first may be parsed
     ports = voss_parsers.parse_ports(
         fixture("voss", "show_interfaces_gigabitethernet.txt"))
-    assert len(ports) == 5
+    assert len(ports) == FIXTURE_PORTS
     by_port = {p.port: p for p in ports}
-    assert by_port["1/1"].admin_up is True and by_port["1/1"].oper_up is True
-    assert by_port["1/2"].admin_up is True and by_port["1/2"].oper_up is False
+    assert by_port["1/1"].admin_up is True
+    assert by_port["1/1"].oper_up is True
+    assert by_port["1/2"].admin_up is True
+    assert by_port["1/2"].oper_up is False
     assert by_port["1/48"].admin_up is False
     assert by_port["2/1/1"].oper_up is True  # channelized port
     # descriptions come from the Port Interface section, not Port Name
@@ -21,9 +28,9 @@ def test_parse_ports_without_section_banner(fixture):
     # partial capture: just the data lines, no banners -> still parses
     full = fixture("voss", "show_interfaces_gigabitethernet.txt")
     section = full.split("Port Name")[0]
-    data_only = "\n".join(l for l in section.splitlines() if l[:1].isdigit())
+    data_only = "\n".join(line for line in section.splitlines() if line[:1].isdigit())
     ports = voss_parsers.parse_ports(data_only)
-    assert len(ports) == 5
+    assert len(ports) == FIXTURE_PORTS
 
 
 def test_parse_mlt(fixture):
@@ -58,10 +65,12 @@ def test_parse_mlt_wrapped_vlan_ids_continuation():
 def test_parse_port_state(fixture):
     ports = voss_parsers.parse_port_state(
         fixture("voss", "show_interfaces_gigabitethernet_state.txt"))
-    assert len(ports) == 5
+    assert len(ports) == FIXTURE_PORTS
     by_port = {p.port: p for p in ports}
-    assert by_port["1/1"].admin_up is True and by_port["1/1"].oper_up is True
-    assert by_port["1/2"].admin_up is True and by_port["1/2"].oper_up is False
+    assert by_port["1/1"].admin_up is True
+    assert by_port["1/1"].oper_up is True
+    assert by_port["1/2"].admin_up is True
+    assert by_port["1/2"].oper_up is False
     assert by_port["1/48"].admin_up is False
     assert by_port["1/48"].state_reason == "SSH"
     assert by_port["1/47"].state_reason == ""
@@ -82,7 +91,7 @@ def test_parse_virtual_ist(fixture):
     ist = voss_parsers.parse_virtual_ist(fixture("voss", "show_virtual_ist.txt"))
     assert ist is not None
     assert ist.peer_ip == "192.168.255.2"
-    assert ist.vlan == 4000
+    assert ist.vlan == IST_VLAN
     assert ist.enabled is True
     assert ist.session_up is True
 
@@ -97,13 +106,13 @@ def test_parse_vlan_isid(fixture):
     # footer '5 out of 5 Total ...' (real format, no leading 'All') must not
     # become VLAN 5
     assert set(by_id) == {1, 100, 200, 300, 4000}
-    assert by_id[100].isid == 10100
+    assert by_id[100].isid == ISID_VLAN_100
     # the third column is the I-SID name, kept separate from the VLAN name
     # (which comes from 'show vlan basic')
     assert by_id[100].isid_name == "Server-VLAN-100"
     assert by_id[100].name == ""
-    assert by_id[200].isid == 10200
-    assert by_id[300].isid == 77777
+    assert by_id[200].isid == ISID_VLAN_200
+    assert by_id[300].isid == NONSTANDARD_ISID
     assert by_id[300].isid_name == "quarantaine"
     assert by_id[1].isid is None
     assert by_id[4000].isid is None
@@ -141,7 +150,7 @@ def test_parse_isid_local_unknown_type_and_vlanid_column():
 def test_parse_isis_spbm_isid(fixture):
     rows = voss_parsers.parse_isis_spbm_isid(
         fixture("voss", "show_isis_spbm_i_sid_all.txt"))
-    assert len(rows) == 5
+    assert len(rows) == FIXTURE_PORTS
     assert {r["isid"] for r in rows} == {10100, 10200, 20300, 20400}
     assert rows[0] == {"isid": 10100, "type": "config", "host": "dvr-01"}
     assert rows[1] == {"isid": 10100, "type": "discover", "host": "beb-07"}
@@ -167,7 +176,6 @@ def test_parse_lldp_neighbors_captures_ip_name_and_descr():
     # real VOSS 8.10.9 block form: NIC advertises an adapter model as SysName
     # (no IP), a server has an EMPTY SysName but an IP + SysDescr, and a switch
     # neighbor has all three. Two blocks on one port: the named one wins.
-    from switch_migrator.parsers.common import parse_lldp_neighbors as p
     out = (
         "Port: 1/3       Index    : 17\n"
         "                SysName  : 10/25Gb 2-port SFP28 BCM57414 OCP3 Adapter fw_version:AFW_1\n"
@@ -193,12 +201,15 @@ def test_parse_lldp_neighbors_captures_ip_name_and_descr():
         "                Address  : 10.0.148.88\n"
     )
     n = p(out)
-    assert n["1/3"].sysname.startswith("10/25Gb 2-port SFP28") and n["1/3"].ip == ""
-    assert n["1/7"].sysname == "" and n["1/7"].ip == "10.0.48.192"
+    assert n["1/3"].sysname.startswith("10/25Gb 2-port SFP28")
+    assert n["1/3"].ip == ""
+    assert n["1/7"].sysname == ""
+    assert n["1/7"].ip == "10.0.48.192"
     assert n["1/7"].sys_descr == "HPE ProLiant DL380 Gen10"
     # port 1/9 has two blocks - the one advertising a name wins, no field mixing
     assert n["1/9"].sysname == "esx-host-01"
-    assert n["2/1"].sysname == "core-s72-q4" and n["2/1"].ip == "10.0.148.88"
+    assert n["2/1"].sysname == "core-s72-q4"
+    assert n["2/1"].ip == "10.0.148.88"
 
 
 def test_parse_mlt_in_datapath(fixture):
@@ -232,7 +243,7 @@ def test_parse_vlan_members(fixture):
     assert m[200] == ["1/2", "1/47", "1/48"]
     assert m[4000] == ["1/47", "1/48"]
     # the 'N out of N Total' footer must not become a phantom VLAN
-    assert 5 not in m or m[5] != []
+    assert set(m) == {1, 100, 200, 300, 4000}
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +331,8 @@ ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR
 39 out of 39 Total Num of Vlans displayed
 """
     names = voss_parsers.parse_vlan_basic(out)
+    # the footer's '39 out of 39' once became VLAN 39 named 'out'
     assert names == {1: "Default", 99: "quarantine", 4051: "BVLAN-1"}
-    assert 39 not in names          # was VLAN 39 named 'out'
 
 
 # ---------------------------------------------------------------------------

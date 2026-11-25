@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from switch_migrator.models import (
     CompStatus,
     FabricState,
+    MltState,
     SwitchAudit,
     VlanComparison,
 )
@@ -16,7 +18,7 @@ from switch_migrator.models import (
 class Table:
     title: str
     headers: list[str]
-    rows: list[list] = field(default_factory=list)
+    rows: list[list[object]] = field(default_factory=list)
     # per-row severity for coloring: ok / warn / error / None
     severities: list[str | None] = field(default_factory=list)
     # Headers worth showing on a terminal. The migration sheets are deliberately
@@ -43,11 +45,11 @@ class Table:
     # How many leading columns stay on screen while scrolling right.
     freeze_columns: int = 0
 
-    def add(self, row: list, severity: str | None = None):
-        self.rows.append(row)
+    def add(self, row: Sequence[object], severity: str | None = None) -> None:
+        self.rows.append(list(row))
         self.severities.append(severity)
 
-    def for_console(self) -> tuple[list[str], list[list]]:
+    def for_console(self) -> tuple[list[str], list[list[object]]]:
         """(headers, rows) reduced to the console subset."""
         if not self.console_columns:
             return self.headers, self.rows
@@ -63,7 +65,7 @@ def _fmt_bool(value: bool | None, true: str = "up", false: str = "down") -> str:
     return true if value else false
 
 
-def _mlt_up_severity(m) -> str | None:
+def _mlt_up_severity(m: MltState) -> str | None:
     """Severity for one MLT's member-up state, tolerant of unknown counts."""
     if not m.members:
         return None                       # dead MLT: handled/labelled separately
@@ -94,15 +96,15 @@ def build_summary(audits: list[SwitchAudit],
         # in no-fabric mode the VLAN count is just how many VLANs the switch has
         vlan_count = len(a.vlans) if no_fabric else len(comps)
         if not a.reachable:
-            row = [a.name, a.platform.value, "NO", "-", "-", "-", "-", "-", "-"]
-            t.add(row + ([] if no_fabric else ["-", "-", "-"]), "error")
+            dead = [a.name, a.platform.value, "NO", "-", "-", "-", "-", "-", "-"]
+            t.add(dead + ([] if no_fabric else ["-", "-", "-"]), "error")
             continue
         ist = "-"
         if a.ist is not None:
             ist = _fmt_bool(a.ist.session_up).upper()
         severity = "error" if err or (a.ist and a.ist.session_up is False) \
             else ("warn" if warn or mlt_issues else "ok")
-        row = [a.name, a.platform.value, "yes",
+        row: list[object] = [a.name, a.platform.value, "yes",
                f"{a.ports_up}/{len(a.ports)}",
                f"{a.uplink_ports_up}/{a.uplink_ports_total}",
                len(a.mlts), mlt_issues, ist, vlan_count]
@@ -222,9 +224,10 @@ def build_coverage(audits: list[SwitchAudit]) -> Table:
 
     Several sources are optional: a release that rejects `show vlan members`,
     or a run without the running-config, still produces a full-looking sheet -
-    with thinner VLAN columns. That difference used to be invisible, which is
-    how a cabling sheet reached a data centre missing VLANs nobody knew were
-    missing. This sheet makes it a number you can look at before the window.
+    with thinner VLAN columns. Without this sheet that difference is
+    invisible, and a cabling sheet reaches the data centre missing VLANs
+    nobody knows are missing. Here it is a number to look at before the
+    window.
 
     Severities feed the process exit code, so they have to mean something
     actionable. A switch with spare ports is not a finding - most of a 48-port
@@ -261,9 +264,7 @@ def build_coverage(audits: list[SwitchAudit]) -> Table:
         # a reachable switch with ports and NO VLAN data at all is a collection
         # that failed, whatever it says elsewhere
         severity = "ok"
-        if not audit.reachable:
-            severity = "error"
-        elif total and not with_vlans:
+        if not audit.reachable or (total and not with_vlans):
             severity = "error"
         elif missing or blind_up:
             severity = "warn"

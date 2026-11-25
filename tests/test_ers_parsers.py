@@ -1,12 +1,16 @@
 from switch_migrator.parsers import ers_parsers
 from switch_migrator.parsers.common import expand_port_list, parse_lldp_neighbors
 
+FIXTURE_PORTS = 5         # rows of the ERS 'show interfaces' fixture
+IST_VLAN = 4000
+
 
 def test_parse_ports(fixture):
     ports = ers_parsers.parse_ports(fixture("ers", "show_interfaces.txt"))
-    assert len(ports) == 5
+    assert len(ports) == FIXTURE_PORTS
     by_port = {p.port: p for p in ports}
-    assert by_port["1"].admin_up is True and by_port["1"].oper_up is True
+    assert by_port["1"].admin_up is True
+    assert by_port["1"].oper_up is True
     assert by_port["2"].oper_up is False
     assert by_port["3"].admin_up is False
     assert by_port["49"].oper_up is True
@@ -69,7 +73,7 @@ def test_parse_ist(fixture):
     assert ist is not None
     assert ist.enabled is True
     assert ist.peer_ip == "192.168.255.1"
-    assert ist.vlan == 4000
+    assert ist.vlan == IST_VLAN
     assert ist.session_up is True
 
 
@@ -97,8 +101,7 @@ def test_parse_mlt_digit_shaped_name_is_not_read_as_members():
            "-- ---- ------- ---- ---- ------ ----\n"
            "4  7    NONE    All  Basic Enabled Trunk\n")
     mlts = ers_parsers.parse_mlt(out)
-    assert len(mlts) == 1
-    assert mlts[0].mlt_id == 4
+    assert [m.mlt_id for m in mlts] == [4]
     assert mlts[0].name == "7"
     assert mlts[0].members == []
 
@@ -153,7 +156,8 @@ def test_empty_name_row_with_no_members_is_still_parsed():
     out = ("Id Name Members Bpdu Mode Status Type\n"
            "1       NONE    All  Basic Enabled Trunk\n")
     mlts = ers_parsers.parse_mlt(out)
-    assert len(mlts) == 1 and mlts[0].members == []
+    assert len(mlts) == 1
+    assert mlts[0].members == []
 
 
 def test_a_bare_number_at_index_four_is_still_refused():

@@ -25,8 +25,14 @@ import csv
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from openpyxl import load_workbook
 
 from switch_migrator.report.excel import SHEET_SCHEMA, STAMP_SHEET
+
+# a stamp row: key | value
+KEY_AND_VALUE = 2
 
 
 class SheetError(Exception):
@@ -181,7 +187,7 @@ _HEADER_NAMES = {"old_switch": "'Old switch'", "old_port": "'Old port'"}
 _MAC_RE = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
 
 
-def _key(header: str) -> str:
+def _key(header: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(header or "").lower())
 
 
@@ -211,41 +217,51 @@ def _macs(value: str) -> list[str]:
     return [m.lower() for m in _MAC_RE.findall(str(value or ""))]
 
 
-def _cell(value) -> str:
+def _cell(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
 
 
-def _build_row(mapping: dict[str, str], number: int) -> CablingRow:
+def _set_int(row: CablingRow, field_name: str, text: str) -> None:
+    if not text:
+        return
+    parsed = _one_int(text)
+    if parsed is None:
+        row.problems.append(f"{field_name.replace('_', ' ')} '{text}' is not a number")
+    else:
+        setattr(row, field_name, parsed)
+
+
+def _set_bool(row: CablingRow, field_name: str, text: str) -> None:
+    word = text.lower()
+    if word in _TRUE:
+        setattr(row, field_name, True)
+    elif word in _FALSE:
+        setattr(row, field_name, False)
+    elif word not in ("", "?", "-"):
+        row.problems.append(f"{field_name.upper()} '{text}' is neither yes nor no")
+
+
+def _set_field(row: CablingRow, field_name: str, text: str) -> None:
+    if field_name in _INT_FIELDS:
+        _set_int(row, field_name, text)
+    elif field_name in _LIST_INT_FIELDS:
+        setattr(row, field_name, _ints(text))
+    elif field_name in _LIST_STR_FIELDS:
+        setattr(row, field_name, _macs(text))
+    elif field_name in _BOOL_FIELDS:
+        _set_bool(row, field_name, text)
+    elif field_name in ("old_port", "new_port"):
+        setattr(row, field_name, normalise_port(text))
+    else:
+        setattr(row, field_name, text)
+
+
+def _build_row(mapping: dict[str, object], number: int) -> CablingRow:
     row = CablingRow(row_number=number)
     for field_name, raw in mapping.items():
-        text = _cell(raw)
-        if field_name in _INT_FIELDS:
-            if text:
-                parsed = _one_int(text)
-                if parsed is None:
-                    row.problems.append(
-                        f"{field_name.replace('_', ' ')} '{text}' is not a number")
-                else:
-                    setattr(row, field_name, parsed)
-        elif field_name in _LIST_INT_FIELDS:
-            setattr(row, field_name, _ints(text))
-        elif field_name in _LIST_STR_FIELDS:
-            setattr(row, field_name, _macs(text))
-        elif field_name in _BOOL_FIELDS:
-            word = text.lower()
-            if word in _TRUE:
-                setattr(row, field_name, True)
-            elif word in _FALSE:
-                setattr(row, field_name, False)
-            elif word not in ("", "?", "-"):
-                row.problems.append(
-                    f"{field_name.upper()} '{text}' is neither yes nor no")
-        elif field_name in ("old_port", "new_port"):
-            setattr(row, field_name, normalise_port(text))
-        else:
-            setattr(row, field_name, text)
+        _set_field(row, field_name, _cell(raw))
     # a half-filled row is the one thing worth complaining about: it means a
     # technician started the line and something interrupted them
     if row.new_switch and not row.new_port:
@@ -255,12 +271,13 @@ def _build_row(mapping: dict[str, str], number: int) -> CablingRow:
     return row
 
 
-def _rows_from_csv(path: Path) -> list[tuple[str, list[list]]]:
+def _rows_from_csv(path: Path) -> list[tuple[str, list[list[object]]]]:
     with path.open(newline="", encoding="utf-8-sig") as fh:
-        return [(path.name, [row for row in csv.reader(fh)])]
+        rows: list[list[object]] = [[*row] for row in csv.reader(fh)]
+        return [(path.name, rows)]
 
 
-def _looks_like_cabling(rows: list[list]) -> bool:
+def _looks_like_cabling(rows: list[list[object]]) -> bool:
     # the header is the first NON-EMPTY row - _parse_table drops blank rows
     # too, so a sheet with a leading blank row must not silently vanish here
     for row in rows:
@@ -270,7 +287,7 @@ def _looks_like_cabling(rows: list[list]) -> bool:
     return False
 
 
-def _read_stamp(wb) -> dict[str, str]:
+def _read_stamp(wb: Any) -> dict[str, str]:   # an openpyxl Workbook
     """The hidden stamp sheet the writer leaves behind, as a plain dict.
 
     Absent on a .csv export and on any workbook an older build wrote, which is
@@ -281,13 +298,13 @@ def _read_stamp(wb) -> dict[str, str]:
         return {}
     stamp: dict[str, str] = {}
     for row in wb[STAMP_SHEET].iter_rows(values_only=True):
-        if row and len(row) >= 2 and row[0]:
+        if row and len(row) >= KEY_AND_VALUE and row[0]:
             stamp[str(row[0])] = _cell(row[1])
     return stamp
 
 
 def _rows_from_xlsx(path: Path,
-                    sheet_name: str | None) -> tuple[list[tuple[str, list[list]]],
+                    sheet_name: str | None) -> tuple[list[tuple[str, list[list[object]]]],
                                                      dict[str, str]]:
     """Every worksheet that looks like a cabling sheet, in workbook order.
 
@@ -296,10 +313,6 @@ def _rows_from_xlsx(path: Path,
     first would verify one site and silently ignore the rest - a migration
     would look complete while half of it was never checked.
     """
-    try:
-        from openpyxl import load_workbook
-    except ImportError:  # pragma: no cover - openpyxl is a hard dependency
-        raise SheetError("openpyxl is required to read .xlsx sheets") from None
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         stamp = _read_stamp(wb)
@@ -334,7 +347,7 @@ def _rows_from_xlsx(path: Path,
         wb.close()
 
 
-def _parse_table(where: str, raw: list[list], sheet: Sheet, path: Path) -> None:
+def _parse_table(where: str, raw: list[list[object]], sheet: Sheet, path: Path) -> None:
     raw = [row for row in raw if any(_cell(c) for c in row)]
     if not raw:
         return

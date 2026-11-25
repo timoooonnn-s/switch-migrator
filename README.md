@@ -27,6 +27,19 @@ change board.
 Each has its own section below. Running `switch-migrator` with no arguments
 opens an interactive menu that does all of it without flags.
 
+The three steps every migration has also exist as verbs, shorthands for the
+flags that do them (every flag still works on its own):
+
+| Verb | Same as |
+|---|---|
+| `switch-migrator collect …` | `--migration-sheets --save-snapshot …` |
+| `switch-migrator plan …` | `--plan …` |
+| `switch-migrator verify SHEET …` | `--verify-migration SHEET …` |
+
+On start the tool also says when this checkout is behind its upstream branch
+(as of the last `git fetch`; it never fetches itself), so a stale copy on a
+jump host does not run a migration night unnoticed.
+
 ## The audit
 
 The audit is the tool's original job and still the core of it. Given a list of
@@ -280,6 +293,11 @@ entry point, not a replacement, so existing scripts and cron jobs are unaffected
 ```bash
 # Standard audit: inventory file + Excel report + console summary
 switch-migrator -c config.yaml -i switches.yaml
+
+# The three steps as verbs
+switch-migrator collect -i switches.yaml
+switch-migrator plan -i switches.yaml --new-switch leaf-a,leaf-b
+switch-migrator verify cabling.xlsx
 
 # A couple of switches without an inventory file (NAME:PLATFORM[:HOST])
 switch-migrator -s old-access-01:ers -s old-agg-01:voss:10.1.1.20
@@ -588,7 +606,12 @@ sections verbatim and drops everything else, so:
   isolated VLAN-only box all work;
 * **annotated, not paste-ready** — fabric uplink ports (those running IS-IS) get
   a `# [REVIEW]` marker, and the header lists the sections that were present but
-  omitted so you remember to configure them separately.
+  omitted so you remember to configure them separately;
+* **nothing ZTP already did** — lines a ZTP'd switch already has (the SPB
+  B-VLANs) or that name the old hardware's ports (`vlan members remove 1
+  1/1-1/48,…`) are left out and listed under `LEFT OUT` in the header instead.
+  The port numbers that remain are the old switch's: right for a 1:1
+  replacement on the same model; for a move or a consolidation use `--plan`.
 
 It works with `--offline`/`--save-raw` like everything else.
 
@@ -598,14 +621,18 @@ and writes two files:
 
 * `<device>.cfg` — each VLAN becomes an `i-sid <isid> elan` with
   `c-vid <vlan> port …` (tagged members) and `untagged-traffic port …` (PVID
-  members); access ports get the flex-UNI boilerplate; old port numbers are kept
-  as `1/N`. It is clearly labelled a **DRAFT** with a "YOU MUST VERIFY" header
+  members); access ports get the flex-UNI boilerplate. Stack unit 1's access
+  ports keep their number as `1/N`; another unit, or a port above the access
+  range (set `plan.ports` / `plan.uplinks`, else 48 is assumed), is flagged
+  `# [REVIEW]`, never renumbered by guess. It is clearly labelled a **DRAFT** with a "YOU MUST VERIFY" header
   (tagged-vs-untagged, uplink/MLT handling, and the untranslated config).
 * `<device>.isid-decisions.txt` — the **I-SID decision worksheet**: because
   several offsets run in parallel (`2500000/2510000/2700000/2710000`),
   `offset + VLAN` is ambiguous, so any VLAN the fabric didn't confirm is listed
-  with all candidate I-SIDs plus a ready-to-paste `isid_conventions.explicit`
-  snippet. Fill in your choices, re-run, and those VLANs resolve. Until then the
+  with all candidate I-SIDs plus an `isid_conventions.explicit` snippet whose
+  lines are commented out with an `<ISID>` placeholder — nothing is pre-filled,
+  so pasting it unread cannot pick an I-SID for you. Uncomment, fill in, re-run,
+  and those VLANs resolve. Until then the
   service block is emitted **commented-out** with a `# [REVIEW]` marker — never a
   guessed I-SID.
 
@@ -1085,8 +1112,20 @@ not failures.
 
 ```bash
 pip install -e '.[dev]'
-pytest -v
+pytest && ruff check . && mypy
 ```
+
+All three must pass before a change goes in:
+
+* **pytest** — the suite (offline, see below).
+* **ruff** — the same rule families as pre-migration-checker, at ruff's
+  default complexity limits (12 branches, 50 statements, 6 returns, 5
+  arguments per function), over the tests as well. There is no ignore list and
+  no `noqa` anywhere: a function past a limit is split, a long parameter list
+  becomes a small dataclass, and a number a test checks gets a name that says
+  what it is.
+* **mypy** — `strict`, against Python 3.10, with no `type: ignore`.
+  migration-check and fabric-weft are skipped: they are optional and need 3.11.
 
 The test suite runs entirely offline against captured CLI fixtures in
 `tests/fixtures/` — including a full end-to-end pipeline test through
@@ -1105,7 +1144,12 @@ its invariants, and how to add a third one).
 
 ```
 switch_migrator/
-├── cli.py              # argument parsing + orchestration
+├── cli.py              # flags -> workflow options, checks, console output
+├── workflow/           # the pipeline both front ends drive
+│   ├── collect.py      # runners, per-switch collection, fabric, dry run
+│   ├── report.py       # compare, sheets, plan, health, verification -> tables
+│   ├── outputs.py      # workbook, CSV, configs, commands, rack sheet
+│   └── macs.py         # the MAC check steps (migration-check)
 ├── menu.py             # interactive toolkit menu (session: collect once, reuse)
 ├── config.py           # YAML config/inventory loading, credential resolution
 ├── connection.py       # netmiko SSH runner + offline replay runner

@@ -26,6 +26,7 @@ diffed and handed around like the rest of the config:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -41,7 +42,7 @@ class ProfileError(Exception):
     pass
 
 
-def load_profiles(path: Path = DEFAULT_FILE) -> dict[str, dict]:
+def load_profiles(path: Path = DEFAULT_FILE) -> dict[str, dict[str, Any]]:
     """All profiles in the file, name -> settings dict. Missing file = none."""
     if not path.is_file():
         return {}
@@ -55,7 +56,7 @@ def load_profiles(path: Path = DEFAULT_FILE) -> dict[str, dict]:
     if not isinstance(profiles, dict):
         raise ProfileError(f"{path}: 'profiles' must be a mapping of "
                            f"name -> settings")
-    out: dict[str, dict] = {}
+    out: dict[str, dict[str, Any]] = {}
     for name, raw in profiles.items():
         if not isinstance(raw, dict):
             raise ProfileError(f"{path}: profile '{name}' must be a mapping")
@@ -63,7 +64,7 @@ def load_profiles(path: Path = DEFAULT_FILE) -> dict[str, dict]:
     return out
 
 
-def _clean(raw: dict, where: str) -> dict:
+def _clean(raw: dict[str, Any], where: str) -> dict[str, Any]:
     """Keep only known keys, with the right types; unknown keys are reported
     once rather than silently dropped (a typo should not lose a setting)."""
     known = set(_STR_KEYS) | set(_BOOL_KEYS) | set(_PATH_KEYS) | {
@@ -72,7 +73,7 @@ def _clean(raw: dict, where: str) -> dict:
     if unknown:
         raise ProfileError(f"{where}: unknown key(s) {', '.join(sorted(unknown))} "
                            f"(known: {', '.join(sorted(known))})")
-    out: dict = {}
+    out: dict[str, Any] = {}
     for key in _STR_KEYS:
         if raw.get(key) is not None:
             out[key] = str(raw[key])
@@ -93,9 +94,9 @@ def _clean(raw: dict, where: str) -> dict:
     return out
 
 
-def save_profile(name: str, settings: dict, path: Path = DEFAULT_FILE) -> Path:
+def save_profile(name: str, settings: dict[str, Any], path: Path = DEFAULT_FILE) -> Path:
     """Add or replace one profile, keeping every other profile in the file."""
-    data: dict = {}
+    data: dict[str, Any] = {}
     if path.is_file():
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

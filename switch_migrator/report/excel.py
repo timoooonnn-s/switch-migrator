@@ -41,12 +41,18 @@ from openpyxl.styles import (
     Side,
 )
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.properties import PageSetupProperties
-from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.worksheet import Worksheet
 
 from switch_migrator import __version__
 from switch_migrator.report.tables import Table
+
+# row 1 is the header
+FIRST_DATA_ROW = 2
+# an inline dropdown list is limited to this many characters by the file format
+INLINE_LIST_MAX = 255
 
 # Bumped whenever the cabling sheet's columns change in a way that a read-back
 # should know about. Recorded in the hidden stamp sheet.
@@ -71,6 +77,7 @@ _GRID = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 # Excel worksheet titles: 31 characters, and these are illegal in them.
 # Location names come from the user's config ('Frankfurt DC1/DC2'), so both
 # limits are reachable in normal use.
+SHEET_TITLE_MAX = 31
 _ILLEGAL_TITLE = re.compile(r"[\[\]:*?/\\]")
 
 # Column widths. Wrapped columns get a fixed, readable width rather than one
@@ -83,7 +90,7 @@ _MAX_WIDTH = 46
 
 def _sheet_title(title: str, used: set[str]) -> str:
     clean = _ILLEGAL_TITLE.sub("-", title).strip() or "Sheet"
-    clean = clean[:31]
+    clean = clean[:SHEET_TITLE_MAX]
     if clean not in used:
         used.add(clean)
         return clean
@@ -91,7 +98,7 @@ def _sheet_title(title: str, used: set[str]) -> str:
     # than letting openpyxl silently rename or raise
     for n in range(2, 100):
         suffix = f" ({n})"
-        candidate = clean[:31 - len(suffix)] + suffix
+        candidate = clean[:SHEET_TITLE_MAX - len(suffix)] + suffix
         if candidate not in used:
             used.add(candidate)
             return candidate
@@ -109,7 +116,7 @@ def _column_width(table: Table, index: int, header: str) -> int:
     return min(longest + 2, _MAX_WIDTH)
 
 
-def _write_header(ws, table: Table) -> None:
+def _write_header(ws: Worksheet, table: Table) -> None:
     ws.append(table.headers)
     for index, header in enumerate(table.headers, start=1):
         cell = ws.cell(row=1, column=index)
@@ -122,9 +129,9 @@ def _write_header(ws, table: Table) -> None:
     ws.row_dimensions[1].height = 30
 
 
-def _add_validations(ws, table: Table, last_row: int) -> None:
+def _add_validations(ws: Worksheet, table: Table, last_row: int) -> None:
     """Dropdowns and whole-number checks on the columns a human fills in."""
-    if last_row < 2:
+    if last_row < FIRST_DATA_ROW:
         return
     for header, choices in table.choice_columns.items():
         if header not in table.headers or not choices:
@@ -134,7 +141,7 @@ def _add_validations(ws, table: Table, last_row: int) -> None:
         # that the dropdown would silently not appear, so fall back to a plain
         # (still helpful) note rather than pretending it is there
         formula = '"' + ",".join(choices) + '"'
-        if len(formula) > 255:
+        if len(formula) > INLINE_LIST_MAX:
             continue
         dv = DataValidation(type="list", formula1=formula, allow_blank=True,
                             showDropDown=False)
@@ -156,7 +163,7 @@ def _add_validations(ws, table: Table, last_row: int) -> None:
         dv.add(f"{letter}2:{letter}{last_row}")
 
 
-def _add_page_breaks(ws, table: Table) -> None:
+def _add_page_breaks(ws: Worksheet, table: Table) -> None:
     """One printed page per group, so a rack's rows never span two sheets."""
     if not table.page_break_column or table.page_break_column not in table.headers:
         return
@@ -170,7 +177,7 @@ def _add_page_breaks(ws, table: Table) -> None:
         previous = value
 
 
-def _setup_printing(ws, table: Table) -> None:
+def _setup_printing(ws: Worksheet, table: Table) -> None:
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
@@ -180,7 +187,7 @@ def _setup_printing(ws, table: Table) -> None:
     _add_page_breaks(ws, table)
 
 
-def _freeze(ws, table: Table) -> None:
+def _freeze(ws: Worksheet, table: Table) -> None:
     """Keep the header - and the columns that identify a row - on screen."""
     columns = min(table.freeze_columns, len(table.headers))
     ws.freeze_panes = f"{get_column_letter(columns + 1)}2" if columns else "A2"
@@ -195,11 +202,11 @@ def _write_table(wb: Workbook, table: Table, used_titles: set[str]) -> None:
     wrapped = {i for i, h in enumerate(table.headers) if h in table.wrap_columns}
     protect = bool(table.manual_columns)
 
-    for row, severity in zip(table.rows, table.severities):
+    for row, severity in zip(table.rows, table.severities, strict=True):
         ws.append([str(c) if not isinstance(c, (int, float)) else c
                    for c in row])
         excel_row = ws.max_row
-        fill = _FILLS.get(severity)
+        fill = _FILLS.get(severity or "")
         for index in range(len(table.headers)):
             cell = ws.cell(row=excel_row, column=index + 1)
             cell.border = _GRID
@@ -233,7 +240,7 @@ def _write_table(wb: Workbook, table: Table, used_titles: set[str]) -> None:
         ws.protection.sort = False
 
 
-def _write_stamp(wb: Workbook, tables: list[Table], meta: dict | None) -> None:
+def _write_stamp(wb: Workbook, tables: list[Table], meta: dict[str, str] | None) -> None:
     """A hidden sheet saying which build wrote this workbook, and with which
     columns - so reading a filled-in sheet back can spot version skew instead
     of quietly misreading a renamed column."""
@@ -252,7 +259,7 @@ def _write_stamp(wb: Workbook, tables: list[Table], meta: dict | None) -> None:
     ws.sheet_state = "hidden"
 
 
-def write_excel(tables: list[Table], path: Path, meta: dict | None = None) -> None:
+def write_excel(tables: list[Table], path: Path, meta: dict[str, str] | None = None) -> None:
     wb = Workbook()
     wb.remove(wb.active)
     used_titles: set[str] = set()

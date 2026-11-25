@@ -1,12 +1,29 @@
 """The migration plan: every rule of the allocator, on synthetic old switches."""
 
-import pytest
+import csv
+import io
+import shutil
+from pathlib import Path
 
+import pytest
+from openpyxl import load_workbook
+from rich.console import Console
+
+from switch_migrator import cabling_sheet, cli, menu, standard, verify
 from switch_migrator import plan as P
-from switch_migrator import standard
+from switch_migrator.config import Credentials, SwitchTarget, load_config
 from switch_migrator.models import IstState, MltState, Platform, PortState, SwitchAudit
+from switch_migrator.report.excel import write_excel
+from switch_migrator.report.migration import assign_port_uids, build_cabling, build_plan_tables
+from switch_migrator.report.migration_tables import build_verification
 
 LAYOUT = P.Layout(ports=28, uplinks=4)          # 24 access ports, 25-28 uplinks
+
+
+CONFIG_ERROR = 2          # main()'s exit code for a config error
+ACCESS_PORTS = 24         # LAYOUT: 28 ports, the last 4 uplinks
+MENU_PORTS = 28           # the port count typed into the menu
+PROD_ISID_695 = 2500695   # the standard: prod prefix 250 + VLAN as 4 digits
 
 
 def _port(port, usage="IN USE", mlt=None, neighbor="", uplink=False, **kw):
@@ -39,8 +56,8 @@ def _where(plan):
 
 
 def test_the_layout_never_plans_the_uplink_ports():
-    assert LAYOUT.access_ports == 24
-    with pytest.raises(ValueError):
+    assert LAYOUT.access_ports == ACCESS_PORTS
+    with pytest.raises(ValueError, match="more ports than uplinks"):
         P.Layout(ports=4, uplinks=4)
 
 
@@ -63,9 +80,11 @@ def test_dual_homed_from_the_bottom_single_homed_from_the_top():
 
 def test_the_mlt_name_follows_the_template():
     plan = _plan([_ers_stack()])
-    assert {m.new_mlt_name for m in plan.moves if m.new_mlt_id == 401} == {"f11"}
+    lag = standard.mlt_id_for_new_lag("1/1")
+    assert {m.new_mlt_name for m in plan.moves if m.new_mlt_id == lag} == {"f11"}
     plan = _plan([_ers_stack()], mlt_name="srv-{id}")
-    assert {m.new_mlt_name for m in plan.moves if m.new_mlt_id == 402} == {"srv-402"}
+    lag = standard.mlt_id_for_new_lag("1/2")
+    assert {m.new_mlt_name for m in plan.moves if m.new_mlt_id == lag} == {f"srv-{lag}"}
 
 
 def test_uplinks_and_unused_ports_do_not_move_and_say_why():
@@ -76,7 +95,8 @@ def test_uplinks_and_unused_ports_do_not_move_and_say_why():
 
 def test_uncertain_ports_are_planned_but_flagged():
     move = _plan([_ers_stack()]).move_for("ers-1", "1/8")
-    assert move is not None and "uncertain" in move.note
+    assert move is not None
+    assert "uncertain" in move.note
 
 
 def test_an_old_smlt_across_a_vist_pair_is_one_attachment():
@@ -98,7 +118,8 @@ def test_a_full_pair_overflows_into_the_next_and_then_reports():
     plan = _plan([_ers_stack()], switches=["a1", "a2", "b1", "b2"], layout=small)
     used = {m.new_switch for m in plan.moves}
     assert used == {"a1", "a2", "b1", "b2"}
-    assert plan.overflow and any("did not fit" in p for p in plan.problems)
+    assert plan.overflow
+    assert any("did not fit" in p for p in plan.problems)
     for fill in plan.fill:
         assert fill.free >= 0
 
@@ -136,10 +157,11 @@ def test_an_unpaired_new_switch_is_named():
 
 
 def test_conventions_copied_from_port_preparer():
-    assert standard.mlt_id_for_new_lag("1/10") == 410
+    assert standard.mlt_id_for_new_lag("1/10") == standard.MLT_NEW_BASE + 10
     assert standard.mlt_name_for_new_lag("1/10") == "f110"
-    assert standard.lacp_key_for(410) == 410
-    assert standard.isid_for_new_service(695, standard.Environment.PROD) == 2500695
+    mlt_id = standard.mlt_id_for_new_lag("1/10")
+    assert standard.lacp_key_for(mlt_id) == mlt_id
+    assert standard.isid_for_new_service(695, standard.Environment.PROD) == PROD_ISID_695
     assert standard.classify_isid(2510695).note.startswith("legacy variant")
     with pytest.raises(standard.ConventionError):
         standard.isid_for_new_service(31, standard.Environment.PROD)
@@ -150,12 +172,6 @@ def test_conventions_copied_from_port_preparer():
 # --------------------------------------------------------------------------
 # through the command line, on the fixture captures
 # --------------------------------------------------------------------------
-
-import csv
-import shutil
-from pathlib import Path
-
-from switch_migrator import cabling_sheet, cli, verify
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -187,13 +203,16 @@ def test_plan_prefills_the_cabling_sheet(tmp_path):
     srv = rows[("old-voss", "2/1/1")]            # MLT 10, one link: a plain port
     # single-homed: from the top of the 48 access ports, never the 4 uplinks
     assert srv["NEW switch"] in ("leaf-a", "leaf-b")
-    assert 40 <= int(srv["NEW port"].split("/")[1]) <= 48
-    assert "single-homed" in srv["Plan note"] and "one link" in srv["Plan note"]
+    top_of_access = range(40, 48 + 1)
+    assert int(srv["NEW port"].split("/")[1]) in top_of_access
+    assert "single-homed" in srv["Plan note"]
+    assert "one link" in srv["Plan note"]
     singles = [r for r in rows.values() if "single-homed" in r["Plan note"]]
     per_switch = [sum(r["NEW switch"] == s for r in singles) for s in ("leaf-a", "leaf-b")]
     assert abs(per_switch[0] - per_switch[1]) <= 1                # balanced (R4)
     uplink = rows[("old-ers", "49")]
-    assert uplink["NEW port"] == "" and uplink["Plan note"].startswith("not planned: uplink")
+    assert uplink["NEW port"] == ""
+    assert uplink["Plan note"].startswith("not planned: uplink")
     assert {r["New switch"] for r in _rows(csvs, "plan.csv")} == {"leaf-a", "leaf-b"}
     assert _rows(csvs, "not_moved.csv")
 
@@ -221,10 +240,11 @@ def test_plan_needs_the_layout_and_the_new_switches(tmp_path):
     config.write_text("{}\n")
     base = ["-c", str(config), "-s", "x:ers", "--no-fabric", "--plan",
             "-o", str(tmp_path / "out")]
-    assert cli.main([*base, "--new-switch", "a,b"]) == 2          # no layout
-    assert cli.main([*base, "--new-ports", "52", "--new-uplinks", "4"]) == 2  # no switches
+    assert cli.main([*base, "--new-switch", "a,b"]) == CONFIG_ERROR          # no layout
+    assert cli.main([*base, "--new-ports", "52",
+                     "--new-uplinks", "4"]) == CONFIG_ERROR  # no switches
     assert cli.main([*base, "--new-switch", "a,b", "--new-ports", "4",
-                     "--new-uplinks", "4"]) == 2                 # nothing left to plan
+                     "--new-uplinks", "4"]) == CONFIG_ERROR      # nothing left to plan
 
 
 def test_a_planned_row_is_pending_until_done_is_ticked():
@@ -244,15 +264,11 @@ def test_a_planned_row_is_pending_until_done_is_ticked():
 
 
 def test_the_menu_plans_with_the_layout_it_asks_for(tmp_path):
-    from rich.console import Console
 
-    from switch_migrator import menu
-    from switch_migrator.config import Credentials, SwitchTarget, load_config
-    from switch_migrator.models import Platform
 
     class Scripted(Console):
         def __init__(self, answers):
-            super().__init__(file=open("/dev/null", "w"))
+            super().__init__(file=io.StringIO())
             self.answers = list(answers)
 
         def input(self, prompt="", **kw):
@@ -267,25 +283,22 @@ def test_the_menu_plans_with_the_layout_it_asks_for(tmp_path):
     s = menu.Session(config_path=config, cfg=load_config(config, require_fabric=False),
                      output_dir=tmp_path / "out", offline_dir=raw)
     s.all_targets = s.selected = [SwitchTarget("old-ers", "old-ers", Platform.ERS)]
-    creds = lambda s, c: (Credentials("o", "o"), Credentials("o", "o"))  # noqa: E731
+    def creds(s, c):
+        return Credentials("o", "o"), Credentials("o", "o")
     menu.action_collect(s, Scripted(["n", "y", "n"]), creds)
     # new switches, plan? yes, 28 ports, 4 uplinks, no pins
     menu.action_sheets(s, Scripted(["leaf-a,leaf-b", "y", "28", "4", ""]))
-    from openpyxl import load_workbook
     wb = load_workbook(next((tmp_path / "out").glob("migration-sheets-*.xlsx")))
     assert {"Plan", "Not moved", "Plan notes"} <= set(wb.sheetnames)
     sheet = wb["Cabling"]
     header = [c.value for c in sheet[1]]
     ports = {r[header.index("NEW port")] for r in sheet.iter_rows(min_row=2, values_only=True)}
-    assert "1/24" in ports and s.cfg.plan.ports == 28
+    assert "1/24" in ports
+    assert s.cfg.plan.ports == MENU_PORTS
 
 
 def test_a_planned_workbook_reads_back_only_its_cabling_rows(tmp_path):
     """'Not moved' and 'Verification' name old ports too; only Cabling counts."""
-    from switch_migrator.report.excel import write_excel
-    from switch_migrator.report.migration import (
-        assign_port_uids, build_cabling, build_plan_tables)
-    from switch_migrator.report.migration_tables import build_verification
 
     audit = _ers_stack()
     assign_port_uids([audit])
@@ -298,3 +311,20 @@ def test_a_planned_workbook_reads_back_only_its_cabling_rows(tmp_path):
     keys = [(r.old_switch, r.old_port) for r in sheet.rows]
     assert len(keys) == len(set(keys))
     assert sheet.sheets_read == ["Cabling"]
+
+
+def test_port_ids_from_the_pinned_sheet_survive_a_new_switch():
+    """Council review: a switch added to the inventory shifted every later
+    Port ID, including IDs already on a printed rack sheet."""
+
+    first = _ers_stack()
+    assign_port_uids([first])
+    printed = {("ers-1", p.port): p.uid for p in first.ports}
+
+    earlier = SwitchAudit("aaa-new", "aaa-new", Platform.ERS, reachable=True,
+                          ports=[_port("1/1"), _port("1/2")])     # sorts first
+    again = _ers_stack()
+    assign_port_uids([earlier, again], keep=printed)
+    assert {("ers-1", p.port): p.uid for p in again.ports} == printed
+    top = max(int(uid[1:]) for uid in printed.values())
+    assert [p.uid for p in earlier.ports] == [f"P{top + 1:04d}", f"P{top + 2:04d}"]

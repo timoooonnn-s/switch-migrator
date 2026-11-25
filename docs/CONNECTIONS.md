@@ -30,7 +30,7 @@ Two words are used precisely throughout:
 | `switch_migrator/connection.py` | **The whole connection layer.** Runner interface, the live SSH runner, the offline and dry-run runners, legacy-algorithm enablement, the ERS login handler, error detection, retry and circuit breaker. |
 | `switch_migrator/config.py` | `SshSettings` (every tunable), `Credentials`, `Platform` parsing from YAML/CLI (`_make_target`), credential resolution (`get_credentials`). |
 | `switch_migrator/models.py` | `Platform` enum; `SwitchAudit.reachable/errors/warnings` — where connection outcomes land. |
-| `switch_migrator/cli.py` | `make_runner()` (which runner for this run), `audit_one_switch()` (per-device isolation), `run_collection()` (parallelism), `collect_fabric()` (DvR sessions). |
+| `switch_migrator/workflow/collect.py` | `make_runner()` (which runner for this run), `collect_one_switch()` (per-device isolation), `run_collection()` (parallelism), `collect_fabric()` (DvR sessions), `collect()` (both at once). The CLI and the menu both call these; neither opens a session itself. |
 | `switch_migrator/collectors/switch.py` | Platform dispatch for *which commands* get sent, plus fallback chains. |
 | `switch_migrator/collectors/dvr.py` | DvR controller command set (always VOSS). |
 | `switch_migrator/parsers/{voss,ers}_parsers.py`, `parsers/common.py` | Per-platform and shared output parsing. |
@@ -82,7 +82,7 @@ different answer, so `run()` deliberately does not.
 
 ## 3. The three runners, and which one runs
 
-`make_runner()` (`cli.py:219`) picks in this order:
+`make_runner()` (`workflow/collect.py`) picks in this order:
 
 ```python
 if args.dry_run:  return DryRunRunner(name, platform)   # connects to nothing
@@ -134,8 +134,8 @@ of these branch points.
 | 7 | `collectors/switch.py:389` in `_enrich()` | LLDP command **order**: VOSS tries `summary` first, ERS tries the block form first | each platform's native form first; the other is a fallback |
 | 8 | `parsers/` | `voss_parsers` vs `ers_parsers`, shared helpers in `common.py` | different table layouts |
 | 9 | `compare.py:74`, `compare.py:129` | VOSS-only local VLAN↔I-SID binding logic; `LOCAL_ONLY` verdict is VOSS-only | ERS has no I-SID concept, so absence from the fabric *is* the finding |
-| 10 | `report/migration.py:205`, `cli.py:407` | VOSS config is filtered/neutralized; ERS config is translated to a VOSS flex-UNI draft | migration direction is ERS/VOSS → VOSS |
-| 11 | `cli.py:368,447`, `menu.py:691` | DvR controllers and post-migration verification targets are **hardcoded** `Platform.VOSS` | DvR controllers are always Fabric Engine; new switches are assumed VOSS (override with `-s`) |
+| 10 | `report/migration.py`, `workflow/outputs.py` | VOSS config is filtered/neutralized; ERS config is translated to a VOSS flex-UNI draft | migration direction is ERS/VOSS → VOSS |
+| 11 | `workflow/collect.py` (`collect_fabric`), `cli.py` (`_targets_from_sheet`), `menu.py` (`action_verify`) | DvR controllers and post-migration verification targets are **hardcoded** `Platform.VOSS` | DvR controllers are always Fabric Engine; new switches are assumed VOSS (override with `-s`) |
 
 **Two `else`-shaped traps.** Branch 4 and branch 5 are written as "VOSS or
 everything else". A third platform added to the enum would therefore be
@@ -357,7 +357,7 @@ captured rejection replays as a rejection.
 ### Phase 5 — close
 
 `close()` calls `disconnect()` inside a bare `except` — teardown is
-best-effort and must never mask the real result. `audit_one_switch()` closes in
+best-effort and must never mask the real result. `collect_one_switch()` closes in
 a `finally`, and in an outer `finally` copies `runner.command_log` into the
 manifest sink and reports to the progress display. So the command log survives
 even a crashed collection.
@@ -695,7 +695,7 @@ collector test in `tests/` already does.
 switch-migrator -s old-access-07:ers:10.1.1.17 --debug
 ```
 `--debug` lowers the stderr handler to DEBUG and stops silencing the `paramiko`
-and `netmiko` loggers (`setup_logging`, `cli.py:201`).
+and `netmiko` loggers (`setup_logging` in `cli.py`).
 
 ---
 
@@ -776,7 +776,7 @@ Each of these exists because of a real failure, and most are pinned by a test.
    — the password is a write.
 8. **Never put a device banner in the report.** Log it; put a one-line
    actionable hint in the error.
-9. **One dead device must never abort the run.** `audit_one_switch` catches
+9. **One dead device must never abort the run.** `collect_one_switch` catches
    `ConnectionFailed`, then bare `Exception`, then wraps collection in another
    bare `Exception` handler, and closes in `finally`.
 10. **Parsers anchor on tokens, never on column offsets** (the one deliberate

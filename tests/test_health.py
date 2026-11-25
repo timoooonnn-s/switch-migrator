@@ -1,5 +1,7 @@
 """Pre-migration health check: is this switch fit to be migrated tonight?"""
 
+import inspect
+
 from switch_migrator import health, usage
 from switch_migrator.models import (
     CompStatus,
@@ -9,12 +11,13 @@ from switch_migrator.models import (
     PortState,
     SwitchAudit,
     VlanComparison,
+    VlanInfo,
 )
 
 
 def _audit(**kw) -> SwitchAudit:
-    base = dict(name="gx-01", host="gx-01", platform=Platform.VOSS,
-                reachable=True)
+    base = {"name": "gx-01", "host": "gx-01", "platform": Platform.VOSS,
+                "reachable": True}
     base.update(kw)
     audit = SwitchAudit(**base)
     if not audit.ports:
@@ -25,7 +28,6 @@ def _audit(**kw) -> SwitchAudit:
             PortState(port="1/2", admin_up=True, oper_up=True),
         ]
     if not audit.vlans:
-        from switch_migrator.models import VlanInfo
         audit.vlans = [VlanInfo(vlan_id=100, name="users")]
     return audit
 
@@ -50,7 +52,8 @@ def test_a_degraded_mlt_blocks_the_migration():
     report = health.check([a])
     finding = _findings(report, "MLT 35")[0]
     assert finding.verdict == health.BLOCK
-    assert "1/2" in finding.detail and "degraded" in finding.detail
+    assert "1/2" in finding.detail
+    assert "degraded" in finding.detail
     assert "no redundancy left" in finding.action
     assert report.verdict == health.BLOCK
 
@@ -109,7 +112,8 @@ def test_losing_uplink_redundancy_blocks():
         PortState(port="1/2", oper_up=False, is_uplink=True),
     ])
     finding = _findings(health.check([a]), "uplinks")[0]
-    assert finding.verdict == health.BLOCK and "1 of 2" in finding.detail
+    assert finding.verdict == health.BLOCK
+    assert "1 of 2" in finding.detail
 
 
 def test_no_uplink_at_all_blocks():
@@ -172,7 +176,8 @@ def test_vlans_with_nowhere_to_land_block():
     ]
     finding = _findings(health.check([a], {"gx-01": comps}), "VLAN vs fabric")[0]
     assert finding.verdict == health.BLOCK
-    assert "695, 696" in finding.detail and "2 VLAN(s)" in finding.detail
+    assert "695, 696" in finding.detail
+    assert "2 VLAN(s)" in finding.detail
 
 
 def test_local_only_vlans_are_not_a_blocker():
@@ -218,7 +223,6 @@ def test_findings_are_sorted_worst_first():
 def test_the_check_sends_no_commands():
     """It is derived from collected state only - there is no runner to send
     anything with, and that is the guarantee."""
-    import inspect
     source = inspect.getsource(health)
     assert "runner" not in source.lower()
     assert "show " not in source

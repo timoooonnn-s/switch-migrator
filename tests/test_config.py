@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from switch_migrator.config import ConfigError, load_config, load_inventory
+from switch_migrator.config import ConfigError, default_inventory, load_config, load_inventory
 
 MINIMAL = """
 dvr_controllers:
@@ -53,14 +53,14 @@ def test_no_fabric_makes_dvr_and_conventions_optional(tmp_path: Path):
     # ...but --no-fabric mode does not
     cfg = load_config(path, require_fabric=False)
     assert cfg.dvr_controllers == []
-    assert cfg.isid_offsets == [] and cfg.isid_explicit == {}
+    assert cfg.isid_offsets == []
+    assert cfg.isid_explicit == {}
     assert cfg.excluded_vlan_names == ["quarant*"]
 
 
 # ------------------- default inventory / commands / console server ----------
 
 def test_config_inventory_key_is_relative_to_the_config_file(tmp_path):
-    from switch_migrator.config import default_inventory
     cfg_dir = tmp_path / "deploy"
     cfg_dir.mkdir()
     cfg_path = cfg_dir / "config.yaml"
@@ -71,7 +71,6 @@ def test_config_inventory_key_is_relative_to_the_config_file(tmp_path):
 
 
 def test_default_inventory_falls_back_to_switches_yaml(tmp_path, monkeypatch):
-    from switch_migrator.config import default_inventory
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text("excluded_vlans: [1]\n")
     cfg = load_config(cfg_path, require_fabric=False)

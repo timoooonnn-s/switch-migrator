@@ -1,14 +1,19 @@
 """VOSS -> VOSS running-config extraction (slice 1)."""
 
+import shutil
 from pathlib import Path
 
+from switch_migrator.cli import main
 from switch_migrator.config_extract import (
+    _norm,
     extract_voss_config,
     split_sections,
-    _norm,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+FIXTURE_ZTP_OWNED = 3     # lines of the VOSS fixture's config that ZTP owns
 
 
 def _cfg() -> str:
@@ -44,7 +49,7 @@ def test_extract_drops_all_secrets_and_identity():
     res = extract_voss_config(_cfg(), device_name="old-leaf-01")
     # check the kept config BODY (everything after the comment header) - concrete
     # config lines/values, so the header's own explanatory text can't false-match
-    body = "\n".join(l for l in res.text.splitlines() if not l.startswith("#"))
+    body = "\n".join(line for line in res.text.splitlines() if not line.startswith("#"))
     for leak in ("supersecret", "secretuser", "f.30.42", "00bb.0000.0000",
                  'prompt "leaf-01"', "password hash sha1", "boot config flags",
                  "snmp-server", "radius server host"):
@@ -62,12 +67,12 @@ def test_uplink_ports_are_annotated_access_ports_are_not():
     res = extract_voss_config(_cfg())
     lines = res.text.splitlines()
     # the IS-IS uplink 2/1 gets a REVIEW line immediately before its block
-    idx = next(i for i, l in enumerate(lines)
-               if l.strip() == "interface GigabitEthernet 2/1")
+    idx = next(i for i, line in enumerate(lines)
+               if line.strip() == "interface GigabitEthernet 2/1")
     assert "[REVIEW] fabric uplink" in lines[idx - 1]
     # the access port 1/4 (flex-uni, no isis) is NOT annotated
-    access = [i for i, l in enumerate(lines)
-              if l.strip() == "interface GigabitEthernet 1/4"]
+    access = [i for i, line in enumerate(lines)
+              if line.strip() == "interface GigabitEthernet 1/4"]
     for i in access:
         assert "[REVIEW]" not in lines[i - 1]
 
@@ -85,8 +90,7 @@ def test_header_lists_omitted_sections_with_content():
 
 def test_cli_extract_config_end_to_end(tmp_path):
     # --extract-config in --no-fabric offline mode writes a per-switch .cfg
-    import shutil
-    from switch_migrator.cli import main
+
     raw = tmp_path / "raw"
     shutil.copytree(FIXTURES / "voss", raw / "leaf-01")
     (tmp_path / "config.yaml").write_text("{}\n")
@@ -102,3 +106,20 @@ def test_cli_extract_config_end_to_end(tmp_path):
     assert "i-sid 2500695 elan" in text                 # kept service config
     assert "[REVIEW] fabric uplink" in text             # uplink annotated
     assert "supersecret" not in text                    # secret dropped
+
+
+def test_what_ztp_owns_is_left_out_and_named():
+    """Council review FA1: the B-VLANs exist on a ZTP'd switch already, and
+    taking VLAN 1 off '1/1-1/48,2/1-2/6' names the OLD chassis's ports."""
+
+
+    text = (Path(__file__).parent / "fixtures" / "voss" / "show_running_config.txt"
+            ).read_text()
+    res = extract_voss_config(text, device_name="old-agg-01")
+    body = [line for line in res.text.splitlines() if not line.startswith("#")]
+    assert not any("spbm-bvlan" in line or line.startswith("vlan members remove 1 ")
+                   for line in body)
+    assert len(res.ztp_owned) == FIXTURE_ZTP_OWNED
+    assert "#   - vlan create 4051 name \"BVLAN-1\" type spbm-bvlan" in res.text
+    assert "Port numbers are the OLD switch's" in res.text
+

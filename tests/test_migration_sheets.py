@@ -1,11 +1,14 @@
 """Migration-day deliverables: port info sheet, cabling sheet, commands."""
 
+import io
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from switch_migrator.collectors.switch import collect_switch
+from switch_migrator.collectors.switch import Reads, collect_switch
 from switch_migrator.config import Config, SshSettings, SwitchTarget
 from switch_migrator.connection import OfflineRunner
 from switch_migrator.models import (
@@ -15,14 +18,16 @@ from switch_migrator.models import (
     SwitchAudit,
     VlanBinding,
 )
-from switch_migrator.parsers.common import normalize_mac, parse_mac_table
-from switch_migrator.parsers.voss_parsers import parse_mlt_lacp
+from switch_migrator.parsers.common import normalize_mac, parse_mac_table, port_sort_key
+from switch_migrator.parsers.voss_parsers import parse_mlt, parse_mlt_lacp
+from switch_migrator.report import console as console_report
 from switch_migrator.report.migration import (
     assign_port_uids,
     build_cabling,
     build_commands,
     build_port_info,
 )
+from switch_migrator.report.tables import Table
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -59,6 +64,11 @@ Number of addresses: 1655
 
 # --------------------------- parsers ---------------------------------------
 
+ACCESS_VLAN = 695         # the untagged VLAN the fixtures put on access ports
+FIXTURE_MLT_ID = 35       # the old aggregation's MLT 35 (1/1,1/2,1/23,1/24)
+MLT_35_VLANS = 34         # VLANs MLT 35 carries in the prod capture
+
+
 def test_normalize_mac_forms():
     assert normalize_mac("00:11:22:33:44:55") == "00:11:22:33:44:55"
     assert normalize_mac("0011.2233.4455") == "00:11:22:33:44:55"
@@ -69,7 +79,7 @@ def test_parse_mac_table_voss_port_prefix_and_mlt():
     t = parse_mac_table(VOSS_MACS)
     # 'Port-1/7' must be attributed to port 1/7, not dropped
     assert [m for m, _ in t["1/7"]] == ["00:11:22:00:00:01", "00:11:22:00:00:02"]
-    assert t["1/7"][0][1] == 695                      # VLAN column picked up
+    assert t["1/7"][0][1] == ACCESS_VLAN                      # VLAN column picked up
     assert [m for m, _ in t["name:MLT035.s.1/2/23/24"]] == ["00:11:22:00:00:04"]
     # the footer line carries no MAC and must not create an entry
     assert all(not k.startswith("2 ") for k in t)
@@ -121,7 +131,7 @@ def test_port_info_lists_every_port_with_migration_columns():
     a = _audit_with_ports()
     assign_port_uids([a])
     t = build_port_info([a])
-    assert len(t.rows) == 3                       # ALL ports, incl. the down one
+    assert len(t.rows) == len(a.ports)            # ALL ports, incl. the down one
     hdr = t.headers
     row = t.rows[0]
     assert row[hdr.index("Port ID")] == "P0001"
@@ -142,12 +152,12 @@ def test_cabling_sheet_only_connected_ports_with_blank_new_columns():
     assign_port_uids([a])
     t = build_cabling([a])
     # 1/2 is down with no neighbor/MAC -> not something to re-patch
-    assert len(t.rows) == 2
+    assert len(t.rows) == len(a.ports) - 1
     hdr = t.headers
     first = t.rows[0]
     # the leading column is the port's UNTAGGED VLAN, not whichever VLAN
     # happened to sort first - on a trunk that number meant nothing
-    assert first[hdr.index("Untagged VLAN")] == 695
+    assert first[hdr.index("Untagged VLAN")] == ACCESS_VLAN
     assert first[hdr.index("VLAN -> I-SID")] == "695->2500695 (u)"
     assert first[hdr.index("Rack (old)")] == ""        # filled in by hand
     assert first[hdr.index("Type")] == "access"
@@ -176,7 +186,8 @@ def test_commands_reference_new_switch_and_expected_macs():
     text = build_commands([a], new_switch="new-01")
     assert "new-01" in text
     assert "show interfaces gigabitEthernet fdb-entry <NEW-PORT>" in text
-    assert "P0001" in text and "00:11:22:00:00:01" in text
+    assert "P0001" in text
+    assert "00:11:22:00:00:01" in text
     assert "was old-01 1/1" in text
 
 
@@ -193,7 +204,7 @@ def test_collector_attributes_macs_and_lacp_from_real_capture(tmp_path):
     # MAC/optic collection is opt-in (pull_macs) so plain audits stay fast
     audit = collect_switch(
         SwitchTarget("gx-11-s72-p1", "gx-11-s72-p1", Platform.VOSS),
-        OfflineRunner("gx-11-s72-p1", tmp_path), cfg, pull_macs=True)
+        OfflineRunner("gx-11-s72-p1", tmp_path), cfg, Reads(macs=True))
     by_port = {p.port: p for p in audit.ports}
     # port MACs land on the right port ('Port-1/7')
     assert by_port["1/7"].macs == ["00:11:22:00:00:01", "00:11:22:00:00:02"]
@@ -219,7 +230,7 @@ def test_macs_not_collected_unless_requested(tmp_path):
     by_port = {p.port: p for p in audit.ports}
     assert by_port["1/7"].macs == []
     # the free derivations are still there
-    assert by_port["1/1"].mlt_id == 35
+    assert by_port["1/1"].mlt_id == FIXTURE_MLT_ID
     assert by_port["1/1"].lacp is False
 
 
@@ -241,7 +252,7 @@ def test_fdb_per_port_fallback_when_bare_form_rejected(tmp_path):
     cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
                  isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
     audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
-                           OfflineRunner("sw", tmp_path), cfg, pull_macs=True)
+                           OfflineRunner("sw", tmp_path), cfg, Reads(macs=True))
     by_port = {p.port: p for p in audit.ports}
     assert by_port["1/7"].macs == ["00:11:22:00:00:aa"]
     assert by_port["1/10"].macs == ["00:11:22:00:00:bb"]
@@ -250,7 +261,6 @@ def test_fdb_per_port_fallback_when_bare_form_rejected(tmp_path):
 
 
 def test_mlt_vlans_parsed_from_show_mlt_incl_continuation(fixture):
-    from switch_migrator.parsers.voss_parsers import parse_mlt
     # the VLAN IDS column of the Mlt Info table, incl. lines that wrap
     mlts = {m.mlt_id: m for m in parse_mlt(
         "38  6181  s129  trunk  smlt  smlt  1/29   174 695 735\n"
@@ -267,7 +277,7 @@ def test_cabling_sheet_carries_mlt_and_port_vlans(tmp_path):
     cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
                  isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
     audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
-                           OfflineRunner("sw", tmp_path), cfg, pull_macs=True)
+                           OfflineRunner("sw", tmp_path), cfg, Reads(macs=True))
     assign_port_uids([audit])
     t = build_cabling([audit])
     hdr = t.headers
@@ -276,10 +286,11 @@ def test_cabling_sheet_carries_mlt_and_port_vlans(tmp_path):
         assert col in hdr, col
     # 1/1 is a member of MLT 35, which carries 34 VLANs on this box
     row = next(r for r in t.rows if r[hdr.index("Old port")] == "1/1")
-    assert row[hdr.index("MLT ID")] == 35
+    assert row[hdr.index("MLT ID")] == FIXTURE_MLT_ID
     assert row[hdr.index("MLT name")] == "MLT035.s.1/2/23/24"
     mlt_vlans = row[hdr.index("MLT VLANs")].split(",")
-    assert "174" in mlt_vlans and len(mlt_vlans) == 34
+    assert "174" in mlt_vlans
+    assert len(mlt_vlans) == MLT_35_VLANS
     assert row[hdr.index("MLT I-SIDs")]          # mapped through the VLAN table
     # a row with no MLT leaves those cells blank rather than inventing data
     non_mlt = [r for r in t.rows if r[hdr.index("MLT ID")] == ""]
@@ -290,7 +301,6 @@ def test_real_optics_columns_drop_the_ddm_flag():
     # real 'show pluggable-optical-modules basic':
     #   PORT NUM | TYPE | DDM SUPPORTED | VENDOR NAME | PART NUMBER | SKU
     # the TRUE/FALSE DDM flag must not end up in the transceiver text
-    import shutil, tempfile
     tmp = Path(tempfile.mkdtemp())
     dev = tmp / "sw"
     shutil.copytree(FIXTURES / "voss_prod" / "gx-11-s72-p1-priv", dev)
@@ -302,7 +312,7 @@ def test_real_optics_columns_drop_the_ddm_flag():
     cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
                  isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
     audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
-                           OfflineRunner("sw", tmp), cfg, pull_macs=True)
+                           OfflineRunner("sw", tmp), cfg, Reads(macs=True))
     t = {p.port: p.transceiver for p in audit.ports}
     assert t["1/7"] == "10GbSR Extreme 10301"
     assert "TRUE" not in t["1/7"]
@@ -317,13 +327,14 @@ def test_fdb_mlt_name_fans_out_to_member_ports(tmp_path):
     cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
                  isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
     audit = collect_switch(SwitchTarget("sw", "sw", Platform.VOSS),
-                           OfflineRunner("sw", tmp_path), cfg, pull_macs=True)
+                           OfflineRunner("sw", tmp_path), cfg, Reads(macs=True))
     by_port = {p.port: p for p in audit.ports}
     # MLT035 members are 1/1,1/2,1/23,1/24 - all get the MLT-learned MAC
     for member in ("1/1", "1/2", "1/23", "1/24"):
         assert "00:11:22:00:00:04" in by_port[member].macs, member
     # and nothing was filed under the VLAN id as if it were a port
-    assert "31" not in by_port and "174" not in by_port
+    assert "31" not in by_port
+    assert "174" not in by_port
 
 
 def test_cabling_sheet_has_new_mlt_placeholders():
@@ -339,10 +350,8 @@ def test_cabling_sheet_has_new_mlt_placeholders():
 def test_per_location_cabling_sheets_stay_out_of_the_console():
     """--split-by-location titles the sheets 'Cabling <group>'; without -v the
     21-column fill-in sheets must not be dumped to the terminal."""
-    import io
-    from rich.console import Console
-    from switch_migrator.report import console as console_report
-    from switch_migrator.report.tables import Table
+
+
 
     t = Table("Cabling Frankfurt", ["A"])
     t.add(["x"])
@@ -355,10 +364,6 @@ def test_per_location_cabling_sheets_stay_out_of_the_console():
 
 
 def test_ports_are_in_faceplate_order_not_text_order():
-    from switch_migrator.models import PortState, SwitchAudit
-    from switch_migrator.parsers.common import port_sort_key
-    from switch_migrator.report.migration import (
-        assign_port_uids, build_cabling, build_port_info)
 
     assert sorted(["1/10", "1/2", "2/1", "1/1/2", "1/1"], key=port_sort_key) == \
         ["1/1", "1/1/2", "1/2", "1/10", "2/1"]
@@ -375,13 +380,12 @@ def test_ports_are_in_faceplate_order_not_text_order():
         assert [row[column] for row in table.rows] == ["1/1", "1/2", "1/10"]
 
 
-@pytest.mark.parametrize("platform, fixture, port, name", [
+@pytest.mark.parametrize(("platform", "fixture", "port", "name"), [
     (Platform.ERS, "ers", "49", "uplink-a"),
     (Platform.VOSS, "voss", "1/1", "core-s74-w5"),
 ])
 def test_the_configured_port_name_reaches_the_sheets(tmp_path, platform, fixture,
                                                      port, name):
-    from switch_migrator.report.migration import build_cabling, build_port_info
 
     shutil.copytree(FIXTURES / fixture, tmp_path / "sw")
     if platform is Platform.VOSS:
@@ -393,7 +397,7 @@ def test_the_configured_port_name_reaches_the_sheets(tmp_path, platform, fixture
     cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
                  isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
     audit = collect_switch(SwitchTarget("sw", "sw", platform),
-                           OfflineRunner("sw", tmp_path), cfg, pull_config=True)
+                           OfflineRunner("sw", tmp_path), cfg, Reads(config=True))
     assert {p.port: p.name for p in audit.ports}.get(port) == name
     info = build_port_info([audit])
     row = next(r for r in info.rows if r[info.headers.index("Port")] == port)

@@ -33,8 +33,17 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from switch_migrator import standard, usage
+from switch_migrator.cabling_sheet import CablingRow
 from switch_migrator.models import Platform, PortState, SwitchAudit
-from switch_migrator.parsers.common import port_sort_key
+from switch_migrator.parsers.common import SLOT_PORT_PARTS, port_sort_key
+
+# two new peers; two sides of an aggregation
+PAIR = 2
+
+# (old switch, old port): one port anywhere in the scope
+PortKey = tuple[str, str]
+# what a human fixed in the sheet: (new switch, new port, new MLT id, new MLT name)
+Pins = dict[PortKey, tuple[str, str, "int | None", str]]
 
 DUAL = "dual-homed"
 SINGLE = "single-homed"
@@ -65,7 +74,7 @@ class Layout:
     def number(self, port: str) -> int | None:
         """The port number of `port` on this layout's slot, or None."""
         parts = port.strip().split("/")
-        if len(parts) == 2 and parts[0] == str(self.slot) and parts[1].isdigit():
+        if len(parts) == SLOT_PORT_PARTS and parts[0] == str(self.slot) and parts[1].isdigit():
             return int(parts[1])
         return None
 
@@ -101,8 +110,8 @@ class Attachment:
         return [link for side in self.sides for link in side]
 
     @property
-    def order(self) -> tuple:
-        first = min(self.links, key=lambda l: (l.old_switch, port_sort_key(l.old_port)))
+    def order(self) -> tuple[str, tuple[int, tuple[int, ...], str]]:
+        first = min(self.links, key=lambda link: (link.old_switch, port_sort_key(link.old_port)))
         return (first.old_switch, port_sort_key(first.old_port))
 
 
@@ -223,9 +232,9 @@ def _unit(platform: Platform, port: str) -> str:
 def _split(links: list[Link]) -> list[list[Link]]:
     """Two sides for the two new peers. Links that already sat on two different
     units (an ERS distributed MLT) keep that split; otherwise they alternate."""
-    links = sorted(links, key=lambda l: port_sort_key(l.old_port))
-    units = sorted({l.unit for l in links}, key=port_sort_key)
-    if len(units) >= 2:
+    links = sorted(links, key=lambda link: port_sort_key(link.old_port))
+    units = sorted({link.unit for link in links}, key=port_sort_key)
+    if len(units) >= PAIR:
         sides: list[list[Link]] = [[], []]
         for link in links:
             sides[units.index(link.unit) % 2].append(link)
@@ -233,75 +242,86 @@ def _split(links: list[Link]) -> list[list[Link]]:
     return [links[0::2], links[1::2]]
 
 
+@dataclass
+class _Scan:
+    """What a pass over the old ports found."""
+    out: list[Attachment] = field(default_factory=list)
+    not_moved: list[NotMoved] = field(default_factory=list)
+    lags: dict[tuple[str, int], list[Link]] = field(default_factory=dict)
+    smlt: dict[tuple[str, int], bool] = field(default_factory=dict)
+
+
 def attachments(audits: list[SwitchAudit]) -> tuple[list[Attachment], list[NotMoved], list[str]]:
     """Every old link that moves, grouped into attachments; what does not move and
     why; and hints a human should look at."""
-    out: list[Attachment] = []
-    not_moved: list[NotMoved] = []
-    hints: list[str] = []
-    peers = old_peers(audits)
-    by_name = {a.name: a for a in audits}
-    lags: dict[tuple[str, int], list[Link]] = {}
-    smlt_ids: dict[tuple[str, int], bool] = {}
-
+    scan = _Scan()
     for audit in sorted(audits, key=lambda a: a.name):
-        if not audit.reachable:
-            continue
-        mlts = {m.mlt_id: m for m in audit.mlts}
-        for p in sorted(audit.ports, key=lambda x: port_sort_key(x.port)):
-            mlt = mlts.get(p.mlt_id) if p.mlt_id is not None else None
-            link = _link(audit, p)
-            if mlt is not None and mlt.is_ist:
-                not_moved.append(NotMoved(link, "vIST/IST peer link - the new pair has its own"))
-                continue
-            if p.is_uplink or (mlt is not None and mlt.is_uplink):
-                not_moved.append(NotMoved(link, "uplink to the core - the new switch has its own"))
-                continue
-            if not _connected(p):
-                if p.usage or p.oper_up is not None:
-                    not_moved.append(NotMoved(
-                        link, f"unused ({p.usage or 'down, nothing learned'}) - "
-                              f"check at the rack that nothing is plugged in"))
-                continue
-            if mlt is not None:
-                lags.setdefault((audit.name, mlt.mlt_id), []).append(link)
-                smlt_ids[(audit.name, mlt.mlt_id)] = "smlt" in (
-                    mlt.admin.lower(), mlt.current.lower())
-            else:
-                out.append(Attachment(SINGLE, [[link]]))
+        if audit.reachable:
+            _scan_audit(scan, audit)
+    _attach_lags(scan, old_peers(audits), {a.name for a in audits})
+    out = scan.out
+    hints = _teaming_hints([a for a in out if a.kind == SINGLE])
+    out.sort(key=lambda a: a.order)
+    return out, scan.not_moved, hints
 
+
+def _scan_audit(scan: _Scan, audit: SwitchAudit) -> None:
+    """Sort one old switch's ports: not moved, single, or a LAG member."""
+    mlts = {m.mlt_id: m for m in audit.mlts}
+    for p in sorted(audit.ports, key=lambda x: port_sort_key(x.port)):
+        mlt = mlts.get(p.mlt_id) if p.mlt_id is not None else None
+        link = _link(audit, p)
+        if mlt is not None and mlt.is_ist:
+            scan.not_moved.append(NotMoved(link, "vIST/IST peer link - the new pair has its own"))
+            continue
+        if p.is_uplink or (mlt is not None and mlt.is_uplink):
+            scan.not_moved.append(NotMoved(link, "uplink to the core - the new switch has its own"))
+            continue
+        if not _connected(p):
+            if p.usage or p.oper_up is not None:
+                scan.not_moved.append(NotMoved(
+                    link, f"unused ({p.usage or 'down, nothing learned'}) - "
+                          f"check at the rack that nothing is plugged in"))
+            continue
+        if mlt is not None:
+            scan.lags.setdefault((audit.name, mlt.mlt_id), []).append(link)
+            scan.smlt[(audit.name, mlt.mlt_id)] = "smlt" in (
+                mlt.admin.lower(), mlt.current.lower())
+        else:
+            scan.out.append(Attachment(SINGLE, [[link]]))
+
+
+def _attach_lags(scan: _Scan, peers: dict[str, str], in_run: set[str]) -> None:
+    """One attachment per old LAG; the two legs of an SMLT become one."""
+    lags = scan.lags
     done: set[tuple[str, int]] = set()
     for (switch, mlt_id), links in sorted(lags.items()):
         if (switch, mlt_id) in done:
             continue
         done.add((switch, mlt_id))
         peer = peers.get(switch)
-        if smlt_ids[(switch, mlt_id)] and peer and (peer, mlt_id) in lags:
+        smlt = scan.smlt[(switch, mlt_id)]
+        if smlt and peer and (peer, mlt_id) in lags:
             done.add((peer, mlt_id))
             first, second = sorted([switch, peer])
-            sides = [sorted(lags[(first, mlt_id)], key=lambda l: port_sort_key(l.old_port)),
-                     sorted(lags[(second, mlt_id)], key=lambda l: port_sort_key(l.old_port))]
-            out.append(Attachment(DUAL, sides, lag=True,
-                                  evidence=f"SMLT {mlt_id} on {first} + {second}"))
+            sides = [sorted(lags[(first, mlt_id)], key=lambda link: port_sort_key(link.old_port)),
+                     sorted(lags[(second, mlt_id)], key=lambda link: port_sort_key(link.old_port))]
+            scan.out.append(Attachment(DUAL, sides, lag=True,
+                                       evidence=f"SMLT {mlt_id} on {first} + {second}"))
             continue
         if len(links) == 1:
             link = links[0]
-            if smlt_ids[(switch, mlt_id)] and peer and peer not in by_name:
+            if smlt and peer and peer not in in_run:
                 link.flags.append(f"other SMLT leg is on {peer}, which is not in this run")
-            elif smlt_ids[(switch, mlt_id)] and not peer:
+            elif smlt and not peer:
                 link.flags.append(f"was SMLT {mlt_id}: the other leg's switch is not "
                                   f"in this run - planned as a plain port")
             else:
                 link.flags.append(f"was MLT {mlt_id} with one link - planned as a plain port")
-            out.append(Attachment(SINGLE, [[link]]))
+            scan.out.append(Attachment(SINGLE, [[link]]))
             continue
-        sides = _split(links)
-        out.append(Attachment(DUAL, sides, lag=True,
-                              evidence=f"MLT {mlt_id} on {switch}"))
-
-    hints += _teaming_hints([a for a in out if a.kind == SINGLE])
-    out.sort(key=lambda a: a.order)
-    return out, not_moved, hints
+        scan.out.append(Attachment(DUAL, _split(links), lag=True,
+                                   evidence=f"MLT {mlt_id} on {switch}"))
 
 
 def _teaming_hints(singles: list[Attachment]) -> list[str]:
@@ -315,9 +335,9 @@ def _teaming_hints(singles: list[Attachment]) -> list[str]:
             by_name.setdefault(link.neighbor, []).append(link)
     out = []
     for name, links in sorted(by_name.items()):
-        boxes = {(l.old_switch, l.unit) for l in links}
-        if len(links) == 2 and len(boxes) == 2:
-            where = " and ".join(f"{l.old_switch} {l.old_port}" for l in links)
+        boxes = {(link.old_switch, link.unit) for link in links}
+        if len(links) == PAIR and len(boxes) == PAIR:
+            where = " and ".join(f"{link.old_switch} {link.old_port}" for link in links)
             out.append(f"'{name}' is on {where}: if that is one server teamed across "
                        f"two switches, give both the same NEW port on the two peers "
                        f"in the sheet and plan again")
@@ -345,7 +365,7 @@ def _pairs(names: list[str]) -> list[tuple[str, str | None]]:
 
 def allocate(atts: list[Attachment], new_switches: list[str], layout: Layout,
              mlt_name: str = standard.DEFAULT_MLT_NAME,
-             pins: dict[tuple[str, str], tuple[str, str, int | None, str]] | None = None
+             pins: Pins | None = None
              ) -> MigrationPlan:
     """Place every attachment. `pins` is {(old switch, old port): (new switch,
     new port, new MLT id or None, new MLT name)} from a sheet a human edited."""
@@ -359,7 +379,7 @@ def allocate(atts: list[Attachment], new_switches: list[str], layout: Layout,
 
     remaining = _apply_pins(atts, pins, switches, layout, plan)
     for att in [a for a in remaining if a.kind == DUAL]:
-        _place_dual(att, switches, new_switches, layout, mlt_name, plan)
+        _place_dual(att, switches, new_switches, mlt_name, plan)
     singles = [a for a in remaining if a.kind == SINGLE]
     for att in singles:
         _place_single(att, switches, new_switches, plan)
@@ -373,18 +393,19 @@ def allocate(atts: list[Attachment], new_switches: list[str], layout: Layout,
     return plan
 
 
-def _apply_pins(atts, pins, switches, layout, plan) -> list[Attachment]:
+def _apply_pins(atts: list[Attachment], pins: Pins, switches: dict[str, _Switch],
+                layout: Layout, plan: MigrationPlan) -> list[Attachment]:
     remaining = []
     for att in atts:
-        pinned = [l for l in att.links if l.key in pins]
+        pinned = [link for link in att.links if link.key in pins]
         if not pinned:
             remaining.append(att)
             continue
         if len(pinned) < len(att.links):
-            loose = [l for l in att.links if l.key not in pins]
+            loose = [link for link in att.links if link.key not in pins]
             plan.problems.append(
-                f"{', '.join(f'{l.old_switch} {l.old_port}' for l in pinned)} "
-                f"pinned, but {', '.join(f'{l.old_switch} {l.old_port}' for l in loose)} "
+                f"{', '.join(f'{link.old_switch} {link.old_port}' for link in pinned)} "
+                f"pinned, but {', '.join(f'{link.old_switch} {link.old_port}' for link in loose)} "
                 f"of the same {att.evidence or 'attachment'} not - place those by hand")
             for link in loose:
                 plan.not_moved.append(NotMoved(link, "part of a partly pinned aggregation - "
@@ -408,7 +429,9 @@ def _apply_pins(atts, pins, switches, layout, plan) -> list[Attachment]:
     return remaining
 
 
-def _place_dual(att, switches, order, layout, mlt_name, plan) -> None:
+def _place_dual(att: Attachment, switches: dict[str, _Switch], order: list[str],
+                mlt_name: str, plan: MigrationPlan) -> None:
+    layout = plan.layout
     n = max(len(att.sides[0]), len(att.sides[1]))
     for a, b in _pairs(order):
         if b is None:
@@ -441,7 +464,8 @@ def _place_dual(att, switches, order, layout, mlt_name, plan) -> None:
                                              f"needed on both peers"))
 
 
-def _place_single(att, switches, order, plan) -> None:
+def _place_single(att: Attachment, switches: dict[str, _Switch], order: list[str],
+                  plan: MigrationPlan) -> None:
     link = att.links[0]
     for a, b in _pairs(order):
         # balance inside the pair: the switch with fewer single-homed links first
@@ -463,7 +487,7 @@ def _place_single(att, switches, order, plan) -> None:
 
 def make_plan(audits: list[SwitchAudit], new_switches: list[str], layout: Layout,
               mlt_name: str = standard.DEFAULT_MLT_NAME,
-              pins: dict | None = None) -> MigrationPlan:
+              pins: Pins | None = None) -> MigrationPlan:
     """The whole plan from the collected old switches."""
     if not new_switches:
         raise ValueError("a plan needs the new switch names (--new-switch A,B)")
@@ -478,7 +502,12 @@ def make_plan(audits: list[SwitchAudit], new_switches: list[str], layout: Layout
     return plan
 
 
-def pins_from_sheet(rows: Iterable) -> dict[tuple[str, str], tuple[str, str, int | None, str]]:
+def uids_from_sheet(rows: Iterable[CablingRow]) -> dict[PortKey, str]:
+    """The Port IDs an earlier sheet gave, so a re-plan keeps them."""
+    return {(r.old_switch, r.old_port): r.uid for r in rows if r.uid}
+
+
+def pins_from_sheet(rows: Iterable[CablingRow]) -> Pins:
     """The NEW entries of an edited cabling sheet, as pins for the next plan."""
     return {(r.old_switch, r.old_port): (r.new_switch, r.new_port, r.new_mlt_id,
                                          r.new_mlt_name)

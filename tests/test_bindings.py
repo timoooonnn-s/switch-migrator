@@ -6,7 +6,7 @@ the running-config source that makes tagged-vs-untagged knowable at all.
 
 from pathlib import Path
 
-from switch_migrator.collectors.switch import collect_switch
+from switch_migrator.collectors.switch import Reads, collect_switch
 from switch_migrator.compare import compare_switch, resolve_binding_isids
 from switch_migrator.config import Config, SshSettings, SwitchTarget
 from switch_migrator.connection import OfflineRunner
@@ -16,19 +16,27 @@ from switch_migrator.models import (
     UNTAGGED,
     FabricState,
     Platform,
+    PortState,
+    SwitchAudit,
     VlanBinding,
     tagging_summary,
 )
 from switch_migrator.parsers import ers_config, voss_config
 from switch_migrator.report.migration import _pairs_cell
+from switch_migrator.report.tables import build_coverage
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+# in the ERS running-config fixture, but not in its 'show vlan' output
+CONFIG_ONLY_VLAN = 2950
+CONFIG_ONLY_ISID = 2502950     # prod convention: 250 + VLAN
+
+
 def _cfg(**kw) -> Config:
-    base = dict(dvr_controllers=[], core_switch_patterns=["core-*", "dvr-*"],
-                isid_offsets=[2500000], isid_explicit={}, excluded_vlans={1},
-                ssh=SshSettings())
+    base = {"dvr_controllers": [], "core_switch_patterns": ["core-*", "dvr-*"],
+                "isid_offsets": [2500000], "isid_explicit": {}, "excluded_vlans": {1},
+                "ssh": SshSettings()}
     base.update(kw)
     return Config(**base)
 
@@ -36,7 +44,7 @@ def _cfg(**kw) -> Config:
 def _collect(platform: str):
     target = SwitchTarget(platform, platform, Platform(platform))
     return collect_switch(target, OfflineRunner(platform, FIXTURES), _cfg(),
-                          pull_config=True, pull_macs=True)
+                          Reads(config=True, macs=True))
 
 
 def _with_fabric(audit):
@@ -194,10 +202,10 @@ def test_config_only_vlans_reach_the_comparison():
     exists on the box - and has to be resolved, not left as a '?'."""
     audit = _with_fabric(_collect("ers"))
     # 2950 is in the ERS running-config fixture, not in its 'show vlan' output
-    assert 2950 in {v.vlan_id for v in audit.vlans}
+    assert CONFIG_ONLY_VLAN in {v.vlan_id for v in audit.vlans}
     uplink = {p.port: p for p in audit.ports}["49"]
-    binding = next(b for b in uplink.bindings if b.vlan == 2950)
-    assert binding.isid == 2502950
+    binding = next(b for b in uplink.bindings if b.vlan == CONFIG_ONLY_VLAN)
+    assert binding.isid == CONFIG_ONLY_ISID
 
 
 # --------------------------------------------------------------------------- #
@@ -218,15 +226,13 @@ def test_the_running_config_is_recorded_as_a_source():
 
 
 def test_coverage_flags_a_switch_whose_ports_have_no_vlans():
-    from switch_migrator.models import PortState, SwitchAudit
-    from switch_migrator.report.tables import build_coverage
 
     thin = SwitchAudit(name="thin-01", host="h", platform=Platform.VOSS,
                        reachable=True)
     thin.ports = [PortState(port=f"1/{n}") for n in range(1, 11)]
     thin.record_source("vlan membership", False, "no VLAN carried member ports")
     table = build_coverage([thin])
-    row = dict(zip(table.headers, table.rows[0]))
+    row = dict(zip(table.headers, table.rows[0], strict=True))
     assert row["Ports with VLANs"] == 0
     assert row["VLAN coverage"] == "0%"
     assert "vlan membership" in row["Sources that did not"]
@@ -235,9 +241,8 @@ def test_coverage_flags_a_switch_whose_ports_have_no_vlans():
 
 def test_coverage_is_clean_when_every_port_has_vlans():
     audit = _collect("ers")
-    from switch_migrator.report.tables import build_coverage
-    row = dict(zip(build_coverage([audit]).headers,
-                   build_coverage([audit]).rows[0]))
+    coverage = build_coverage([audit])
+    row = dict(zip(coverage.headers, coverage.rows[0], strict=True))
     assert row["VLAN coverage"] == "100%"
     assert row["Ports with tagging"] == len(audit.ports)
 
@@ -268,7 +273,7 @@ def test_the_raw_config_is_dropped_once_its_tagging_is_extracted():
     it, keeps the original text."""
     target = SwitchTarget("ers", "ers", Platform.ERS)
     audit = collect_switch(target, OfflineRunner("ers", FIXTURES), _cfg(),
-                           pull_config=True, pull_macs=True, keep_config=False)
+                           Reads(config=True, macs=True, keep_config=False))
     assert audit.running_config == ""
     # ...and the tagging it was read for survived
     assert {p.port: p for p in audit.ports}["49"].tagging == "tagged"
@@ -329,8 +334,6 @@ vlan members 10 5
 def test_coverage_does_not_flag_spare_ports_at_all():
     """Severities feed the exit code. Most of a 48-port box being dark is
     normal - not an error, and not even worth an amber row."""
-    from switch_migrator.models import PortState, SwitchAudit
-    from switch_migrator.report.tables import build_coverage
 
     audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
                         reachable=True)
@@ -345,8 +348,6 @@ def test_coverage_does_not_flag_spare_ports_at_all():
 def test_coverage_flags_an_up_port_with_no_vlan_data():
     """The hole that matters: a live port whose VLANs nothing could read. It
     reaches the cabling sheet looking complete and empty."""
-    from switch_migrator.models import PortState, SwitchAudit
-    from switch_migrator.report.tables import build_coverage
 
     audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
                         reachable=True)
@@ -356,7 +357,7 @@ def test_coverage_flags_an_up_port_with_no_vlan_data():
         PortState(port="1/2", oper_up=True),        # up, and we know nothing
     ]
     table = build_coverage([audit])
-    row = dict(zip(table.headers, table.rows[0]))
+    row = dict(zip(table.headers, table.rows[0], strict=True))
     assert row["Up ports missing VLANs"] == 1
     assert table.severities[0] == "warn"
 
@@ -365,28 +366,27 @@ def test_coverage_reads_a_snapshot_from_an_older_build():
     """Older snapshots carry the flat vlans/isids lists and no bindings.
     Counting bindings alone reported complete data as 0% and, because that
     tripped the error branch, made --from-snapshot exit 1."""
-    from switch_migrator.models import PortState, SwitchAudit
-    from switch_migrator.report.tables import build_coverage
 
     audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
                         reachable=True)
     audit.ports = [PortState(port="1/1", oper_up=True, vlans=[100],
                              isids=[10100], tagging="untagged")]
     table = build_coverage([audit])
-    row = dict(zip(table.headers, table.rows[0]))
-    assert row["Ports with VLANs"] == 1 and row["VLAN coverage"] == "100%"
-    assert row["Ports with I-SIDs"] == 1 and row["Ports with tagging"] == 1
+    row = dict(zip(table.headers, table.rows[0], strict=True))
+    assert row["Ports with VLANs"] == 1
+    assert row["VLAN coverage"] == "100%"
+    assert row["Ports with I-SIDs"] == 1
+    assert row["Ports with tagging"] == 1
     assert table.severities[0] == "ok"
 
 
 def test_coverage_is_quiet_on_a_plain_audit_run():
     """A plain audit never reads the running-config, so tagging is empty by
     design. Amber on every switch for that would be pure noise."""
-    from switch_migrator.report.tables import build_coverage
     target = SwitchTarget("voss", "voss", Platform.VOSS)
     audit = collect_switch(target, OfflineRunner("voss", FIXTURES), _cfg())
     table = build_coverage([audit])
-    row = dict(zip(table.headers, table.rows[0]))
+    row = dict(zip(table.headers, table.rows[0], strict=True))
     assert row["Ports with tagging"] == 0        # no config was pulled
     assert row["Sources that did not"] == "-"
     assert table.severities[0] == "ok"

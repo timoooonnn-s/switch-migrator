@@ -5,16 +5,21 @@ from pathlib import Path
 
 import pytest
 
+from switch_migrator.collectors import switch as switch_mod
 from switch_migrator.collectors.dvr import collect_dvr
-from switch_migrator.collectors.switch import collect_switch
+from switch_migrator.collectors.switch import Reads, collect_switch
 from switch_migrator.config import Config, SshSettings, SwitchTarget
 from switch_migrator.connection import OfflineRunner
-from switch_migrator.models import FabricState, Platform
+from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator.parsers.common import parse_lldp_neighbors_summary
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 INVALID = "                     ^\n% Invalid input detected at '^' marker.\n"
+
+
+PARTIAL_ISID = 10100      # from the fixture's 'show i-sid': merged even when partial
+FIXTURE_PORTS_UP = 3      # ports up in the VOSS fixture
 
 
 @pytest.fixture
@@ -43,7 +48,7 @@ def test_dvr_without_fabric_wide_data_is_not_authoritative(tmp_path: Path):
     assert fabric.dvrs_ok == []
     assert any("not counted as an authoritative" in e for e in fabric.dvr_errors)
     # the partial data itself is still merged (harmless extra attachments)
-    assert 10100 in fabric.isids
+    assert PARTIAL_ISID in fabric.isids
 
 
 def test_voss_port_fallback_chain_and_lldp_warning(tmp_path: Path, cfg: Config):
@@ -61,7 +66,7 @@ def test_voss_port_fallback_chain_and_lldp_warning(tmp_path: Path, cfg: Config):
     target = SwitchTarget("old-agg-01", "old-agg-01", Platform.VOSS)
     audit = collect_switch(target, OfflineRunner("old-agg-01", tmp_path), cfg)
     assert audit.ports, "third command in the chain must have delivered ports"
-    assert audit.ports_up == 3
+    assert audit.ports_up == FIXTURE_PORTS_UP
     assert not audit.errors
     assert any("no LLDP neighbor data" in w for w in audit.warnings)
 
@@ -80,19 +85,15 @@ def test_parse_lldp_neighbors_summary():
 def test_parse_lldp_neighbors_summary_ip_and_empty_sysname():
     # real VOSS 8.10.9 layout: IP/IPv6 ADDR column, and an EMPTY SYSNAME cell
     # for a server (its REMOTE PORT/SYSDESCR must not bleed into the name)
-    output = (
-        "LOCAL            IP/IPv6                                  CHASSIS            REMOTE\n"
-        "PORT       PROT  ADDR                                     ID                 PORT               SYSNAME       SYSDESCR\n"
-        "-----------------------------------------------------------------------------------------------------------------------\n"
-        "1/3        LLDP  -                                        a4:00:00:00:00:03  a4:00:00:00:00:13  10/25Gb 2-po~ 235.1.164.2 fw_version:AFW_1\n"
-        "1/7        LLDP  10.0.48.192                              --                 a4:00:00:00:00:07                HPE ProLiant DL380 Gen10\n"
-        "2/1        LLDP  10.0.148.88                              a4:00:00:00:00:21  2/1                core-s72-q4   VSP-7254XSQ (8.10.9.0)\n"
-    )
+    output = (FIXTURES / "voss" / "show_lldp_neighbor_summary_ip_column.txt").read_text()
     n = parse_lldp_neighbors_summary(output)
-    assert n["1/3"].sysname == "10/25Gb" and n["1/3"].ip == ""          # truncated name, no IP
-    assert n["1/7"].sysname == "" and n["1/7"].ip == "10.0.48.192"      # server: name blank, IP set
+    assert n["1/3"].sysname == "10/25Gb"
+    assert n["1/3"].ip == ""
+    assert n["1/7"].sysname == ""
+    assert n["1/7"].ip == "10.0.48.192"
     assert n["1/7"].sys_descr == "HPE ProLiant DL380 Gen10"
-    assert n["2/1"].sysname == "core-s72-q4" and n["2/1"].ip == "10.0.148.88"
+    assert n["2/1"].sysname == "core-s72-q4"
+    assert n["2/1"].ip == "10.0.148.88"
 
 
 def test_ers_unsupported_commands_stay_out_of_the_report(tmp_path: Path, cfg: Config):
@@ -169,7 +170,7 @@ def test_counter_sections_do_not_reset_has_traffic(tmp_path, cfg):
         "PORT_NUM IN_ERROR OUT_ERROR\n"
         "1/1 0 0\n")
     audit = collect_switch(SwitchTarget("sw1", "sw1", Platform.VOSS),
-                           OfflineRunner("sw1", tmp_path), cfg, pull_macs=True)
+                           OfflineRunner("sw1", tmp_path), cfg, Reads(macs=True))
     port = next(p for p in audit.ports if p.port == "1/1")
     assert port.has_traffic is True
 
@@ -177,8 +178,6 @@ def test_counter_sections_do_not_reset_has_traffic(tmp_path, cfg):
 def test_an_unparsable_running_config_is_reported_once(tmp_path):
     """The failure path returned before caching, so the second consumer parsed
     the config again and appended a duplicate warning and coverage row."""
-    from switch_migrator.collectors import switch as switch_mod
-    from switch_migrator.models import Platform, SwitchAudit
 
     audit = SwitchAudit(name="sw", host="h", platform=Platform.VOSS,
                         reachable=True)

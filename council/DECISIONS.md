@@ -198,6 +198,105 @@ README says to take VOSS baselines with `--mac-snapshot`. Teaching
 migration-check to read `fdb-entry` is its own backlog item, and needs a real
 capture first.
 
+## D7 — built 2026-11-25: the workflow layer
+
+`switch_migrator/workflow/` is the pipeline: `collect.py` (runners, per-switch
+collection, fabric, dry run), `report.py` (compare, sheets, plan, health,
+verification -> tables, and the exit-code rule), `outputs.py` (every file),
+`macs.py` (the MAC-check steps). It takes small option types
+(`CollectOptions`, `ReportOptions`, `OutputOptions`), never an argparse
+namespace. `cli.py` turns flags into them; `menu.py` turns its session into
+them - `Session.to_args`, the fake namespace, is gone, and the menu imports
+nothing from `cli`. `manifest.build` takes a plain mapping of options.
+
+Checked by the 461 tests and by replaying ten CLI runs over the fixtures
+before and after: every sheet, config, commands file, manifest, log and exit
+code identical. One intended change: with `--split-by-location` the per-site
+Cabling tabs now come right after Port Info instead of after the plan sheets.
+A verification sheet that does not load now fails before any switch is read
+(exit 2), not after the collection.
+
+Still open from D7: the PortState split (facts / derived / plan).
+
+## D11 — Lint and type checks (2026-11-25) — *tightened by D12*
+
+`pytest && ruff check . && mypy` all pass and are the bar for a change
+(config in `pyproject.toml`, tools in the `dev` extra).
+
+* **ruff:** pre-migration-checker's rule families. Ignored, with a reason in
+  the config: magic values, early-return tables, many arguments, imports
+  inside functions (optional dependencies). Complexity capped at 18 branches /
+  60 statements; four decision tables carry an explained `noqa`
+  (`_collect_voss`, `_verify_row`, `run_menu`, `generate_voss_from_ers`).
+  `load_config` and `_enrich_migration_fields` were split instead.
+* **mypy:** not strict - `check_untyped_defs` on an untyped-by-default code
+  base. migration-check / fabric-weft are skipped (optional, Python 3.11).
+* **Not done:** `ruff format`. The code base was never formatted by a tool;
+  formatting it now would rewrite most lines and bury every real change of the
+  next weeks in the diff. Worth doing once, on its own, when nothing else is
+  in flight.
+
+What the checks found that mattered: closures over loop variables in the LLDP
+summary parser, row/severity `zip`s that would drop rows silently, an optional
+console-server setting dereferenced unchecked, one variable holding two types
+in the ERS generator, a module constant used before its definition, and the
+collectors typed for a runner when the MAC check hands them a memo (now a
+`CommandSource` protocol). Behaviour unchanged: the same fixture replay as
+D7, every file identical.
+
+## D12 — Review round 2 fixed; no suppressions left (2026-11-25)
+
+The council's second breakdown, fixed in the code:
+
+* **Extract:** the old VOSS extract leaves out what a ZTP'd switch already
+  has or what names the old hardware's ports (the SPB B-VLANs, `vlan members
+  remove 1 1/1-1/48,...`) and lists them under `LEFT OUT`. It still carries the
+  old port numbers and says so: `--plan` is the route for a move.
+* **ERS draft:** only stack unit 1's access ports keep their number as 1/N;
+  other units and ports above the access range are flagged, never renumbered.
+  The access range comes from `plan.ports` / `plan.uplinks` (48 assumed, and
+  said so, when unset); per-port lines come from `plan.port_lines`.
+* **I-SID worksheet:** the `explicit` snippet is no longer pre-filled with the
+  first candidate. Every line is commented out with `<ISID>`, so pasting it
+  unread decides nothing.
+* **Version check:** on start the tool says when the checkout is behind its
+  upstream, from the last fetch only (no network, no writes).
+* **Port IDs** survive a re-plan: with `--pins` the sheet's IDs are kept and
+  new ports get numbers above the highest.
+* **Verbs:** `collect`, `plan`, `verify` as shorthands for their flags (PLAN.md's
+  three verbs); every flag still works.
+* Docstrings that told the story of a past bug now say what the code does.
+
+**Checks, tightened from D11:** ruff at its default complexity limits over the
+package *and* the tests, with no ignore list and no `noqa`; mypy `strict` with
+no `type: ignore`. Long functions were split along their own steps (the VLAN
+comparison is now a list of rules tried in order, the DvR and ERS-config
+readers are tables, the menu's actions and the new-switch renderer are one
+function per section), long parameter lists became small dataclasses
+(`handover.Contents`, `connection.Device` / `RunnerSettings`,
+`menu.MenuStart`), and every number a test checks has a name or is derived
+from the fixture. Two limits the tests check are now named in the package:
+`config.DEFAULT_MAC_CAP`, `report.excel.SHEET_TITLE_MAX`.
+
+Behaviour: 468 tests pass (453 + 1 skip without migration-check). The fixture
+replay from D7, run again, differs from the last one only where the fixes
+above meant it to (extract `LEFT OUT`, worksheet placeholders, ERS
+numbering note) and in log timestamps.
+
+**Not done, on purpose:**
+* *The PortState split* (facts / derived / plan), open since D7. The plan
+  already lives in its own model; nothing today needs PortState to be
+  immutable. **Recommendation:** do it when the AixBOMS import (phase 2) adds a
+  second source of facts per port - that is the first time "where did this
+  value come from" has two answers.
+* *Raw captures inside snapshots.* A snapshot that carried the raw CLI output
+  would also carry the running-config, which the collection drops on purpose
+  unless it was asked for (secrets). **Recommendation:** keep snapshots to the
+  parsed state; `--save-raw` stays the separate, explicit way to keep raw
+  output - and it already leaves the running-config out unless the config
+  was asked for.
+* `ruff format`: still as in D11.
+
 ## D10 — The cabling sheet is the plan file (2026-11-24)
 
 D2 said "a YAML file the Excel sheet round-trips into". Two edit surfaces for one

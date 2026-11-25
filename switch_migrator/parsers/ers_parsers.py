@@ -12,8 +12,13 @@ from switch_migrator.parsers.common import (
     PORT_RE,
     expand_port_list,
     is_port_list,
+    is_vlan_id,
     name_says_ist,
 )
+
+MIN_MLT_FIELDS = 6
+# STATUS sits at this index when the NAME column is empty (see parse_mlt)
+STATUS_WITHOUT_NAME = 4
 
 _VLAN_TYPES = ("Port", "Protocol", "Protocol-based", "MAC", "MACSA", "SPBM-BVLAN",
                "Spbm-bvlan", "Private", "IDS", "RSPAN")
@@ -74,7 +79,7 @@ def parse_vlans(output: str) -> list[VlanInfo]:
         if m:
             raw = ""
             vlan_id = int(m.group(1))
-            if not 1 <= vlan_id <= 4094:
+            if not is_vlan_id(vlan_id):
                 current = None
                 continue
             current = VlanInfo(vlan_id=vlan_id, name=m.group(2).strip())
@@ -121,7 +126,7 @@ def parse_mlt(output: str) -> list[MltState]:
     mlts: list[MltState] = []
     for line in output.splitlines():
         tokens = line.split()
-        if len(tokens) < 6 or not tokens[0].isdigit():
+        if len(tokens) < MIN_MLT_FIELDS or not tokens[0].isdigit():
             continue
         status_idx = next((i for i in range(len(tokens) - 1, 0, -1)
                            if tokens[i].lower() in ("enabled", "disabled")), None)
@@ -135,12 +140,12 @@ def parse_mlt(output: str) -> list[MltState]:
         # digit-shaped name ('Trunk 7' named '7') must never be read as a
         # member. 'NONE' or a list carrying a separator can only be members;
         # a bare number could be either, so it is still refused.
-        if status_idx is None or status_idx < 4:
+        if status_idx is None or status_idx < STATUS_WITHOUT_NAME:
             continue
         members_tok = tokens[status_idx - 3]
         if members_tok.upper() != "NONE" and not re.match(r"^[\d/,\-]+$", members_tok):
             continue
-        if status_idx == 4 and members_tok.upper() != "NONE" \
+        if status_idx == STATUS_WITHOUT_NAME and members_tok.upper() != "NONE" \
                 and not re.search(r"[/,\-]", members_tok):
             continue
         status = tokens[status_idx]

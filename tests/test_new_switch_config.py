@@ -1,7 +1,10 @@
 """The config per new switch, rendered from the plan (new_switch_config.py)."""
 
 import re
+import shutil
+from pathlib import Path
 
+from switch_migrator import cli
 from switch_migrator.config import Config, SshSettings
 from switch_migrator.models import (
     BOTH,
@@ -92,7 +95,8 @@ def test_an_smlt_gets_the_same_4xx_on_both_peers_with_its_lacp_and_service():
     configs, _ = _configs()
     for switch in ("leaf-a", "leaf-b"):
         text = configs[switch].text
-        assert 'mlt 401 enable name "f11"' in text and "mlt 401 member 1/1" in text
+        assert 'mlt 401 enable name "f11"' in text
+        assert "mlt 401 member 1/1" in text
         block = _block(text, "interface mlt 401")
         assert block.splitlines()[1:4] == ["smlt", "lacp enable key 401", "flex-uni enable"]
         assert "c-vid 2200 mlt 401" in _block(text, "i-sid 2502200 elan")
@@ -122,7 +126,8 @@ def test_your_decision_in_config_yaml_settles_it():
 def test_reserved_vlans_and_unknown_tagging_are_said_not_guessed():
     configs, plan = _configs()
     text = configs[plan.move_for("ers-1", "1/3").new_switch].text
-    assert "VLAN 31" in text and "reserved estate-wide" in text
+    assert "VLAN 31" in text
+    assert "reserved estate-wide" in text
     assert "i-sid 1531100" not in text
     unknown = plan.move_for("ers-1", "1/4")
     problems = configs[unknown.new_switch].problems
@@ -134,7 +139,8 @@ def test_an_admin_down_old_port_stays_shut_and_says_so():
     new = plan.move_for("ers-1", "1/6")
     port = _block(configs[new.new_switch].text.split("PHASE II")[1],
                   f"interface GigabitEthernet {new.new_port}")
-    assert "shutdown" in port.splitlines() and "was admin-down" in port
+    assert "shutdown" in port.splitlines()
+    assert "was admin-down" in port
 
 
 def test_nothing_ztp_owns_can_appear():
@@ -157,10 +163,7 @@ def test_one_untagged_service_per_port():
 
 
 def test_plan_writes_one_config_per_new_switch(tmp_path):
-    import shutil
-    from pathlib import Path
 
-    from switch_migrator import cli
 
     raw = tmp_path / "raw"
     shutil.copytree(Path(__file__).parent / "fixtures" / "ers", raw / "old-ers")

@@ -1,23 +1,32 @@
 """Interactive menu: session model, target selection, output actions."""
 
+import csv
+import io
+import json
 import shutil
 from pathlib import Path
 
 import pytest
 from rich.console import Console
 
+import switch_migrator.menu as menu_mod
+from switch_migrator import connection as C
 from switch_migrator import menu as M
-from switch_migrator.config import Credentials, load_config
-from switch_migrator.models import Platform
+from switch_migrator.collectors.switch import Reads
+from switch_migrator.config import Credentials, load_config, load_inventory
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+INVENTORY_SWITCHES = 2    # the env fixture's inventory names two switches
+PROMPTS_TO_QUIT = 2       # the aborted prompt, then the one that quits
 
 
 class ScriptedConsole(Console):
     """A Console whose input() replays a scripted list of answers."""
 
     def __init__(self, answers):
-        super().__init__(file=open("/dev/null", "w"), force_terminal=False)
+        super().__init__(file=io.StringIO(), force_terminal=False)
         self._answers = list(answers)
         self.asked = []
 
@@ -51,7 +60,6 @@ def env(tmp_path):
 
 def _session(env):
     tmp, cfg_path, inv, raw = env
-    from switch_migrator.config import load_inventory
     s = M.Session(config_path=cfg_path,
                   cfg=load_config(cfg_path, require_fabric=False),
                   inventory_path=inv, output_dir=tmp / "out", offline_dir=raw)
@@ -68,22 +76,22 @@ def _offline_creds(s, console):
 
 def test_menu_opens_without_fabric_config(env, monkeypatch):
     # a config with no dvr_controllers/isid_conventions must not block the menu
-    tmp, cfg_path, inv, raw = env
+    tmp, cfg_path, inv, _raw = env
     console = ScriptedConsole(["0"])          # straight to quit
-    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
+    rc = M.run_menu(M.MenuStart(cfg_path, inv, tmp / "out"), console=console,
                     creds_fn=_offline_creds)
     assert rc == 0
 
 
-def test_to_args_matches_cli_namespace_shape(env):
+def test_the_session_builds_the_same_collect_options_as_the_cli(env):
+    """The menu drives the same workflow as the flags; its session carries how
+    the devices are reached (offline replay, raw capture)."""
     s = _session(env)
-    args = s.to_args(migration_sheets=True)
-    # the menu reuses the CLI's collection path, so the namespace must carry
-    # every attribute that path reads
-    for attr in ("offline", "save_raw", "output_dir", "extract_config",
-                 "migration_sheets", "no_fabric", "new_switch"):
-        assert hasattr(args, attr), attr
-    assert args.migration_sheets is True
+    s.save_raw = True
+    opts = s.collect_options(migration_sheets=True)
+    assert opts.offline == s.offline_dir
+    assert opts.raw_dir == s.output_dir / "raw"
+    assert opts.reads == Reads(config=True, macs=True, keep_config=False)
 
 
 # ------------------------------ selection ----------------------------------
@@ -98,15 +106,15 @@ def test_select_subset_by_number(env):
 def test_select_range_and_all(env):
     s = _session(env)
     M.action_select(s, ScriptedConsole(["1-2"]))
-    assert len(s.selected) == 2
+    assert len(s.selected) == INVENTORY_SWITCHES
     M.action_select(s, ScriptedConsole(["all"]))
-    assert len(s.selected) == 2
+    assert len(s.selected) == INVENTORY_SWITCHES
 
 
 def test_select_ignores_bad_input_without_crashing(env):
     s = _session(env)
     M.action_select(s, ScriptedConsole(["9,abc"]))
-    assert len(s.selected) == 2               # unchanged, nothing valid picked
+    assert len(s.selected) == INVENTORY_SWITCHES   # unchanged, nothing valid picked
 
 
 # ------------------------------ collect + outputs --------------------------
@@ -115,11 +123,13 @@ def test_collect_once_then_multiple_outputs(env):
     s = _session(env)
     # collect: (no fabric question - config has no DvRs), config? n, macs? y
     M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
-    assert s.has_data and len(s.audits) == 2
+    assert s.has_data
+    assert len(s.audits) == INVENTORY_SWITCHES
     # the MAC/migration-sheet collection reads the running-config for its
     # tagging, but declining the config extract means the text is not kept -
     # so the session must not claim to have it
-    assert s.collected_macs and not s.collected_config
+    assert s.collected_macs
+    assert not s.collected_config
     collected_at = s.collected_at
 
     # two different outputs from the SAME collected data - no re-collection
@@ -160,7 +170,7 @@ def test_config_extract_writes_when_running_config_present(env):
 def test_settings_change_one_at_a_time(env):
     """The settings menu changes exactly the setting that was picked - a
     crash (or an abort) mid-way can no longer lose every other answer."""
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, raw = env
     s = _session(env)
     console = ScriptedConsole([
         "1", str(tmp / "other"),                        # output dir
@@ -180,32 +190,32 @@ def test_settings_change_one_at_a_time(env):
 
 
 def test_settings_keeps_the_config_groups_when_none_are_typed(env):
-    tmp, cfg_path, inv, raw = env
+    _tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_settings(s, ScriptedConsole(["6", "y", "", ""]))
-    assert s.split_by_location and s.location_groups == {}
+    assert s.split_by_location
+    assert s.location_groups == {}
 
 
 def test_settings_rejects_a_mistyped_group_rather_than_scattering_ports(env):
-    tmp, cfg_path, inv, raw = env
+    _tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_settings(s, ScriptedConsole(["6", "y", "Frankfurt gx-11", ""]))
     assert s.location_groups == {}      # fell back to the config, not a half-group
 
 
 def test_x_aborts_an_action_at_any_prompt(env):
-    import pytest as _pytest
     s = _session(env)
-    with _pytest.raises(M.Abort):
+    with pytest.raises(M.Abort):
         M.action_settings(s, ScriptedConsole(["1", "x"]))
-    with _pytest.raises(M.Abort):
+    with pytest.raises(M.Abort):
         M.action_generate_mlt(s, ScriptedConsole(["x"]))
 
 
 def test_blank_at_the_main_menu_redisplays_instead_of_quitting(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, cfg_path, inv, _raw = env
     console = ScriptedConsole(["", "", "0"])   # two stray Enters, then quit
-    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
+    rc = M.run_menu(M.MenuStart(cfg_path, inv, tmp / "out"), console=console,
                     creds_fn=_offline_creds)
     assert rc == 0
     # all three answers were consumed: blank never quit the menu early
@@ -215,7 +225,7 @@ def test_blank_at_the_main_menu_redisplays_instead_of_quitting(env):
 # ------------------------- snapshot & dry run -------------------------------
 
 def test_snapshot_save_then_load_restores_the_session(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
     before = [(a.name, len(a.ports), len(a.mlts)) for a in s.audits]
@@ -234,7 +244,7 @@ def test_snapshot_save_then_load_restores_the_session(env):
 
 
 def test_reports_from_a_loaded_snapshot_need_no_devices(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
     snap = tmp / "snap.json"
@@ -249,14 +259,15 @@ def test_reports_from_a_loaded_snapshot_need_no_devices(env):
 
 
 def test_loading_a_bad_snapshot_keeps_the_session_intact(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
     kept = list(s.audits)
     bad = tmp / "bad.json"
     bad.write_text("{}")
     M.action_snapshot(s, ScriptedConsole(["2", str(bad)]))
-    assert s.audits == kept and s.loaded_from is None
+    assert s.audits == kept
+    assert s.loaded_from is None
 
 
 def test_dry_run_action_sends_nothing(env):
@@ -267,22 +278,21 @@ def test_dry_run_action_sends_nothing(env):
 
 
 def test_manifest_is_written_when_enabled(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     s.write_manifest = True
     M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
     manifests = list((tmp / "out").glob("manifest-*.json"))
     assert len(manifests) == 1
-    import json
     data = json.loads(manifests[0].read_text())
-    assert data["totals"]["switches"] == 2
+    assert data["totals"]["switches"] == INVENTORY_SWITCHES
     assert data["switches"][0]["commands"]["sent"] > 0
 
 
 # ------------------- health / MLT blocks / verification ---------------------
 
 def test_health_action_writes_a_report_and_needs_no_devices(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
     s.offline_dir = None                        # nothing left to talk to
@@ -291,8 +301,7 @@ def test_health_action_writes_a_report_and_needs_no_devices(env):
 
 
 def test_generate_mlt_action_writes_blocks(env, tmp_path):
-    import csv
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     sheet = tmp / "cabling.csv"
     with sheet.open("w", newline="") as fh:
         w = csv.writer(fh)
@@ -309,7 +318,7 @@ def test_generate_mlt_action_writes_blocks(env, tmp_path):
 
 
 def test_generate_mlt_action_reports_a_bad_sheet(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     bad = tmp / "notasheet.csv"
     bad.write_text("a,b\n1,2\n")
     s = _session(env)
@@ -318,8 +327,7 @@ def test_generate_mlt_action_reports_a_bad_sheet(env):
 
 
 def test_verify_action_collects_the_switches_the_sheet_names(env):
-    import csv
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     sheet = tmp / "cabling.csv"
     with sheet.open("w", newline="") as fh:
         w = csv.writer(fh)
@@ -337,7 +345,7 @@ def test_verify_action_collects_the_switches_the_sheet_names(env):
 def test_collect_auto_saves_a_snapshot(env):
     """Crash insurance: the expensive collection lands on disk immediately,
     timestamped, without being asked for."""
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
     snaps = list((tmp / "out" / "snapshots").glob("snapshot-*.json"))
@@ -345,7 +353,7 @@ def test_collect_auto_saves_a_snapshot(env):
 
 
 def test_snapshot_can_be_loaded_by_number(env):
-    tmp, cfg_path, inv, raw = env
+    _tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     M.action_collect(s, ScriptedConsole(["n", "y"]), _offline_creds)
     fresh = _session(env)
@@ -357,7 +365,7 @@ def test_snapshot_can_be_loaded_by_number(env):
 
 
 def test_auto_snapshot_can_be_turned_off(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     s.auto_snapshot = False
     M.action_collect(s, ScriptedConsole(["n", "n"]), _offline_creds)
@@ -365,7 +373,6 @@ def test_auto_snapshot_can_be_turned_off(env):
 
 
 def test_preflight_offline_session_skips_the_check(env, monkeypatch):
-    from switch_migrator import connection as C
     s = _session(env)                              # offline_dir is set
 
     def boom(*a, **k):
@@ -377,7 +384,6 @@ def test_preflight_offline_session_skips_the_check(env, monkeypatch):
 
 
 def test_preflight_lets_wrong_credentials_be_corrected(env, monkeypatch):
-    from switch_migrator import connection as C
     s = _session(env)
     s.offline_dir = None                           # live SSH session
     results = iter(["auth", None])                 # refused, then accepted
@@ -391,11 +397,11 @@ def test_preflight_lets_wrong_credentials_be_corrected(env, monkeypatch):
     console = ScriptedConsole(["admin2", "pw2"])   # corrected username + password
     out = M._preflight_credentials(s, console, Credentials("admin", "pw"))
     assert out == Credentials("admin2", "pw2")
-    assert seen[0][1] == "admin" and seen[1][1] == "admin2"
+    assert seen[0][1] == "admin"
+    assert seen[1][1] == "admin2"
 
 
 def test_preflight_unreachable_is_a_warning_not_a_verdict(env, monkeypatch):
-    from switch_migrator import connection as C
     s = _session(env)
     s.offline_dir = None
     monkeypatch.setattr(C, "quick_auth_check",
@@ -408,7 +414,7 @@ def test_preflight_unreachable_is_a_warning_not_a_verdict(env, monkeypatch):
 
 
 def test_profiles_save_then_load_into_a_fresh_session(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, _cfg_path, _inv, _raw = env
     s = _session(env)
     s.profiles_path = tmp / "profiles.yaml"
     s.new_switch = "leaf-a-01"
@@ -447,9 +453,9 @@ class _InterruptingConsole(ScriptedConsole):
 def test_ctrl_c_at_the_main_menu_quits(env):
     """Ctrl-C at the menu prompt used to be swallowed and the loop continued,
     so there was no way out of the program short of SIGKILL."""
-    tmp, cfg_path, inv, raw = env
+    tmp, cfg_path, inv, _raw = env
     console = _InterruptingConsole()
-    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
+    rc = M.run_menu(M.MenuStart(cfg_path, inv, tmp / "out"), console=console,
                     creds_fn=_offline_creds)
     assert rc == 0
     assert console.count == 1, "it should quit on the first Ctrl-C, not loop"
@@ -458,16 +464,15 @@ def test_ctrl_c_at_the_main_menu_quits(env):
 def test_x_at_the_main_menu_still_just_reshows_it(env):
     """'x' abandons an action; at the menu there is no action, so it redraws -
     only Ctrl-C means quit."""
-    tmp, cfg_path, inv, raw = env
+    tmp, cfg_path, inv, _raw = env
     console = ScriptedConsole(["x", "0"])
-    assert M.run_menu(cfg_path, inv, tmp / "out", console=console,
+    assert M.run_menu(M.MenuStart(cfg_path, inv, tmp / "out"), console=console,
                       creds_fn=_offline_creds) == 0
-    assert len(console.asked) == 2
+    assert len(console.asked) == PROMPTS_TO_QUIT
 
 
 def test_ctrl_c_inside_an_action_returns_to_the_menu(env):
     """Ctrl-C at a prompt WITHIN an action keeps its documented meaning."""
-    s = _session(env)
 
     class _OneInterrupt(ScriptedConsole):
         def input(self, prompt="", **kw):
@@ -482,7 +487,7 @@ def test_ctrl_c_inside_an_action_returns_to_the_menu(env):
 
 def test_menu_applies_a_named_profile(env, tmp_path):
     """`--menu --profile X` used to ignore the profile entirely."""
-    tmp, cfg_path, inv, raw = env
+    tmp, cfg_path, inv, _raw = env
     profiles = tmp / "profiles.yaml"
     profiles.write_text(
         "profiles:\n"
@@ -499,13 +504,12 @@ def test_menu_applies_a_named_profile(env, tmp_path):
         seen["split"] = s.split_by_location
         raise M.Abort()
 
-    import switch_migrator.menu as menu_mod
     original = menu_mod.action_select
     menu_mod.action_select = _capture
     try:
-        M.run_menu(cfg_path, inv, tmp / "out", console=ScriptedConsole(["1", "0"]),
-                   creds_fn=_offline_creds, profile="site-a",
-                   profiles_file=profiles)
+        M.run_menu(M.MenuStart(cfg_path, inv, tmp / "out", profile="site-a",
+                               profiles_file=profiles),
+                   console=ScriptedConsole(["1", "0"]), creds_fn=_offline_creds)
     finally:
         menu_mod.action_select = original
 
@@ -519,16 +523,16 @@ class _RecordingConsole(ScriptedConsole):
 
     def __init__(self, answers):
         Console.__init__(self, record=True, width=200,
-                         file=open("/dev/null", "w"), force_terminal=False)
+                         file=io.StringIO(), force_terminal=False)
         self._answers = list(answers)
         self.asked = []
 
 
 def test_menu_says_so_when_the_named_profile_is_missing(env):
-    tmp, cfg_path, inv, raw = env
+    tmp, cfg_path, inv, _raw = env
     console = _RecordingConsole(["0"])
-    rc = M.run_menu(cfg_path, inv, tmp / "out", console=console,
-                    creds_fn=_offline_creds, profile="nope",
-                    profiles_file=tmp / "profiles.yaml")
+    rc = M.run_menu(M.MenuStart(cfg_path, inv, tmp / "out", profile="nope",
+                                profiles_file=tmp / "profiles.yaml"), console=console,
+                    creds_fn=_offline_creds)
     assert rc == 0
     assert "No profile 'nope'" in console.export_text()

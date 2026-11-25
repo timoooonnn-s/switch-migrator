@@ -7,6 +7,7 @@ tables are written here.
 """
 
 import argparse
+import io
 import json
 import shutil
 from pathlib import Path
@@ -15,11 +16,19 @@ import pytest
 
 from switch_migrator import cli, mac_check
 from switch_migrator.cabling_sheet import CablingRow, Sheet
+from switch_migrator.collectors.switch import Reads
 from switch_migrator.config import ConfigError, MacCheckSettings, SwitchTarget, load_config
 from switch_migrator.connection import BaseRunner, CommandError, OfflineRunner
 from switch_migrator.models import Platform
+from switch_migrator.workflow.collect import CollectOptions, preview_commands
+from switch_migrator.workflow.macs import mac_check_targets
 
 pytest.importorskip("migration_check")
+from migration_check.platforms.boss import COMMANDS, LLDP, MAC_TABLE
+from rich.console import Console
+
+from switch_migrator import menu
+from switch_migrator.config import Credentials
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -50,6 +59,10 @@ ID   STATUS     ADDRESS            INTERFACE          REMOTE   TUNNEL
 """
 
 ERS_FILES = ("show_interfaces", "show_lldp_neighbor", "show_mlt", "show_vlan")
+
+
+SWAPPED = 2               # the two cables the scenario swaps
+ROUNDS_TO_SETTLE = 2      # round 1, then a round 2 that finds nothing new
 
 
 def _sheet(*rows: tuple[str, str, str, str]) -> Sheet:
@@ -121,7 +134,6 @@ def test_the_memo_keeps_answers_and_rejections_but_not_lost_commands():
 
 
 def test_the_recorder_sends_only_what_the_collection_did_not(tmp_path):
-    from migration_check.platforms.boss import COMMANDS
 
     runner = _Scripted({c: f"text of {c}" for c in COMMANDS})
     memo = mac_check.AnswerMemo(runner)
@@ -138,7 +150,6 @@ def test_the_recorder_sends_only_what_the_collection_did_not(tmp_path):
 
 
 def test_a_rejected_command_is_recorded_as_rejected_a_lost_one_as_failed(tmp_path):
-    from migration_check.platforms.boss import LLDP, MAC_TABLE
 
     runner = _Scripted({MAC_TABLE: "% Invalid input detected", LLDP: "!lost"})
     recorder = mac_check.SnapshotRecorder(tmp_path / "snap", "pre")
@@ -218,15 +229,15 @@ def test_only_the_switches_links_moved_onto_are_read():
     sheet = _sheet(("old-1", "1", "leaf-1", "1/1"))
     old = SwitchTarget(name="old-1", host="old-1", platform=Platform.ERS)
     new = SwitchTarget(name="leaf-1", host="leaf-1", platform=Platform.VOSS)
-    assert cli._mac_check_targets([old, new], sheet) == [new]
+    assert mac_check_targets([old, new], sheet) == [new]
 
 
 def test_the_dry_run_lists_the_mac_commands_once(tmp_path):
     cfg = load_config(_empty_config(tmp_path), require_fabric=False)
     target = SwitchTarget("leaf-1", "leaf-1", Platform.VOSS)
-    args = argparse.Namespace(migration_sheets=True, extract_config=False)
-    plain = cli.preview_commands([target], cfg, args)["leaf-1"]
-    with_macs = cli.preview_commands([target], cfg, args, mac_for={"leaf-1"})["leaf-1"]
+    opts = CollectOptions(reads=Reads.for_run(migration_sheets=True))
+    plain = preview_commands([target], cfg, opts)["leaf-1"]
+    with_macs = preview_commands([target], cfg, opts, mac_for={"leaf-1"})["leaf-1"]
     added = with_macs[len(plain):]
     assert with_macs[:len(plain)] == plain
     assert "show vlan mac-address-entry" in added
@@ -266,7 +277,7 @@ def test_baseline_then_verification_end_to_end(tmp_path):
                      "-o", str(out)])
     assert code == 1                         # the verification itself fails links
     report = json.loads(next(out.glob("mac-check-*.json")).read_text())
-    assert report["summary"]["other-port"] == 2      # the two cables are swapped
+    assert report["summary"]["other-port"] == SWAPPED
     assert report["summary"]["missing"] == 1
     after = next(out.glob("mac-check-*/after"))
     assert json.loads((after / "snapshot.json").read_text())["devices"].keys() == {"leaf-1"}
@@ -290,11 +301,12 @@ def test_the_watch_rereads_until_nothing_changes(tmp_path):
 
     lines: list[str] = []
     result = mac_check.check(
-        [baseline], first, _sheet(("old-1", "1", "leaf-1", "1/1")), out, "stamp",
-        watch=MacCheckSettings(0, 5, 1), targets=[leaf],
-        open_runner=lambda t: OfflineRunner(t.name, new_raw), on_round=lines.append)
+        mac_check.MacCheckJob([baseline], first, _sheet(("old-1", "1", "leaf-1", "1/1")),
+                              out, "stamp"),
+        mac_check.Watching(MacCheckSettings(0, 5, 1), [leaf],
+                           lambda t: OfflineRunner(t.name, new_raw), on_round=lines.append))
 
-    assert len(lines) == 2                   # round 2 found nothing new: stable
+    assert len(lines) == ROUNDS_TO_SETTLE
     assert "the number not found stopped falling" in result.stopped
     assert result.snapshot.name == "round-02"
     assert result.text.read_text().startswith(lines[0])
@@ -314,9 +326,9 @@ def test_ctrl_c_ends_the_watch_not_the_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mac_check, "capture", interrupted)
     result = mac_check.check(
-        [baseline], first, _sheet(), tmp_path / "out", "stamp",
-        watch=MacCheckSettings(0, 5, 3), targets=[leaf],
-        open_runner=lambda t: OfflineRunner(t.name, new_raw))
+        mac_check.MacCheckJob([baseline], first, _sheet(), tmp_path / "out", "stamp"),
+        mac_check.Watching(MacCheckSettings(0, 5, 3), [leaf],
+                           lambda t: OfflineRunner(t.name, new_raw)))
     assert result.stopped == "stopped after round 1: interrupted"
     assert result.json.is_file()
 
@@ -329,9 +341,8 @@ class _ScriptedConsole:
     """Just enough of a rich Console for the menu: scripted answers, no output."""
 
     def __init__(self, answers):
-        from rich.console import Console
 
-        self._console = Console(file=open("/dev/null", "w"), force_terminal=False)
+        self._console = Console(file=io.StringIO(), force_terminal=False)
         self._answers = list(answers)
         self.asked: list[str] = []
 
@@ -346,8 +357,6 @@ class _ScriptedConsole:
 
 
 def test_the_menu_baseline_is_offered_to_the_verification(tmp_path):
-    from switch_migrator import menu
-    from switch_migrator.config import Credentials
 
     raw = _old_ers_raw(tmp_path / "raw")
     _new_fe_raw(raw)                         # the new switch replays from the same folder
@@ -355,14 +364,16 @@ def test_the_menu_baseline_is_offered_to_the_verification(tmp_path):
     s = menu.Session(config_path=config, cfg=load_config(config, require_fabric=False),
                      output_dir=tmp_path / "out", offline_dir=raw)
     s.all_targets = s.selected = [SwitchTarget("old-1", "old-1", Platform.ERS)]
-    creds = lambda s, c: (Credentials("offline", "x"), Credentials("offline", "x"))  # noqa: E731
+    def creds(s, c):
+        return Credentials("offline", "x"), Credentials("offline", "x")
 
     # running-config? no - MAC tables? yes - MAC snapshot? yes
     menu.action_collect(s, _ScriptedConsole(["n", "y", "y"]), creds)
-    assert s.mac_snapshot is not None and (s.mac_snapshot / "snapshot.json").is_file()
+    assert s.mac_snapshot is not None
+    assert (s.mac_snapshot / "snapshot.json").is_file()
 
     console = _ScriptedConsole([str(_sheet_csv(tmp_path / "sheet.csv")), "", "n"])
     menu.action_verify(s, console, creds)    # blank baseline answer = the offered one
     assert any(str(s.mac_snapshot) in prompt for prompt in console.asked)
     report = json.loads(next((tmp_path / "out").glob("mac-check-*.json")).read_text())
-    assert report["summary"]["other-port"] == 2
+    assert report["summary"]["other-port"] == SWAPPED

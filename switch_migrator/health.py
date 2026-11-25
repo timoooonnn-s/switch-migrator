@@ -30,6 +30,10 @@ from switch_migrator import usage
 from switch_migrator.config import Config
 from switch_migrator.models import CompStatus, SwitchAudit, VlanComparison
 
+# how many items a finding names before it says '(+N more)'
+SHOW_DEGRADED = 8
+SHOW_VLANS = 10
+
 BLOCK = "BLOCK"
 WARN = "WARN"
 OK = "OK"
@@ -210,7 +214,8 @@ def _check_degraded_ports(a: SwitchAudit) -> list[Finding]:
     if not degraded:
         return []
     listed = ", ".join(p.port for p in degraded[:8])
-    more = f" (+{len(degraded) - 8} more)" if len(degraded) > 8 else ""
+    more = (f" (+{len(degraded) - SHOW_DEGRADED} more)"
+                if len(degraded) > SHOW_DEGRADED else "")
     return [Finding(a.name, WARN, "degraded ports",
                     f"{len(degraded)} port(s) down on a still-forwarding MLT: "
                     f"{listed}{more}",
@@ -230,7 +235,7 @@ def _check_comparisons(a: SwitchAudit,
     out = []
     for status, vlans in by_status.items():
         listed = ", ".join(str(v) for v in sorted(vlans)[:10])
-        more = f" (+{len(vlans) - 10} more)" if len(vlans) > 10 else ""
+        more = f" (+{len(vlans) - SHOW_VLANS} more)" if len(vlans) > SHOW_VLANS else ""
         out.append(Finding(
             a.name, BLOCK, "VLAN vs fabric",
             f"{len(vlans)} VLAN(s) {status.value}: {listed}{more}",

@@ -68,7 +68,7 @@ class _Target:
     ident: str         # '1/24' or '401'
 
     @property
-    def sort(self) -> tuple:
+    def sort(self) -> tuple[int, tuple[int, tuple[int, ...], str]]:
         return (0 if self.kind == "mlt" else 1, port_sort_key(self.ident))
 
 
@@ -78,6 +78,27 @@ class _Service:
     source: str
     cvids: dict[int, list[_Target]] = field(default_factory=dict)
     untagged: list[_Target] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _Use:
+    """One binding as it lands on a target: the VLAN, how it egresses
+    ('t' tagged, 'u' untagged) and where it came from, for messages."""
+    vlan: int | None
+    kinds: tuple[str, ...]
+    where: str
+
+
+@dataclass
+class _Sections:
+    """The rendered parts of one new switch's config."""
+    mlt_plans: list[MltPlan] = field(default_factory=list)
+    mlt_extra: dict[int, list[str]] = field(default_factory=dict)
+    member_lines: list[str] = field(default_factory=list)
+    phase1: list[str] = field(default_factory=list)
+    phase2: list[str] = field(default_factory=list)
+    definitions: list[str] = field(default_factory=list)
+    interfaces: list[str] = field(default_factory=list)
 
 
 class _Builder:
@@ -113,7 +134,7 @@ class _Builder:
             if b.vlan is None:
                 if b.isid is None:
                     continue
-                self._add(b.isid, "the old switch", target, None, ("u",), where)
+                self._add(b.isid, "the old switch", target, _Use(None, ("u",), where))
                 continue
             if b.vlan in standard.RESERVED_VLAN_IDS:
                 self.notes.append(f"# VLAN {b.vlan} on {where}: reserved estate-wide "
@@ -135,12 +156,13 @@ class _Builder:
             source = {"explicit": "your decision in config.yaml",
                       "fabric": "the old switch / the fabric"}.get(decision.source,
                                                                     decision.source)
-            self._add(decision.isid, source, target, b.vlan, kinds, where)
+            assert decision.isid is not None   # explicit and fabric decisions carry one
+            self._add(decision.isid, source, target, _Use(b.vlan, kinds, where))
             tagged = tagged or "t" in kinds
         return tagged
 
-    def _add(self, isid: int, source: str, target: _Target, vlan: int | None,
-             kinds: tuple[str, ...], where: str) -> None:
+    def _add(self, isid: int, source: str, target: _Target, use: _Use) -> None:
+        vlan, kinds, where = use.vlan, use.kinds, use.where
         service = self.services.setdefault(isid, _Service(isid, source))
         if target.kind == "mlt":
             self.unverified.add(UNVERIFIED_CVID_MLT)
@@ -180,90 +202,94 @@ def render_switch(switch: str, plan: MigrationPlan, audits: list[SwitchAudit],
                    key=lambda m: port_sort_key(m.new_port))
     peer = next((f.peer for f in plan.fill if f.name == switch), "")
 
-    # -- MLTs -------------------------------------------------------------------
     lags: dict[int, list[Move]] = {}
     plain: list[Move] = []
     for move in moves:
         (lags.setdefault(move.new_mlt_id, []) if move.new_mlt_id is not None
          else plain).append(move)
-    mlt_plans: list[MltPlan] = []
-    mlt_extra: dict[int, list[str]] = {}
-    member_lines: list[str] = []
+    sec = _Sections()
     for mlt_id, members in sorted(lags.items()):
-        old_ports = [b.ports.get(m.link.key) for m in members]
-        old_mlts: list[MltState] = [b.mlts[(m.link.old_switch, m.link.old_mlt_id)]
-                                    for m in members if m.link.old_mlt_id is not None
-                                    and (m.link.old_switch, m.link.old_mlt_id) in b.mlts]
-        lacp = _lacp([p for p in old_ports if p is not None])
-        problems = []
-        if lacp is None:
-            problems.append("LACP unknown: the old aggregation's LACP state was not "
-                            "read - add 'lacp enable key <id>' by hand if the far "
-                            "end runs it")
-        bindings = (old_mlts[0].bindings if old_mlts and old_mlts[0].bindings else
-                    [x for p in old_ports if p is not None for x in p.bindings])
-        target = _Target("mlt", str(mlt_id))
-        tagged = b.bind(target, _dedupe(bindings), f"MLT {mlt_id}")
-        if tagged:
-            b.unverified.add(UNVERIFIED_MLT_ENCAP)
-            mlt_extra[mlt_id] = ["# [UNVERIFIED] encapsulation on an MLT",
-                                 "encapsulation dot1q"]
-        if lacp:
-            b.unverified.add(UNVERIFIED_LACP_MEMBERS)
-        mlt_plans.append(MltPlan(
-            switch=switch, mlt_id=mlt_id, name=members[0].new_mlt_name or f"MLT{mlt_id}",
-            members=sorted({m.new_port for m in members}, key=port_sort_key),
-            smlt=bool(peer), lacp=lacp, flex_uni=True,
-            id_source="from the plan (4xx of the first port)",
-            old_mlt=", ".join(sorted({f"{m.link.old_switch} MLT {m.link.old_mlt_id}"
-                                      for m in members if m.link.old_mlt_id is not None})),
-            neighbors=sorted({p.lldp_neighbor for p in old_ports if p and p.lldp_neighbor}),
-            vlans=sorted({x.vlan for x in bindings if x.vlan is not None}),
-            problems=problems))
-        for move in members:
-            port = b.ports.get(move.link.key)
-            member_lines += [""] + _comment_for(move, port) + [
-                f"interface GigabitEthernet {move.new_port}"]
-            if port and port.name:
-                member_lines.append(f'name "{port.name}"')
-            if lacp:
-                member_lines.append("# [UNVERIFIED] LACP member port: check whether "
-                                    "'lacp key/aggregation' is needed here")
-            member_lines += ["no shutdown", "exit"]
-
-    # -- plain ports --------------------------------------------------------------
-    phase1: list[str] = []
-    phase2: list[str] = []
+        _render_lag(b, sec, mlt_id, members, peer)
     for move in plain:
-        port = b.ports.get(move.link.key)
-        target = _Target("port", move.new_port)
-        tagged = b.bind(target, _dedupe(port.bindings if port else []),
-                        f"{move.new_port} (old {move.link.old_switch} {move.link.old_port})")
-        if port is None or not port.bindings:
-            b.problems.append(f"{move.new_port} <- {move.link.old_switch} "
-                              f"{move.link.old_port}: no VLAN on the old port - it gets "
-                              f"no service; check the old running-config was read")
-        if tagged:
-            phase1 += ["", f"interface GigabitEthernet {move.new_port}",
-                       "encapsulation dot1q", "exit"]
-        phase2 += [""] + _comment_for(move, port) + [
-            f"interface GigabitEthernet {move.new_port}", "default-vlan-id 0"]
-        if port and port.name:
-            phase2.append(f'name "{port.name}"')
-        phase2.append("flex-uni enable")
-        if port is not None and port.admin_up is False:
-            phase2.append("# [!] was admin-down on the old switch")
-            phase2.append("shutdown")
-        else:
-            phase2.append("no shutdown")
-        phase2 += list(cfg.plan.port_lines) + ["exit"]
+        _render_plain_port(b, sec, move)
 
-    definitions, interfaces = render_sections(mlt_plans, mlt_extra)
-    text = _assemble(switch, peer, plan, moves, b, definitions, interfaces,
-                     member_lines, phase1, phase2)
+    sec.definitions, sec.interfaces = render_sections(sec.mlt_plans, sec.mlt_extra)
+    text = _assemble(b, peer, moves, sec)
     return NewSwitchConfig(switch, text, sorted(b.decisions.values(),
                                                  key=lambda d: d.vlan_id),
                            b.problems, sorted(b.unverified))
+
+
+def _render_lag(b: _Builder, sec: _Sections, mlt_id: int, members: list[Move],
+                peer: str) -> None:
+    """One MLT of the plan: its definition, its services, its member ports."""
+    old_ports = [b.ports.get(m.link.key) for m in members]
+    old_mlts: list[MltState] = [b.mlts[(m.link.old_switch, m.link.old_mlt_id)]
+                                for m in members if m.link.old_mlt_id is not None
+                                and (m.link.old_switch, m.link.old_mlt_id) in b.mlts]
+    lacp = _lacp([p for p in old_ports if p is not None])
+    problems = []
+    if lacp is None:
+        problems.append("LACP unknown: the old aggregation's LACP state was not "
+                        "read - add 'lacp enable key <id>' by hand if the far "
+                        "end runs it")
+    bindings = (old_mlts[0].bindings if old_mlts and old_mlts[0].bindings else
+                [x for p in old_ports if p is not None for x in p.bindings])
+    target = _Target("mlt", str(mlt_id))
+    tagged = b.bind(target, _dedupe(bindings), f"MLT {mlt_id}")
+    if tagged:
+        b.unverified.add(UNVERIFIED_MLT_ENCAP)
+        sec.mlt_extra[mlt_id] = ["# [UNVERIFIED] encapsulation on an MLT",
+                                 "encapsulation dot1q"]
+    if lacp:
+        b.unverified.add(UNVERIFIED_LACP_MEMBERS)
+    sec.mlt_plans.append(MltPlan(
+        switch=b.switch, mlt_id=mlt_id, name=members[0].new_mlt_name or f"MLT{mlt_id}",
+        members=sorted({m.new_port for m in members}, key=port_sort_key),
+        smlt=bool(peer), lacp=lacp, flex_uni=True,
+        id_source="from the plan (4xx of the first port)",
+        old_mlt=", ".join(sorted({f"{m.link.old_switch} MLT {m.link.old_mlt_id}"
+                                  for m in members if m.link.old_mlt_id is not None})),
+        neighbors=sorted({p.lldp_neighbor for p in old_ports if p and p.lldp_neighbor}),
+        vlans=sorted({x.vlan for x in bindings if x.vlan is not None}),
+        problems=problems))
+    for move in members:
+        port = b.ports.get(move.link.key)
+        sec.member_lines += ["", *_comment_for(move, port),
+                             f"interface GigabitEthernet {move.new_port}"]
+        if port and port.name:
+            sec.member_lines.append(f'name "{port.name}"')
+        if lacp:
+            sec.member_lines.append("# [UNVERIFIED] LACP member port: check whether "
+                                    "'lacp key/aggregation' is needed here")
+        sec.member_lines += ["no shutdown", "exit"]
+
+
+def _render_plain_port(b: _Builder, sec: _Sections, move: Move) -> None:
+    """One port that is not in a LAG: phase I (encapsulation) if it carries
+    tagged traffic, phase II (flex-UNI) always."""
+    port = b.ports.get(move.link.key)
+    target = _Target("port", move.new_port)
+    tagged = b.bind(target, _dedupe(port.bindings if port else []),
+                    f"{move.new_port} (old {move.link.old_switch} {move.link.old_port})")
+    if port is None or not port.bindings:
+        b.problems.append(f"{move.new_port} <- {move.link.old_switch} "
+                          f"{move.link.old_port}: no VLAN on the old port - it gets "
+                          f"no service; check the old running-config was read")
+    if tagged:
+        sec.phase1 += ["", f"interface GigabitEthernet {move.new_port}",
+                       "encapsulation dot1q", "exit"]
+    sec.phase2 += ["", *_comment_for(move, port),
+                   f"interface GigabitEthernet {move.new_port}", "default-vlan-id 0"]
+    if port and port.name:
+        sec.phase2.append(f'name "{port.name}"')
+    sec.phase2.append("flex-uni enable")
+    if port is not None and port.admin_up is False:
+        sec.phase2.append("# [!] was admin-down on the old switch")
+        sec.phase2.append("shutdown")
+    else:
+        sec.phase2.append("no shutdown")
+    sec.phase2 += [*list(b.cfg.plan.port_lines), "exit"]
 
 
 def _dedupe(bindings: list[VlanBinding]) -> list[VlanBinding]:
@@ -282,9 +308,12 @@ def _targets(targets: list[_Target]) -> list[str]:
     return [f"mlt {m}" for m in mlts] + ([f"port {','.join(ports)}"] if ports else [])
 
 
-def _assemble(switch, peer, plan, moves, b, definitions, interfaces, member_lines,
-              phase1, phase2) -> str:
-    bar = "# " + "=" * 74
+_BAR = "# " + "=" * 74
+
+
+def _header(b: _Builder, peer: str, moves: list[Move]) -> list[str]:
+    """What the config is, what it leaves out, and what to read first."""
+    switch, plan, bar = b.switch, b.plan, _BAR
     olds = sorted({m.link.old_switch for m in moves})
     out = [bar, f"# NEW SWITCH CONFIG - {switch} - GENERATED, REVIEW BEFORE PASTING",
            f"# From the plan: {len(moves)} link(s) from {', '.join(olds) or '-'}"
@@ -309,15 +338,30 @@ def _assemble(switch, peer, plan, moves, b, definitions, interfaces, member_line
         out += ["#", "# PROBLEMS - read these first:"]
         out += [f"# [!] {p}" for p in b.problems]
     out.append(bar)
+    return out
 
-    if definitions:
-        out += ["", "#", "# MLT CONFIGURATION", "#", *definitions,
-                "", "#", "# MLT INTERFACE CONFIGURATION", "#", *interfaces]
-    if phase1:
-        out += ["", "#", "# PORT CONFIGURATION - PHASE I", "#", *phase1]
-    if phase2 or member_lines:
-        out += ["", "#", "# PORT CONFIGURATION - PHASE II", "#", *member_lines, *phase2]
 
+def _assemble(b: _Builder, peer: str, moves: list[Move], sec: _Sections) -> str:
+    out = _header(b, peer, moves)
+    if sec.definitions:
+        out += ["", "#", "# MLT CONFIGURATION", "#", *sec.definitions,
+                "", "#", "# MLT INTERFACE CONFIGURATION", "#", *sec.interfaces]
+    if sec.phase1:
+        out += ["", "#", "# PORT CONFIGURATION - PHASE I", "#", *sec.phase1]
+    if sec.phase2 or sec.member_lines:
+        out += ["", "#", "# PORT CONFIGURATION - PHASE II", "#",
+                *sec.member_lines, *sec.phase2]
+
+    services = _service_lines(b)
+    if services or b.notes:
+        out += ["", "#", "# I-SID CONFIGURATION", "#", *b.notes, *services]
+    if not moves:
+        out += ["", "# (the plan puts nothing on this switch)"]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _service_lines(b: _Builder) -> list[str]:
+    """The I-SID services, then the ones waiting for a decision (commented out)."""
     services: list[str] = []
     for isid in sorted(b.services):
         s = b.services[isid]
@@ -336,11 +380,7 @@ def _assemble(switch, peer, plan, moves, b, definitions, interfaces, member_line
         services += [f"# c-vid {vlan} {t}" for t in _targets(tagged)]
         services += [f"# untagged-traffic {t}" for t in _targets(untagged)]
         services.append("# exit")
-    if services or b.notes:
-        out += ["", "#", "# I-SID CONFIGURATION", "#", *b.notes, *services]
-    if not moves:
-        out += ["", "# (the plan puts nothing on this switch)"]
-    return "\n".join(out).rstrip() + "\n"
+    return services
 
 
 def render_all(audits: list[SwitchAudit], plan: MigrationPlan,

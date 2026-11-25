@@ -79,21 +79,19 @@ def build_worksheet(decisions: list[IsidDecision], device_name: str = "") -> str
             out.append(f"#   VLAN {d.vlan_id}{name}: candidates {cands}")
         out += [
             "#",
-            "# Paste your choices into config.yaml, then re-run:",
+            "# Copy into config.yaml, then for each VLAN: uncomment the line and",
+            "# replace <ISID> with your choice. A new service takes the lower",
+            "# prefix of its environment (250 prod, 270 non-prod, 299 special).",
             "#",
             "isid_conventions:",
             "  explicit:",
         ]
+        # nothing is pre-filled: a filled-in value pasted unread is a guess
+        # with the user's name on it, so every line waits for a decision
         for d in sorted(need, key=lambda d: d.vlan_id):
-            if d.candidates:
-                out.append(f"    {d.vlan_id}: {d.candidates[0]}    # candidates: "
-                           f"{', '.join(map(str, d.candidates))}")
-            else:
-                # nothing is ever guessed: with no offsets there is no
-                # candidate, so leave the value to the human instead of
-                # pre-filling a fake '0'
-                out.append(f"    # {d.vlan_id}: <ISID>    # no offsets "
-                           f"configured - fill in the I-SID")
+            hint = (f"candidates: {', '.join(map(str, d.candidates))}"
+                    if d.candidates else "no offsets configured")
+            out.append(f"    # {d.vlan_id}: <ISID>    # {hint}")
     else:
         out.append("# No decisions needed - every VLAN resolved.")
     out.append("#")

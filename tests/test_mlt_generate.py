@@ -37,7 +37,8 @@ def test_an_old_mlt_becomes_one_block_with_its_members(tmp_path):
     p = result.plans[0]
     assert (p.switch, p.mlt_id, p.name) == ("leaf-01", 35, "MLT035.srv")
     assert p.members == ["1/11", "1/12"]
-    assert p.smlt and p.flex_uni
+    assert p.smlt
+    assert p.flex_uni
     assert "carried over from gx-01" in p.id_source
     assert p.problems == []
 
@@ -228,7 +229,8 @@ def test_the_emitted_block_matches_the_devices_own_syntax(tmp_path):
     assert "flex-uni enable" in text
     assert text.count("exit") == 1
     # the context a human needs to check it against reality
-    assert "carried VLAN(s): 695" in text and "I-SID(s): 2500695" in text
+    assert "carried VLAN(s): 695" in text
+    assert "I-SID(s): 2500695" in text
     assert "REVIEW BEFORE PASTING" in text
 
 
@@ -261,7 +263,8 @@ def test_blocks_are_grouped_per_new_switch(tmp_path):
         _member("1/2", "1/12", **{"NEW switch": "leaf-02"}),
     ]))
     text = G.render(result)
-    assert "===== leaf-01 =====" in text and "===== leaf-02 =====" in text
+    assert "===== leaf-01 =====" in text
+    assert "===== leaf-02 =====" in text
     assert text.index("===== leaf-01 =====") < text.index("===== leaf-02 =====")
 
 

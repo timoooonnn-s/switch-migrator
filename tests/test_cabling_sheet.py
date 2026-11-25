@@ -9,13 +9,21 @@ import csv
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook, load_workbook
 
 from switch_migrator import cabling_sheet as CS
+from switch_migrator.models import UNTAGGED, Platform, PortState, SwitchAudit, VlanBinding
+from switch_migrator.report.excel import SHEET_SCHEMA, STAMP_SHEET, write_excel
+from switch_migrator.report.migration import assign_port_uids, build_cabling
+from switch_migrator.report.tables import Table
 
 HEADERS = ["VLAN", "Type", "Port ID", "End device / neighbor", "NEW switch",
            "NEW port", "NEW MLT ID", "NEW MLT name", "NEW VLAN", "Old switch",
            "Old port", "MLT ID", "MLT name", "MLT VLANs", "MLT I-SIDs",
            "Port VLANs", "Port I-SIDs", "MAC addresses", "Media", "Usage", "Why"]
+
+
+ROW_MLT_ID = 35           # the MLT id the filled-in row carries
 
 
 def _row(**kw) -> list:
@@ -24,7 +32,7 @@ def _row(**kw) -> list:
     return [values[h] for h in HEADERS]
 
 
-def _csv(tmp_path: Path, rows: list[list], headers: list[str] = None) -> Path:
+def _csv(tmp_path: Path, rows: list[list], headers: list[str] | None = None) -> Path:
     path = tmp_path / "cabling.csv"
     with path.open("w", newline="") as fh:
         writer = csv.writer(fh)
@@ -50,10 +58,15 @@ def test_reads_the_columns_the_tool_wrote(tmp_path):
     assert (row.new_switch, row.new_port) == ("leaf-01", "1/7")
     assert row.neighbor == "srv-esx-01"
     assert row.macs == ["00:11:22:33:44:55", "00:11:22:33:44:56"]
-    assert row.port_vlans == [695, 735] and row.port_isids == [2500695, 2510735]
-    assert row.mlt_id == 35 and row.mlt_name == "MLT035"
-    assert row.media == "10GbSR" and row.usage == "IN USE" and row.kind == "mlt"
-    assert row.migrated and sheet.problems == []
+    assert row.port_vlans == [695, 735]
+    assert row.port_isids == [2500695, 2510735]
+    assert row.mlt_id == ROW_MLT_ID
+    assert row.mlt_name == "MLT035"
+    assert row.media == "10GbSR"
+    assert row.usage == "IN USE"
+    assert row.kind == "mlt"
+    assert row.migrated
+    assert sheet.problems == []
 
 
 def test_extra_and_reordered_columns_are_fine(tmp_path):
@@ -97,7 +110,8 @@ def test_unfilled_rows_are_pending_not_errors(tmp_path):
                 "NEW switch": "leaf-01", "NEW port": "1/8"}),
     ])
     sheet = CS.load(path)
-    assert len(sheet.pending) == 1 and len(sheet.migrated) == 1
+    assert len(sheet.pending) == 1
+    assert len(sheet.migrated) == 1
     assert not sheet.pending[0].problems
 
 
@@ -112,7 +126,8 @@ def test_half_filled_rows_are_flagged(tmp_path):
     rows = CS.load(path).rows
     assert "NEW port is empty" in rows[0].problems[0]
     assert "NEW switch is empty" in rows[1].problems[0]
-    assert not rows[0].migrated and not rows[1].migrated
+    assert not rows[0].migrated
+    assert not rows[1].migrated
 
 
 def test_new_vlan_overrides_the_old_one(tmp_path):
@@ -146,7 +161,7 @@ def test_blank_and_spacer_lines_are_skipped(tmp_path):
         _row(),
         _row(**{"Old switch": "gx-01", "Old port": "1/8"}),
     ])
-    assert len(CS.load(path).rows) == 2
+    assert [r.old_port for r in CS.load(path).rows] == ["1/7", "1/8"]
 
 
 def test_a_file_that_is_not_a_cabling_sheet_says_so(tmp_path):
@@ -173,8 +188,6 @@ def test_clear_errors_for_missing_or_empty_files(tmp_path):
 def test_reads_the_xlsx_the_tool_writes(tmp_path):
     """Round-trip through the actual writer: the sheet the technicians get is
     the sheet this has to read."""
-    from switch_migrator.report.excel import write_excel
-    from switch_migrator.report.tables import Table
 
     table = Table("Cabling", HEADERS)
     table.add(_row(**{"Port ID": "P0001", "Old switch": "gx-01",
@@ -192,8 +205,6 @@ def test_reads_the_xlsx_the_tool_writes(tmp_path):
 
 
 def test_xlsx_sheet_can_be_named(tmp_path):
-    from switch_migrator.report.excel import write_excel
-    from switch_migrator.report.tables import Table
 
     table = Table("Patching", HEADERS)
     table.add(_row(**{"Old switch": "gx-01", "Old port": "1/7"}))
@@ -208,8 +219,6 @@ def test_every_cabling_worksheet_is_read_not_just_the_first(tmp_path):
     """--split-by-location writes one worksheet per site. Reading only the
     first would verify one site and silently ignore the rest - the migration
     would look complete while half of it was never checked."""
-    from switch_migrator.report.excel import write_excel
-    from switch_migrator.report.tables import Table
 
     tables = [Table("Summary", ["Switch", "Ports up"])]
     tables[0].add(["gx-11-s72-p1", "12/48"])          # not a cabling sheet
@@ -231,8 +240,6 @@ def test_every_cabling_worksheet_is_read_not_just_the_first(tmp_path):
 
 
 def test_one_worksheet_can_still_be_singled_out(tmp_path):
-    from switch_migrator.report.excel import write_excel
-    from switch_migrator.report.tables import Table
 
     tables = []
     for site, switch in (("Frankfurt", "gx-11-s72-p1"), ("Munich", "mu-01-a")):
@@ -248,7 +255,6 @@ def test_one_worksheet_can_still_be_singled_out(tmp_path):
 def test_xlsx_worksheet_with_a_leading_blank_row_is_still_read(tmp_path):
     """openpyxl hands back leading blank rows; the header detection must skip
     them like the parser does, or the whole worksheet silently vanishes."""
-    from openpyxl import Workbook
     wb = Workbook()
     ws = wb.active
     ws.title = "Cabling"
@@ -267,10 +273,6 @@ def test_xlsx_worksheet_with_a_leading_blank_row_is_still_read(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def _written_sheet(tmp_path, rows=None):
-    from switch_migrator.models import UNTAGGED, PortState, SwitchAudit, VlanBinding
-    from switch_migrator.models import Platform
-    from switch_migrator.report.excel import write_excel
-    from switch_migrator.report.migration import assign_port_uids, build_cabling
 
     a = SwitchAudit(name="old-01", host="old-01", platform=Platform.VOSS,
                     reachable=True)
@@ -291,17 +293,18 @@ def test_the_written_cabling_sheet_reads_back(tmp_path):
     sheet = CS.load(path)
     assert len(sheet.rows) == 1
     row = sheet.rows[0]
-    assert row.old_switch == "old-01" and row.old_port == "1/1"
+    assert row.old_switch == "old-01"
+    assert row.old_port == "1/1"
     assert row.uid == "P0001"
     assert row.tagging == "untagged"
     # the rack columns exist and are empty - a human fills them in
-    assert row.rack_old == "" and row.rack_new == ""
+    assert row.rack_old == ""
+    assert row.rack_new == ""
     # the hidden stamp is not mistaken for a worksheet of links
     assert "_migrator" not in sheet.sheets_read
 
 
 def test_the_stamp_records_the_build_that_wrote_the_sheet(tmp_path):
-    from switch_migrator.report.excel import SHEET_SCHEMA
     sheet = CS.load(_written_sheet(tmp_path))
     assert sheet.schema == SHEET_SCHEMA
     assert sheet.written_by
@@ -310,8 +313,7 @@ def test_the_stamp_records_the_build_that_wrote_the_sheet(tmp_path):
 
 
 def test_a_sheet_from_an_older_build_is_flagged_not_rejected(tmp_path):
-    from openpyxl import load_workbook
-    from switch_migrator.report.excel import STAMP_SHEET
+
     path = _written_sheet(tmp_path)
     wb = load_workbook(path)
     stamp = wb[STAMP_SHEET]
@@ -326,7 +328,6 @@ def test_a_sheet_from_an_older_build_is_flagged_not_rejected(tmp_path):
 
 
 def test_rack_columns_are_read_when_filled_in(tmp_path):
-    from openpyxl import load_workbook
     path = _written_sheet(tmp_path)
     wb = load_workbook(path)
     ws = wb["Cabling"]
@@ -338,8 +339,10 @@ def test_rack_columns_are_read_when_filled_in(tmp_path):
     wb.save(path)
 
     row = CS.load(path).rows[0]
-    assert row.rack_old == "R12" and row.rack_new == "R44"
-    assert row.migrated and row.new_switch == "new-01"
+    assert row.rack_old == "R12"
+    assert row.rack_new == "R44"
+    assert row.migrated
+    assert row.new_switch == "new-01"
     assert row.new_port == "1/9"           # normalised on the way in
 
 
@@ -353,7 +356,6 @@ def test_the_tools_own_columns_are_not_reported_as_foreign(tmp_path):
 
 
 def test_a_genuinely_foreign_column_is_still_reported(tmp_path):
-    from openpyxl import load_workbook
     path = _written_sheet(tmp_path)
     wb = load_workbook(path)
     ws = wb["Cabling"]

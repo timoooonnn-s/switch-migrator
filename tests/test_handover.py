@@ -37,9 +37,9 @@ def _bundle(tmp_path):
     files = [out / "migration-audit-20260101-000000.xlsx",
              out / "manifest-20260101-000000.json",
              out / "config" / "leaf-01.cfg"]
-    return out, handover.build(out, files, _tables(), _audits(),
-                               meta={"config": "site-a.yaml"},
-                               stamp="20260101-000000")
+    return out, handover.build(out, handover.Contents(
+        files, _tables(), _audits(), meta={"config": "site-a.yaml"},
+        stamp="20260101-000000"))
 
 
 def test_bundle_gathers_every_file_and_an_index(tmp_path):
@@ -69,7 +69,8 @@ def test_index_is_self_contained_and_names_the_findings(tmp_path):
     _, bundle = _bundle(tmp_path)
     page = (bundle / "index.html").read_text()
     # no external assets: it has to open from a file share or a USB stick
-    assert "http://" not in page and "https://" not in page
+    assert "http://" not in page
+    assert "https://" not in page
     assert "<style>" in page
     # the summary and the issues are readable without opening the workbook
     assert "connection refused" in page
@@ -87,7 +88,8 @@ def test_index_escapes_device_text(tmp_path):
     tables[0].add(["<b>not markup</b>", "yes"], None)
     out = tmp_path / "output"
     out.mkdir()
-    bundle = handover.build(out, [], tables, audits, stamp="20260101-000000")
+    bundle = handover.build(out, handover.Contents([], tables, audits,
+                                                   stamp="20260101-000000"))
     page = (bundle / "index.html").read_text()
     assert "<script>alert(1)</script>" not in page
     assert "&lt;b&gt;not markup&lt;/b&gt;" in page
@@ -96,8 +98,8 @@ def test_index_escapes_device_text(tmp_path):
 def test_a_missing_file_is_skipped_rather_than_fatal(tmp_path):
     out = tmp_path / "output"
     out.mkdir()
-    bundle = handover.build(out, [out / "never-written.xlsx"], _tables(),
-                            _audits(), stamp="20260101-000000")
+    bundle = handover.build(out, handover.Contents(
+        [out / "never-written.xlsx"], _tables(), _audits(), stamp="20260101-000000"))
     assert (bundle / "index.html").is_file()
     assert not (bundle / "never-written.xlsx").exists()
 

@@ -11,6 +11,9 @@ from __future__ import annotations
 from switch_migrator import health, verify
 from switch_migrator.report.tables import Table
 
+# how many unexpected ports the summary names before '(+N more)'
+SHOW_EXTRA_PORTS = 10
+
 _VERDICT_SEVERITY = {
     health.BLOCK: "error", health.WARN: "warn",
     health.OK: "ok", health.UNKNOWN: "warn",
@@ -86,7 +89,8 @@ def build_verification_summary(report: verify.VerifyReport,
            "no NEW switch/port recorded in the sheet yet"])
     if extra_ports:
         listed = ", ".join(f"{s} {p}" for s, p in extra_ports[:10])
-        more = f" (+{len(extra_ports) - 10} more)" if len(extra_ports) > 10 else ""
+        more = (f" (+{len(extra_ports) - SHOW_EXTRA_PORTS} more)"
+            if len(extra_ports) > SHOW_EXTRA_PORTS else "")
         t.add(["Unlisted ports up", len(extra_ports),
                f"up on a new switch but in no sheet row: {listed}{more}"],
               "warn")

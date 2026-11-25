@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import html
 import shutil
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -122,7 +123,7 @@ def _describe(path: Path) -> str:
 def _render_table(table: Table) -> str:
     head = "".join(f"<th>{html.escape(str(h))}</th>" for h in table.headers)
     body = []
-    for row, severity in zip(table.rows, table.severities):
+    for row, severity in zip(table.rows, table.severities, strict=True):
         cells = "".join(f"<td>{html.escape(str(c))}</td>" for c in row)
         body.append(f'<tr class="{html.escape(severity or "")}">{cells}</tr>')
     if not body:
@@ -132,7 +133,7 @@ def _render_table(table: Table) -> str:
 
 
 def _render_index(bundle: Path, files: list[Path], tables: list[Table],
-                  audits: list[SwitchAudit], meta: dict) -> str:
+                  audits: list[SwitchAudit], meta: dict[str, str]) -> str:
     by_title = {t.title: t for t in tables}
     reachable = sum(1 for a in audits if a.reachable)
     errors = sum(len(a.errors) for a in audits)
@@ -154,7 +155,7 @@ def _render_index(bundle: Path, files: list[Path], tables: list[Table],
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
         f"<title>Migration handover - {html.escape(bundle.name)}</title>",
         f"<style>{_STYLE}</style></head><body><main>",
-        f"<h1>Migration handover</h1>",
+        "<h1>Migration handover</h1>",
         f'<p class="sub">{html.escape(bundle.name)} &mdash; everything one '
         f"switch-migrator run produced, with what each file is for. "
         f"Only <code>show</code> commands were sent; no device was changed.</p>",
@@ -190,21 +191,32 @@ def _render_index(bundle: Path, files: list[Path], tables: list[Table],
     return "\n".join(parts)
 
 
-def build(output_dir: Path, files: list[Path], tables: list[Table],
-          audits: list[SwitchAudit], meta: dict | None = None,
-          stamp: str | None = None) -> Path:
+@dataclass
+class Contents:
+    """What goes into one bundle: the files the run wrote, and the findings and
+    switches its index page summarises. `meta` adds rows to the page's header
+    table; `stamp` names the folder (now, if not given)."""
+
+    files: list[Path]
+    tables: list[Table]
+    audits: list[SwitchAudit]
+    meta: dict[str, str] = field(default_factory=dict)
+    stamp: str | None = None
+
+
+def build(output_dir: Path, contents: Contents) -> Path:
     """Copy this run's output into a dated folder with an index page.
 
     Returns the folder. Files are copied rather than moved, so an existing
     workflow that looks for them where they were written keeps working.
     """
-    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = contents.stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
     bundle = output_dir / f"handover-{stamp}"
     bundle.mkdir(parents=True, exist_ok=True)
 
     config_dir = output_dir / "config"
     copied: list[Path] = []
-    for path in files:
+    for path in contents.files:
         if not path.exists():
             continue
         # the per-device extracts are copied once, with the directory below
@@ -225,8 +237,9 @@ def build(output_dir: Path, files: list[Path], tables: list[Table],
         copied.append(target)
 
     full_meta = {"generated": datetime.now().isoformat(timespec="seconds")}
-    full_meta.update(meta or {})
+    full_meta.update(contents.meta)
     index = bundle / "index.html"
-    index.write_text(_render_index(bundle, copied, tables, audits, full_meta),
+    index.write_text(_render_index(bundle, copied, contents.tables, contents.audits,
+                                   full_meta),
                      encoding="utf-8")
     return bundle

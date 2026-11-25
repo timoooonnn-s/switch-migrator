@@ -38,7 +38,7 @@ def render(tables: list[Table], console: Console | None = None,
                                header_style="bold", expand=False)
         for header in headers:
             rich_table.add_column(header, overflow="fold")
-        for row, severity in zip(rows, table.severities):
+        for row, severity in zip(rows, table.severities, strict=True):
             rich_table.add_row(*[str(cell) for cell in row],
                                style=_STYLES.get(severity, ""))
         console.print()

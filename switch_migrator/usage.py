@@ -18,6 +18,7 @@ behind it, so a human can overrule the tool.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from switch_migrator.models import MltState, PortState, SwitchAudit
@@ -55,11 +56,14 @@ def parse_uptime_days(sys_info: str) -> int | None:
     """Days from `SysUpTime : 135 day(s), 07:12:09`. Tells us how long the
     interface counters have been accumulating - '0 packets' on a box that
     rebooted an hour ago proves nothing."""
-    import re
     m = re.search(r"SysUpTime\s*:\s*([\d,]+)\s*day", sys_info, re.IGNORECASE)
     if m:
         return int(m.group(1).replace(",", ""))
     return None
+
+
+# (class, the evidence that decided it - it leads the evidence text)
+Verdict = tuple[str, list[str]]
 
 
 def classify_port(port: PortState, mlt: MltState | None,
@@ -73,55 +77,55 @@ def classify_port(port: PortState, mlt: MltState | None,
     if port.has_traffic is True:
         ev.append("has traffic counters")
     elif port.has_traffic is False:
-        ev.append(f"0 traffic counters"
+        ev.append("0 traffic counters"
                   + (f" over {uptime_days}d uptime" if uptime_days else ""))
+    usage, lead = (_in_use(port) or _degraded(mlt)
+                   or _down(port, unused_after_days, uptime_days))
+    return usage, ", ".join([*lead, *ev])
 
-    # --- positively in use, in decreasing directness
+
+def _in_use(port: PortState) -> Verdict | None:
+    """Positively in use, in decreasing directness."""
     if port.oper_up:
-        ev.insert(0, "link up")
-        if port.macs:
-            ev.insert(1, f"{port.mac_total or len(port.macs)} MAC(s)")
+        lead = ["link up"]
         if port.lldp_neighbor or port.lldp_neighbor_ip:
-            ev.insert(1, f"LLDP {port.lldp_neighbor or port.lldp_neighbor_ip}")
-        return IN_USE, ", ".join(ev)
+            lead.append(f"LLDP {port.lldp_neighbor or port.lldp_neighbor_ip}")
+        if port.macs:
+            lead.append(f"{port.mac_total or len(port.macs)} MAC(s)")
+        return IN_USE, lead
     if port.macs:
-        ev.insert(0, f"{port.mac_total or len(port.macs)} MAC(s) learned")
-        return IN_USE, ", ".join(ev)
+        return IN_USE, [f"{port.mac_total or len(port.macs)} MAC(s) learned"]
+    return None
 
-    # --- down, but part of an MLT that is still forwarding => a FAULT, and the
-    # cable is definitely still in use
-    if mlt is not None:
-        live = mlt.in_datapath is True or bool(mlt.members_up)
-        if live:
-            up = (f"{mlt.members_up}/{mlt.members_total}"
-                  if mlt.members_up is not None else "?")
-            ev.insert(0, f"member of MLT {mlt.mlt_id} still forwarding ({up} up)")
-            return DEGRADED, ", ".join(ev)
 
-    # --- down: how confident are we that it is dead?
+def _degraded(mlt: MltState | None) -> Verdict | None:
+    """Down, but part of an MLT that is still forwarding => a FAULT, and the
+    cable is definitely still in use."""
+    if mlt is None or not (mlt.in_datapath is True or bool(mlt.members_up)):
+        return None
+    up = (f"{mlt.members_up}/{mlt.members_total}"
+          if mlt.members_up is not None else "?")
+    return DEGRADED, [f"member of MLT {mlt.mlt_id} still forwarding ({up} up)"]
+
+
+def _down(port: PortState, unused_after_days: int, uptime_days: int | None) -> Verdict:
+    """Down: how confident are we that it is dead?"""
+    days = port.last_change_days
     if port.has_traffic is True:
-        ev.insert(0, "link down but has passed traffic")
-        return UNCERTAIN, ", ".join(ev)
+        return UNCERTAIN, ["link down but has passed traffic"]
     if days is None:
-        ev.insert(0, "link down, age of the change unknown")
-        return UNCERTAIN, ", ".join(ev)
+        return UNCERTAIN, ["link down, age of the change unknown"]
     if days < unused_after_days:
-        ev.insert(0, f"link down only {days}d (< {unused_after_days}d)")
-        return UNCERTAIN, ", ".join(ev)
-
+        return UNCERTAIN, [f"link down only {days}d (< {unused_after_days}d)"]
     # down long enough to call it. Counters make it certain; without them, or on
     # a recently-rebooted box, stay at LIKELY.
     counters_trustworthy = (port.has_traffic is False
                             and (uptime_days is None
                                  or uptime_days >= unused_after_days))
-    if port.admin_up is False and counters_trustworthy:
-        ev.insert(0, "admin disabled")
-        return UNUSED, ", ".join(ev)
+    usage = UNUSED if counters_trustworthy else LIKELY_UNUSED
     if port.admin_up is False:
-        ev.insert(0, "admin disabled")
-        return LIKELY_UNUSED, ", ".join(ev)
-    ev.insert(0, f"link down {days}d")
-    return (UNUSED if counters_trustworthy else LIKELY_UNUSED), ", ".join(ev)
+        return usage, ["admin disabled"]
+    return usage, [f"link down {days}d"]
 
 
 def classify_audit(audit: SwitchAudit, unused_after_days: int = 30,

@@ -11,14 +11,24 @@ Every runner returns the raw text of a command or raises CommandError.
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import io
 import logging
+import os
 import re
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Protocol
+
+import paramiko
+from netmiko import ConnectHandler, redispatch
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from paramiko.transport import Transport
 
 from switch_migrator.config import (
     ConsoleServerSettings,
@@ -58,8 +68,16 @@ _LEGACY_KEX = (
 _LEGACY_CIPHERS = ("aes256-cbc", "aes192-cbc", "aes128-cbc", "3des-cbc")
 _LEGACY_KEYS = ("ssh-rsa", "ssh-dss")
 
-_legacy_enabled = False
-_legacy_lock = threading.Lock()
+class _LegacyAlgorithms:
+    """paramiko's algorithm tables are process-wide, so is the record that the
+    legacy ones were appended to them."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.lock = threading.Lock()
+
+
+_LEGACY = _LegacyAlgorithms()
 
 # consecutive transport failures (timeouts, socket errors) after which a
 # device session is abandoned instead of burning read_timeout on every
@@ -77,15 +95,13 @@ def enable_legacy_ssh_algorithms() -> list[str]:
     and process-wide; no device or OS configuration is touched. Idempotent.
     Returns the algorithms that were newly enabled.
     """
-    global _legacy_enabled
-    from paramiko.transport import Transport
 
     added: list[str] = []
-    with _legacy_lock:
-        if _legacy_enabled:
+    with _LEGACY.lock:
+        if _LEGACY.enabled:
             return added
 
-        def extend(attr: str, wanted: tuple[str, ...], implemented) -> None:
+        def extend(attr: str, wanted: tuple[str, ...], implemented: dict[str, Any]) -> None:
             current = list(getattr(Transport, attr))
             for algo in wanted:
                 if algo not in current and algo in implemented:
@@ -96,7 +112,7 @@ def enable_legacy_ssh_algorithms() -> list[str]:
         extend("_preferred_kex", _LEGACY_KEX, Transport._kex_info)
         extend("_preferred_ciphers", _LEGACY_CIPHERS, Transport._cipher_info)
         extend("_preferred_keys", _LEGACY_KEYS, Transport._key_info)
-        _legacy_enabled = True
+        _LEGACY.enabled = True
     if added:
         log.info("legacy SSH algorithms enabled: %s", ", ".join(added))
     missing = [a for a in _LEGACY_KEYS + _LEGACY_KEX + _LEGACY_CIPHERS
@@ -137,6 +153,10 @@ def looks_like_error(output: str) -> bool:
     return False
 
 
+# one sent command, as the manifest stores it: vars() of a CommandRecord
+CommandEntry = dict[str, Any]
+
+
 @dataclass
 class CommandRecord:
     """One command as it was actually sent - the raw material for the run
@@ -148,6 +168,14 @@ class CommandRecord:
     error: str = ""
 
 
+class CommandSource(Protocol):
+    """What a collector needs from a device: an answer per command. Runners
+    are one; the MAC check's AnswerMemo, which sits in front of a runner, is
+    another."""
+
+    def run(self, command: str) -> str: ...
+
+
 class BaseRunner:
     setup_warnings: list[str]
     name: str = ""
@@ -157,11 +185,11 @@ class BaseRunner:
     # BEFORE the command is sent. The runner is the single choke point for all
     # device traffic, so this is the one place that sees every command without
     # threading a callback through every collector.
-    on_command: "Callable[[str, str, int], None] | None" = None
+    on_command: Callable[[str, str, int], None] | None = None
     # per-command spelling overrides (config `commands:`); applied here at the
     # choke point so collectors, raw capture, dry run and offline replay all
     # see the SAME remapped spelling. Values are validated read-only at load.
-    command_overrides: dict[str, str] = {}
+    command_overrides: Mapping[str, str] = MappingProxyType({})   # read-only default
 
     def _map(self, command: str) -> str:
         return self.command_overrides.get(command, command)
@@ -174,10 +202,8 @@ class BaseRunner:
 
     def _log_start(self, command: str) -> float:
         if self.on_command is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self.on_command(self.name, command, len(self.command_log) + 1)
-            except Exception:  # noqa: BLE001 - a broken progress bar is not fatal
-                pass
         return time.monotonic()
 
     def _log_end(self, command: str, started: float, ok: bool,
@@ -201,7 +227,68 @@ _CTRL_Y = "\x19"
 _CTRL_C = "\x03"
 
 
-def _patient_ers_class():
+# the two methods of the patient ERS login (see _patient_ers_class)
+def _patient_login_handler(self: Any, delay_factor: float = 1.0) -> None:
+    # getattr with defaults: a netmiko layout change that drops either
+    # attribute must degrade (defaults match today's values), not crash
+    # every ERS connect
+    prompt = getattr(self, "prompt_pattern", r"(?m:[>#]\s*$)")
+    enter = getattr(self, "RETURN", "\r")
+    pattern = (r"(?:sername|ssword|[Cc]trl[-\s]?[Yy]|Press [Ee][Nn][Tt][Ee][Rr]"
+               rf"|Menu|{prompt})")
+    self.write_channel(enter)  # wake boxes that wait for a keystroke
+    for _ in range(6):
+        try:
+            chunk = self.read_until_pattern(pattern=pattern, read_timeout=6.0)
+        except Exception:  # broad on purpose: silent so far: nudge with Ctrl-Y
+            self.write_channel(_CTRL_Y)
+            time.sleep(0.3 * delay_factor)
+            self.write_channel(enter)
+            continue
+        if re.search(prompt, chunk):
+            return
+        if re.search(r"[Cc]trl[-\s]?[Yy]", chunk):
+            self.write_channel(_CTRL_Y)
+            time.sleep(0.3 * delay_factor)
+            self.write_channel(enter)
+        elif re.search(r"Press [Ee][Nn][Tt][Ee][Rr]", chunk):
+            self.write_channel(enter)
+        elif "Menu" in chunk:
+            self.write_channel(_CTRL_C)
+        elif "sername" in chunk:
+            self.write_channel((self.username or "") + enter)
+        elif "ssword" in chunk:
+            self.write_channel((self.password or "") + enter)
+        else:
+            self.write_channel(enter)
+    # Don't hard-fail: session_preparation() retries prompt detection and
+    # raises the friendlier connect error if the box truly won't enter.
+
+def _patient_session_preparation(self: Any) -> None:
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            self.set_base_prompt()
+            last_exc = None
+            break
+        except Exception as exc:  # broad on purpose: ReadTimeout/ValueError
+            last_exc = exc
+            try:
+                self.clear_buffer()
+                self.write_channel(_CTRL_Y)
+                time.sleep(0.3)
+                self.write_channel(getattr(self, "RETURN", "\r"))
+                time.sleep(0.5 + attempt * 0.5)
+                self.clear_buffer()
+            except Exception:  # broad on purpose: best-effort re-nudge
+                pass
+    if last_exc is not None:
+        raise last_exc
+    self.set_terminal_width()
+    self.disable_paging()
+
+
+def _patient_ers_class() -> type | None:
     """netmiko's ExtremeErsSSH with a robust 'Enter Ctrl-Y to begin' login.
 
     ERS/BOSS gate the CLI behind 'Enter Ctrl-Y to begin', and many boxes stay
@@ -213,72 +300,46 @@ def _patient_ers_class():
     of patient retries for slow CPUs. ERS-only; the VOSS path is untouched.
     Returns None if this netmiko build can't be subclassed (fall back to stock).
     """
+    # looked up when needed, not imported at the top: a netmiko release that
+    # moves this internal class must cost the patient login, not the whole tool
     try:
-        from netmiko.extreme.extreme_ers_ssh import ExtremeErsSSH
-    except Exception:  # noqa: BLE001 - unexpected netmiko layout: use stock class
+        stock = importlib.import_module("netmiko.extreme.extreme_ers_ssh").ExtremeErsSSH
+    except (ImportError, AttributeError):
         return None
 
-    class PatientExtremeErs(ExtremeErsSSH):
-        def special_login_handler(self, delay_factor: float = 1.0) -> None:
-            # getattr with defaults: a netmiko layout change that drops either
-            # attribute must degrade (defaults match today's values), not crash
-            # every ERS connect
-            prompt = getattr(self, "prompt_pattern", r"(?m:[>#]\s*$)")
-            enter = getattr(self, "RETURN", "\r")
-            pattern = (r"(?:sername|ssword|[Cc]trl[-\s]?[Yy]|Press [Ee][Nn][Tt][Ee][Rr]"
-                       rf"|Menu|{prompt})")
-            self.write_channel(enter)  # wake boxes that wait for a keystroke
-            for _ in range(6):
-                try:
-                    chunk = self.read_until_pattern(pattern=pattern, read_timeout=6.0)
-                except Exception:  # noqa: BLE001 - silent so far: nudge with Ctrl-Y
-                    self.write_channel(_CTRL_Y)
-                    time.sleep(0.3 * delay_factor)
-                    self.write_channel(enter)
-                    continue
-                if re.search(prompt, chunk):
-                    return
-                if re.search(r"[Cc]trl[-\s]?[Yy]", chunk):
-                    self.write_channel(_CTRL_Y)
-                    time.sleep(0.3 * delay_factor)
-                    self.write_channel(enter)
-                elif re.search(r"Press [Ee][Nn][Tt][Ee][Rr]", chunk):
-                    self.write_channel(enter)
-                elif "Menu" in chunk:
-                    self.write_channel(_CTRL_C)
-                elif "sername" in chunk:
-                    self.write_channel((self.username or "") + enter)
-                elif "ssword" in chunk:
-                    self.write_channel((self.password or "") + enter)
-                else:
-                    self.write_channel(enter)
-            # Don't hard-fail: session_preparation() retries prompt detection and
-            # raises the friendlier connect error if the box truly won't enter.
+    # built with type(): the base is only known at run time
+    return type("PatientExtremeErs", (stock,), {
+        "special_login_handler": _patient_login_handler,
+        "session_preparation": _patient_session_preparation,
+    })
 
-        def session_preparation(self) -> None:
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    self.set_base_prompt()
-                    last_exc = None
-                    break
-                except Exception as exc:  # noqa: BLE001 - ReadTimeout/ValueError
-                    last_exc = exc
-                    try:
-                        self.clear_buffer()
-                        self.write_channel(_CTRL_Y)
-                        time.sleep(0.3)
-                        self.write_channel(getattr(self, "RETURN", "\r"))
-                        time.sleep(0.5 + attempt * 0.5)
-                        self.clear_buffer()
-                    except Exception:  # noqa: BLE001 - best-effort re-nudge
-                        pass
-            if last_exc is not None:
-                raise last_exc
-            self.set_terminal_width()
-            self.disable_paging()
 
-    return PatientExtremeErs
+@dataclass(frozen=True)
+class Device:
+    """Which device a session is for. `console` is its line on the console
+    server, used when SSH to the device itself fails."""
+
+    name: str
+    host: str
+    platform: Platform
+    console: str = ""
+
+
+@dataclass(frozen=True)
+class RunnerSettings:
+    """How a session behaves, the same for every device of a run.
+
+    `raw_skip` lists commands whose OUTPUT must not be written to the raw
+    capture in `raw_dir`. The migration sheets read the running-config for its
+    tagging and then drop the text; writing it to disk would keep the RADIUS
+    keys and SNMP users the caller just decided not to keep.
+    """
+
+    ssh: SshSettings
+    command_overrides: dict[str, str] = field(default_factory=dict)
+    console_server: ConsoleServerSettings | None = None
+    raw_dir: Path | None = None
+    raw_skip: tuple[str, ...] = ()
 
 
 class SshRunner(BaseRunner):
@@ -286,26 +347,16 @@ class SshRunner(BaseRunner):
     # still has one, and the raw-capture branch never raises on a missing attr
     raw_skip: tuple[str, ...] = ()
 
-    def __init__(self, name: str, host: str, platform: Platform,
-                 creds: Credentials, ssh: SshSettings,
-                 raw_dir: Path | None = None,
-                 command_overrides: dict[str, str] | None = None,
-                 console: str = "",
-                 console_server: ConsoleServerSettings | None = None,
-                 raw_skip: tuple[str, ...] = ()):
-        self.name = name
-        self.host = host
-        self.platform = platform
-        self.ssh = ssh
-        self.raw_dir = raw_dir
-        # commands whose OUTPUT must not be written to the raw capture. The
-        # migration sheets read the running-config for its tagging and then
-        # drop the text; writing it to disk here would keep the RADIUS keys and
-        # SNMP users the caller just decided not to keep.
-        self.raw_skip = tuple(raw_skip)
-        self.command_overrides = dict(command_overrides or {})
-        self.console = console
-        self.console_server = console_server
+    def __init__(self, device: Device, creds: Credentials, settings: RunnerSettings):
+        self.name = device.name
+        self.host = device.host
+        self.platform = device.platform
+        self.console = device.console
+        self.ssh = settings.ssh
+        self.raw_dir = settings.raw_dir
+        self.raw_skip = tuple(settings.raw_skip)
+        self.command_overrides = dict(settings.command_overrides)
+        self.console_server = settings.console_server
         self.setup_warnings: list[str] = []
         self.command_log: list[CommandRecord] = []
         self._transport_failures = 0
@@ -313,7 +364,7 @@ class SshRunner(BaseRunner):
         # captures the login/banner bytes so a connect failure can show what the
         # device actually sent instead of an opaque 'pattern not detected'
         self._session_log = io.BytesIO()
-        if ssh.legacy_algorithms:
+        if self.ssh.legacy_algorithms:
             enable_legacy_ssh_algorithms()
         self._conn = self._connect(creds)
         # connected: stop the in-memory session log from growing with every
@@ -321,7 +372,7 @@ class SshRunner(BaseRunner):
         try:
             if getattr(self._conn, "session_log", None) is not None:
                 self._conn.session_log.session_log = None
-        except Exception:  # noqa: BLE001 - purely a memory optimisation
+        except Exception:  # broad on purpose: purely a memory optimisation
             pass
         self._ensure_privileged()
         self._ensure_paging_disabled()
@@ -340,7 +391,7 @@ class SshRunner(BaseRunner):
         """
         try:
             prompt = self._conn.find_prompt().strip()
-        except Exception as exc:  # noqa: BLE001 - keep going, commands may still work
+        except Exception as exc:  # broad on purpose: keep going, commands may still work
             log.warning("[%s] could not read prompt to check privilege level: %s",
                         self.name, exc)
             return
@@ -350,7 +401,7 @@ class SshRunner(BaseRunner):
         try:
             self._conn.enable(cmd="enable")
             prompt = self._conn.find_prompt().strip()
-        except Exception as exc:  # noqa: BLE001 - e.g. box asks for an enable password
+        except Exception as exc:  # broad on purpose: e.g. box asks for an enable password
             detail = f" ({exc.__class__.__name__}: {str(exc).splitlines()[0] if str(exc) else exc})"
         if prompt.endswith("#"):
             log.debug("[%s] entered privileged EXEC", self.name)
@@ -366,7 +417,8 @@ class SshRunner(BaseRunner):
         """Sanitised tail of what the device sent during connect, for errors."""
         try:
             data = self._session_log.getvalue().decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
+        # broad on purpose: the session log is diagnostics, never a reason to fail
+        except Exception:
             return ""
         # collapse to single spaced-out lines so it fits on one report row
         data = " | ".join(ln.strip() for ln in data.splitlines() if ln.strip())
@@ -387,7 +439,7 @@ class SshRunner(BaseRunner):
         for command in commands:
             try:
                 out = self._conn.send_command(command, read_timeout=15)
-            except Exception as exc:  # noqa: BLE001 - never fail the whole device here
+            except Exception as exc:  # broad on purpose: never fail the whole device here
                 # a timeout on one spelling must not skip the remaining
                 # spellings: recover the channel and try the next form
                 details.append(f"'{command}': {exc.__class__.__name__}: {exc}")
@@ -403,10 +455,8 @@ class SshRunner(BaseRunner):
             + " - long command outputs may stall on this device")
         log.warning("[%s] %s", self.name, self.setup_warnings[-1])
 
-    def _connect(self, creds: Credentials):
+    def _connect(self, creds: Credentials) -> Any:   # a netmiko connection
         # Imported lazily so parsers/tests work without netmiko installed.
-        from netmiko import ConnectHandler
-        from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
         params = {
             "device_type": NETMIKO_DEVICE_TYPE[self.platform],
@@ -464,6 +514,9 @@ class SshRunner(BaseRunner):
                 # acceptable kex/host key algorithm)' - retrying won't help.
                 # ReadTimeout (prompt not found) also lands here.
                 raise self._fail(exc) from exc
+        # range(retries + 1) runs at least once, and every pass either returns,
+        # raises, or records the exception
+        assert last_exc is not None
         raise self._fail(last_exc) from last_exc
 
     @property
@@ -473,7 +526,7 @@ class SshRunner(BaseRunner):
         return bool(self.console and self.console_server
                     and self.console_server.configured)
 
-    def _connect_via_console(self, creds: Credentials):
+    def _connect_via_console(self, creds: Credentials) -> Any:
         """SSH to the terminal server, land on the switch's serial console,
         drive the switch's own console login, then hand the session to the
         platform's netmiko driver (redispatch).
@@ -484,11 +537,10 @@ class SshRunner(BaseRunner):
         SM_CONSOLE_USERNAME/SM_CONSOLE_PASSWORD when set, else the switch
         credentials are reused for both hops.
         """
-        import os
 
-        from netmiko import ConnectHandler, redispatch
 
         cs = self.console_server
+        assert cs is not None, "only reached when _via_console said yes"
         cs_user = os.environ.get("SM_CONSOLE_USERNAME") or creds.username
         cs_pass = os.environ.get("SM_CONSOLE_PASSWORD") or creds.password
         username, port = cs.resolve(cs_user, self.console)
@@ -507,14 +559,12 @@ class SshRunner(BaseRunner):
             self._drive_console_login(conn, creds)
             redispatch(conn, device_type=NETMIKO_DEVICE_TYPE[self.platform])
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 conn.disconnect()
-            except Exception:  # noqa: BLE001 - best effort on a failed hop
-                pass
             raise
         return conn
 
-    def _drive_console_login(self, conn, creds: Credentials) -> None:
+    def _drive_console_login(self, conn: Any, creds: Credentials) -> None:
         """A serial console shows the switch's own login (or ERS's Ctrl-Y
         gate, or a stale session's prompt) - answer whatever appears until a
         CLI prompt is reached."""
@@ -526,7 +576,7 @@ class SshRunner(BaseRunner):
             try:
                 chunk = conn.read_until_pattern(pattern=pattern,
                                                 read_timeout=8.0)
-            except Exception:  # noqa: BLE001 - still silent: nudge again
+            except Exception:  # broad on purpose: still silent: nudge again
                 conn.write_channel(_CTRL_Y)
                 time.sleep(0.3)
                 conn.write_channel("\r\n")
@@ -549,11 +599,12 @@ class SshRunner(BaseRunner):
                 conn.write_channel("\r\n")
         raise ConnectionFailed(
             f"{self.name}: connected to console server "
-            f"{self.console_server.host} (line {self.console}) but never "
+            f"{self.console_server.host if self.console_server else '?'} "
+            f"(line {self.console}) but never "
             f"reached a switch CLI prompt - is the line number right and the "
             f"switch console alive?")
 
-    def _fail(self, exc: Exception, note: str = "") -> "ConnectionFailed":
+    def _fail(self, exc: Exception, note: str = "") -> ConnectionFailed:
         """Build a CONCISE, one-line connect failure. The device's login banner
         (which is verbose and noisy for a wall of dead switches) is sent to the
         log file, never into the report. When we captured device bytes the SSH
@@ -585,7 +636,7 @@ class SshRunner(BaseRunner):
             self._conn.write_channel("q\n")
             time.sleep(0.5)
             self._conn.clear_buffer()
-        except Exception:  # noqa: BLE001 - purely best-effort recovery
+        except Exception:  # broad on purpose: purely best-effort recovery
             pass
 
     def run(self, command: str) -> str:
@@ -641,13 +692,11 @@ class SshRunner(BaseRunner):
             self._log_end(command, started, False, attempts, "device rejected")
             raise CommandError(command, output)
         self._log_end(command, started, True, attempts)
-        return output
+        return str(output)
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._conn.disconnect()
-        except Exception:  # noqa: BLE001 - best effort on teardown
-            pass
 
 
 class OfflineRunner(BaseRunner):
@@ -725,7 +774,6 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
     credentials, or a short reason string for any other failure (unreachable,
     algorithm mismatch, ...), which is NOT proof the credentials are wrong.
     """
-    import paramiko
 
     # The real run negotiates with the legacy algorithms appended and any
     # pinned-out ones excluded. Without the same treatment here the pre-flight
@@ -734,7 +782,7 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
     # that estate would open with a needless "continue anyway?".
     if ssh.legacy_algorithms:
         enable_legacy_ssh_algorithms()
-    params: dict = {}
+    params: dict[str, Any] = {}
     if ssh.disabled_algorithms:
         params["disabled_algorithms"] = ssh.disabled_algorithms
 
@@ -749,11 +797,9 @@ def quick_auth_check(host: str, creds: Credentials, ssh: SshSettings) -> str | N
         return None
     except paramiko.AuthenticationException:
         return "auth"
-    except Exception as exc:  # noqa: BLE001 - reachability, algorithms, ...
+    except Exception as exc:  # broad on purpose: reachability, algorithms, ...
         first = str(exc).splitlines()[0] if str(exc) else ""
         return f"{exc.__class__.__name__}: {first}"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             client.close()
-        except Exception:  # noqa: BLE001 - teardown is best effort
-            pass

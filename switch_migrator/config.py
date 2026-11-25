@@ -12,11 +12,16 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from switch_migrator.location import LocationRules
 from switch_migrator.models import Platform
+
+# -s NAME:PLATFORM[:HOST]
+NAME_AND_PLATFORM = 2
+HOST_PART = 2
 
 
 class ConfigError(Exception):
@@ -93,7 +98,7 @@ class SshSettings:
     default_enter: str | None = None  # e.g. "\r\n" for ERS/BOSS that ignore "\n"
     # advanced: paramiko disabled_algorithms, e.g. {"kex": ["curve25519-..."]}
     # to pin OUT a modern algorithm a device negotiates but implements badly
-    disabled_algorithms: dict | None = None
+    disabled_algorithms: dict[str, list[str]] | None = None
 
 
 @dataclass
@@ -108,6 +113,10 @@ class MacCheckSettings:
     interval_seconds: float = 120.0
     max_rounds: int = 15
     stable_rounds: int = 3
+
+
+# closing lines of every new flex-UNI access port: the production access port's set
+DEFAULT_PORT_LINES = ("slpp-guard enable timeout 0", "spanning-tree mstp edge-port true")
 
 
 @dataclass
@@ -127,13 +136,14 @@ class PlanSettings:
     port_lines: list[str] = field(default_factory=lambda: list(DEFAULT_PORT_LINES))
 
 
-DEFAULT_PORT_LINES = ("slpp-guard enable timeout 0", "spanning-tree mstp edge-port true")
-
-
 @dataclass
 class Credentials:
     username: str
     password: str
+
+
+# learned MACs kept per port unless config.yaml says otherwise
+DEFAULT_MAC_CAP = 10
 
 
 @dataclass
@@ -149,7 +159,7 @@ class Config:
     # learned MACs kept per port for the migration sheets. Raise it on
     # server-heavy access ports, lower it on busy uplinks - the full count is
     # always reported as '(+N more)' regardless.
-    mac_cap: int = 10
+    mac_cap: int = DEFAULT_MAC_CAP
     # how switch names map to sites, and which sites share a cabling worksheet
     locations: LocationRules = field(default_factory=LocationRules)
     ssh: SshSettings = field(default_factory=SshSettings)
@@ -169,7 +179,7 @@ class Config:
     plan: PlanSettings = field(default_factory=PlanSettings)
 
 
-def _require(data: dict, key: str, path: Path):
+def _require(data: dict[str, Any], key: str, path: Path) -> Any:
     if key not in data or data[key] in (None, [], {}):
         raise ConfigError(f"{path}: missing or empty required key '{key}'")
     return data[key]
@@ -179,6 +189,9 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
     """Load the config. With require_fabric=False (the --no-fabric report mode)
     the DvR controllers and I-SID conventions are optional: the tool only reads
     and reports per-switch state and never compares against a fabric.
+
+    One loader per section below; each validates its own keys and names the
+    file in every error.
     """
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -189,14 +202,48 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: top level must be a mapping")
 
-    dvr_entries = (_require(data, "dvr_controllers", path) if require_fabric
-                   else (data.get("dvr_controllers") or []))
+    offsets, explicit = _isid_conventions(data, path, require_fabric)
+    return Config(
+        dvr_controllers=_dvr_controllers(data, path, require_fabric),
+        core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
+        isid_offsets=offsets,
+        isid_explicit=explicit,
+        excluded_vlans=_excluded_vlans(data, path),
+        excluded_vlan_names=[str(p) for p in (data.get("excluded_vlan_names") or [])],
+        unused_after_days=int(data.get("unused_after_days", 30)),
+        mac_cap=max(1, int(data.get("mac_cap", DEFAULT_MAC_CAP))),
+        locations=_locations(data, path),
+        ssh=_ssh(data, path),
+        inventory=_inventory(data, path),
+        command_overrides=_command_overrides(data, path),
+        console_server=_console_server(data, path),
+        mac_check=_mac_check(data, path),
+        plan=_plan(data, path),
+    )
+
+
+def _section(data: dict[str, Any], key: str, path: Path, shape: str) -> dict[str, Any]:
+    """A mapping-valued section, or {} when absent."""
+    raw = data.get(key) or {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: '{key}' must be a mapping with {shape}")
+    return raw
+
+
+def _dvr_controllers(data: dict[str, Any], path: Path, require_fabric: bool) -> list[DvrTarget]:
+    entries = (_require(data, "dvr_controllers", path) if require_fabric
+               else (data.get("dvr_controllers") or []))
     dvrs = []
-    for i, entry in enumerate(dvr_entries):
+    for i, entry in enumerate(entries):
         if not isinstance(entry, dict) or "host" not in entry:
             raise ConfigError(f"{path}: dvr_controllers[{i}] needs at least 'host'")
-        dvrs.append(DvrTarget(name=str(entry.get("name", entry["host"])), host=str(entry["host"])))
+        dvrs.append(DvrTarget(name=str(entry.get("name", entry["host"])),
+                              host=str(entry["host"])))
+    return dvrs
 
+
+def _isid_conventions(data: dict[str, Any], path: Path,
+                      require_fabric: bool) -> tuple[list[int], dict[int, int]]:
     conventions = data.get("isid_conventions") or {}
     offsets = [int(o) for o in (conventions.get("offsets") or [])]
     explicit = {int(k): int(v) for k, v in (conventions.get("explicit") or {}).items()}
@@ -204,146 +251,137 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         raise ConfigError(
             f"{path}: isid_conventions must define at least one offset or explicit mapping"
         )
+    return offsets, explicit
 
-    ssh_data = data.get("ssh") or {}
-    disabled_algorithms = ssh_data.get("disabled_algorithms")
+
+def _ssh(data: dict[str, Any], path: Path) -> SshSettings:
+    raw = data.get("ssh") or {}
+    disabled_algorithms = raw.get("disabled_algorithms")
     if disabled_algorithms is not None and not isinstance(disabled_algorithms, dict):
         raise ConfigError(
             f"{path}: ssh.disabled_algorithms must be a mapping like "
             f"{{kex: [...], ciphers: [...], keys: [...]}}")
-    default_enter = ssh_data.get("default_enter")
-    ssh = SshSettings(
-        conn_timeout=int(ssh_data.get("conn_timeout", 20)),
-        read_timeout=int(ssh_data.get("read_timeout", 60)),
-        workers=max(1, int(ssh_data.get("workers", 4))),
-        retries=max(0, int(ssh_data.get("retries", 1))),
-        command_retries=max(0, int(ssh_data.get("command_retries", 1))),
-        max_transport_failures=max(1, int(ssh_data.get("max_transport_failures", 2))),
-        legacy_algorithms=bool(ssh_data.get("legacy_algorithms", True)),
-        global_delay_factor=float(ssh_data.get("global_delay_factor", 1.0)),
+    default_enter = raw.get("default_enter")
+    return SshSettings(
+        conn_timeout=int(raw.get("conn_timeout", 20)),
+        read_timeout=int(raw.get("read_timeout", 60)),
+        workers=max(1, int(raw.get("workers", 4))),
+        retries=max(0, int(raw.get("retries", 1))),
+        command_retries=max(0, int(raw.get("command_retries", 1))),
+        max_transport_failures=max(1, int(raw.get("max_transport_failures", 2))),
+        legacy_algorithms=bool(raw.get("legacy_algorithms", True)),
+        global_delay_factor=float(raw.get("global_delay_factor", 1.0)),
         default_enter=str(default_enter) if default_enter else None,
         disabled_algorithms=disabled_algorithms,
     )
 
-    excluded_vlans: set[int] = set()
+
+def _excluded_vlans(data: dict[str, Any], path: Path) -> set[int]:
+    excluded: set[int] = set()
     for v in data.get("excluded_vlans") or []:
         try:
-            excluded_vlans.add(int(v))
+            excluded.add(int(v))
         except (TypeError, ValueError):
             raise ConfigError(
                 f"{path}: excluded_vlans entry '{v}' is not a VLAN id - to "
                 f"exclude VLANs by NAME (e.g. 'quarantaine') use the "
                 f"excluded_vlan_names list instead") from None
+    return excluded
 
-    loc = data.get("locations") or {}
-    if not isinstance(loc, dict):
-        raise ConfigError(f"{path}: 'locations' must be a mapping with "
-                          f"'patterns', 'fallback_segments' and/or 'groups'")
+
+def _locations(data: dict[str, Any], path: Path) -> LocationRules:
+    loc = _section(data, "locations", path,
+                   "'patterns', 'fallback_segments' and/or 'groups'")
     patterns = loc.get("patterns") or {}
     groups_raw = loc.get("groups") or {}
     if not isinstance(patterns, dict) or not isinstance(groups_raw, dict):
         raise ConfigError(f"{path}: locations.patterns and locations.groups "
                           f"must both be mappings")
     groups: dict[str, list[str]] = {}
-    for name, members in groups_raw.items():
-        if isinstance(members, str):
-            members = [members]
+    for name, value in groups_raw.items():
+        members = [value] if isinstance(value, str) else value
         if not isinstance(members, list) or not members:
             raise ConfigError(
                 f"{path}: locations.groups['{name}'] must be a non-empty list "
                 f"of location names, e.g. ['Frankfurt DC1', 'Frankfurt DC2']")
         groups[str(name)] = [str(m) for m in members]
-    locations = LocationRules(
+    return LocationRules(
         patterns={str(k): str(v) for k, v in patterns.items()},
         fallback_segments=max(1, int(loc.get("fallback_segments", 2))),
         groups=groups,
     )
 
-    inventory = data.get("inventory")
-    if inventory:
-        inventory = Path(str(inventory))
-        if not inventory.is_absolute():
-            # relative to the config file, so `-c deploy/config.yaml` works
-            # from any working directory
-            inventory = path.parent / inventory
 
-    overrides_raw = data.get("commands") or {}
-    if not isinstance(overrides_raw, dict):
+def _inventory(data: dict[str, Any], path: Path) -> Path | None:
+    raw = data.get("inventory")
+    if not raw:
+        return None
+    inventory = Path(str(raw))
+    # relative to the config file, so `-c deploy/config.yaml` works from any
+    # working directory
+    return inventory if inventory.is_absolute() else path.parent / inventory
+
+
+def _command_overrides(data: dict[str, Any], path: Path) -> dict[str, str]:
+    raw = data.get("commands") or {}
+    if not isinstance(raw, dict):
         raise ConfigError(f"{path}: 'commands' must be a mapping of "
                           f"original -> replacement command")
-    command_overrides: dict[str, str] = {}
-    for orig, repl in overrides_raw.items():
-        repl = str(repl).strip()
-        if not repl.startswith(("show", "terminal", "term ", "enable")):
+    overrides: dict[str, str] = {}
+    for original, replacement in raw.items():
+        command = str(replacement).strip()
+        if not command.startswith(("show", "terminal", "term ", "enable")):
             raise ConfigError(
-                f"{path}: commands['{orig}'] = '{repl}' is not a read-only "
+                f"{path}: commands['{original}'] = '{command}' is not a read-only "
                 f"command - overrides must start with 'show', 'terminal'/"
                 f"'term' or 'enable', because the tool's read-only claim "
                 f"covers everything it sends")
-        command_overrides[str(orig).strip()] = repl
+        overrides[str(original).strip()] = command
+    return overrides
 
-    cs_raw = data.get("console_server") or {}
-    if not isinstance(cs_raw, dict):
-        raise ConfigError(f"{path}: 'console_server' must be a mapping with "
-                          f"'host' and a username_template/tcp_port_template")
-    console_server = ConsoleServerSettings(
-        host=str(cs_raw.get("host") or ""),
-        username_template=str(cs_raw.get("username_template") or ""),
-        tcp_port_template=str(cs_raw.get("tcp_port_template") or ""),
-        device_type=str(cs_raw.get("device_type") or "generic_termserver"),
+
+def _console_server(data: dict[str, Any], path: Path) -> ConsoleServerSettings:
+    raw = _section(data, "console_server", path,
+                   "'host' and a username_template/tcp_port_template")
+    return ConsoleServerSettings(
+        host=str(raw.get("host") or ""),
+        username_template=str(raw.get("username_template") or ""),
+        tcp_port_template=str(raw.get("tcp_port_template") or ""),
+        device_type=str(raw.get("device_type") or "generic_termserver"),
     )
 
-    mc_raw = data.get("mac_check") or {}
-    if not isinstance(mc_raw, dict):
-        raise ConfigError(f"{path}: 'mac_check' must be a mapping with "
-                          f"'interval', 'rounds' and/or 'stable'")
+
+def _mac_check(data: dict[str, Any], path: Path) -> MacCheckSettings:
+    raw = _section(data, "mac_check", path, "'interval', 'rounds' and/or 'stable'")
     try:
-        mac_check = MacCheckSettings(
-            interval_seconds=float(mc_raw.get("interval", 120)),
-            max_rounds=int(mc_raw.get("rounds", 15)),
-            stable_rounds=int(mc_raw.get("stable", 3)),
+        settings = MacCheckSettings(
+            interval_seconds=float(raw.get("interval", 120)),
+            max_rounds=int(raw.get("rounds", 15)),
+            stable_rounds=int(raw.get("stable", 3)),
         )
     except (TypeError, ValueError):
         raise ConfigError(f"{path}: mac_check interval/rounds/stable must be "
                           f"numbers") from None
-    if (mac_check.interval_seconds < 0 or mac_check.max_rounds < 1
-            or mac_check.stable_rounds < 1):
+    if (settings.interval_seconds < 0 or settings.max_rounds < 1
+            or settings.stable_rounds < 1):
         raise ConfigError(f"{path}: mac_check needs interval >= 0, rounds >= 1 "
                           f"and stable >= 1")
+    return settings
 
-    plan_raw = data.get("plan") or {}
-    if not isinstance(plan_raw, dict):
-        raise ConfigError(f"{path}: 'plan' must be a mapping with 'ports', "
-                          f"'uplinks' and/or 'mlt_name'")
+
+def _plan(data: dict[str, Any], path: Path) -> PlanSettings:
+    raw = _section(data, "plan", path, "'ports', 'uplinks' and/or 'mlt_name'")
     try:
-        plan = PlanSettings(
-            ports=int(plan_raw["ports"]) if plan_raw.get("ports") is not None else None,
-            uplinks=(int(plan_raw["uplinks"]) if plan_raw.get("uplinks") is not None
-                     else None),
-            mlt_name=str(plan_raw.get("mlt_name") or "f{slot}{port}"),
-            port_lines=[str(x) for x in plan_raw["port_lines"]]
-            if plan_raw.get("port_lines") is not None else list(DEFAULT_PORT_LINES),
+        return PlanSettings(
+            ports=int(raw["ports"]) if raw.get("ports") is not None else None,
+            uplinks=int(raw["uplinks"]) if raw.get("uplinks") is not None else None,
+            mlt_name=str(raw.get("mlt_name") or "f{slot}{port}"),
+            port_lines=([str(x) for x in raw["port_lines"]]
+                        if raw.get("port_lines") is not None
+                        else list(DEFAULT_PORT_LINES)),
         )
     except (TypeError, ValueError):
         raise ConfigError(f"{path}: plan ports/uplinks must be numbers") from None
-
-    return Config(
-        dvr_controllers=dvrs,
-        core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
-        isid_offsets=offsets,
-        isid_explicit=explicit,
-        excluded_vlans=excluded_vlans,
-        excluded_vlan_names=[str(p) for p in (data.get("excluded_vlan_names") or [])],
-        unused_after_days=int(data.get("unused_after_days", 30)),
-        mac_cap=max(1, int(data.get("mac_cap", 10))),
-        locations=locations,
-        ssh=ssh,
-        inventory=inventory,
-        command_overrides=command_overrides,
-        console_server=console_server,
-        mac_check=mac_check,
-        plan=plan,
-    )
 
 
 def load_inventory(path: Path) -> list[SwitchTarget]:
@@ -372,7 +410,7 @@ def load_inventory(path: Path) -> list[SwitchTarget]:
     return targets
 
 
-def default_inventory(cfg: "Config") -> Path | None:
+def default_inventory(cfg: Config) -> Path | None:
     """The inventory to use when none is given: the config's `inventory:` key,
     else a `switches.yaml` sitting in the working directory."""
     if cfg.inventory is not None:
@@ -384,10 +422,10 @@ def default_inventory(cfg: "Config") -> Path | None:
 def parse_switch_arg(arg: str) -> SwitchTarget:
     """Parse a CLI -s argument: NAME:PLATFORM[:HOST]."""
     parts = arg.split(":")
-    if len(parts) < 2:
+    if len(parts) < NAME_AND_PLATFORM:
         raise ConfigError(f"-s '{arg}': expected NAME:PLATFORM[:HOST] (e.g. old-sw-01:ers)")
     name, platform = parts[0], parts[1]
-    host = parts[2] if len(parts) > 2 else name
+    host = parts[HOST_PART] if len(parts) > HOST_PART else name
     return _make_target(name, host, platform, where=f"-s '{arg}'")
 
 

@@ -1,12 +1,12 @@
 """The rack sheet: a print rendering of the filled-in cabling sheet (D6)."""
 
-from pathlib import Path
 
 import pytest
 
 from switch_migrator import cabling_sheet, cli
 from switch_migrator.cabling_sheet import CablingRow, Sheet
 from switch_migrator.report.rack_sheet import HEADERS, build_rack_sheets
+from switch_migrator.workflow.outputs import write_rack_sheet
 
 
 def _row(switch, port, **kw) -> CablingRow:
@@ -28,16 +28,18 @@ def test_one_page_per_old_switch_in_faceplate_order_dead_ports_last():
     port, on_it, link, note = (HEADERS.index(h) for h in ("Port", "On it", "Link", "Note"))
     assert [r[port] for r in b.rows] == ["1/2", "1/10", "1/3"]  # dead 1/3 last
     assert "if a cable IS plugged in" in b.rows[2][note]            # R7
-    assert b.rows[0][on_it] == '"esx-07"' and b.rows[0][link] == "MLT 35 (old)"
+    assert b.rows[0][on_it] == '"esx-07"'
+    assert b.rows[0][link] == "MLT 35 (old)"
     a_note = tables[0].rows[0][note]
-    assert "no new port planned" in a_note and "identify at the rack" in a_note
+    assert "no new port planned" in a_note
+    assert "identify at the rack" in a_note
     assert "read the cable label" in a_note
 
 
 def test_the_rack_sheet_is_never_read_back_as_a_cabling_sheet(tmp_path):
     sheet = Sheet(rows=[_row("sw", "1/1", new_switch="leaf", new_port="1/1",
                              usage="IN USE")])
-    path = cli.write_rack_sheet(sheet, tmp_path)
+    path = write_rack_sheet(sheet, tmp_path)
     with pytest.raises(cabling_sheet.SheetError, match="Old port"):
         cabling_sheet.load(path)
 
