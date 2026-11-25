@@ -131,3 +131,18 @@ def test_clear_errors_for_junk_input(tmp_path):
     other.write_text('{"something": "else"}')
     with pytest.raises(snapshot.SnapshotError, match="not a switch-migrator"):
         snapshot.load(other)
+
+
+def test_a_port_saved_with_description_comes_back_as_media(tmp_path):
+    """PortState.description held the media type and was renamed to media."""
+    old = {
+        "format": snapshot.SNAPSHOT_FORMAT, "tool_version": "1.0.0",
+        "created": "2026-08-01T00:00:00", "fabric": {},
+        "switches": [{"name": "sw", "host": "sw", "platform": "voss", "reachable": True,
+                      "ports": [{"port": "1/1", "description": "10GbSR"}]}],
+    }
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(old))
+    audits, _, _ = snapshot.load(path)
+    assert audits[0].ports[0].media == "10GbSR"
+    assert audits[0].ports[0].name == ""

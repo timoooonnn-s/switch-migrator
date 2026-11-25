@@ -19,6 +19,8 @@ from switch_migrator.models import (
     SwitchAudit,
     tagging_summary,
 )
+from switch_migrator.parsers.common import port_sort_key
+from switch_migrator.plan import OVERFLOW, MigrationPlan
 from switch_migrator.report.tables import Table
 
 
@@ -35,12 +37,13 @@ def new_switch_names(value: str) -> list[str]:
 def assign_port_uids(audits: list[SwitchAudit], prefix: str = "P") -> None:
     """Assign stable sequential migration IDs across all audited switches.
 
-    Deterministic: switches in name order, ports in their collected order, so a
-    re-run of the same inventory produces the same IDs.
+    Deterministic: switches in name order, ports in faceplate order, so a
+    re-run of the same inventory produces the same IDs and they ascend along
+    the front of the switch.
     """
     n = 0
     for audit in sorted(audits, key=lambda a: a.name):
-        for port in audit.ports:
+        for port in sorted(audit.ports, key=lambda x: port_sort_key(x.port)):
             n += 1
             port.uid = f"{prefix}{n:04d}"
 
@@ -128,7 +131,7 @@ def _sources_cell(holder) -> str:
 def build_port_info(audits: list[SwitchAudit]) -> Table:
     """Sheet 1: every port with everything needed during the migration."""
     t = Table("Port Info", [
-        "Port ID", "Switch", "Port", "Device on port", "Neighbor IP",
+        "Port ID", "Switch", "Port", "Port name", "Device on port", "Neighbor IP",
         "MAC addresses", "Untagged VLAN", "Tagging", "VLAN -> I-SID",
         "VLAN IDs", "I-SIDs", "Admin", "Oper",
         "LACP", "MLT ID", "MLT name", "Transceiver", "Media", "Uplink",
@@ -138,9 +141,9 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
                          "VLAN -> I-SID", "Oper", "MLT ID", "Usage"]
     t.wrap_columns = ["VLAN -> I-SID", "MAC addresses", "Why"]
     for audit in sorted(audits, key=lambda a: a.name):
-        for p in audit.ports:
+        for p in sorted(audit.ports, key=lambda x: port_sort_key(x.port)):
             t.add([
-                p.uid, audit.name, p.port, _neighbor(p), p.lldp_neighbor_ip,
+                p.uid, audit.name, p.port, p.name, _neighbor(p), p.lldp_neighbor_ip,
                 _macs_cell(p), _untagged_vlan(p), _tagging(p), _pairs_cell(p.bindings),
                 ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
                 _fmt_bool(p.admin_up, "enable", "disable"),
@@ -157,7 +160,8 @@ def build_port_info(audits: list[SwitchAudit]) -> Table:
 
 def build_cabling_by_location(audits: list[SwitchAudit],
                               rules: LocationRules,
-                              new_switches: list[str] | None = None) -> list[Table]:
+                              new_switches: list[str] | None = None,
+                              plan: MigrationPlan | None = None) -> list[Table]:
     """One cabling worksheet per location group.
 
     Deliberately NOT accompanied by a combined sheet. This is a document people
@@ -172,16 +176,23 @@ def build_cabling_by_location(audits: list[SwitchAudit],
     by_name = {a.name: a for a in audits}
     tables = []
     for group, names in groups.items():
-        table = build_cabling([by_name[n] for n in names], new_switches)
+        table = build_cabling([by_name[n] for n in names], new_switches, plan)
         table.title = f"Cabling {group}"
         tables.append(table)
     return tables
 
 
 def build_cabling(audits: list[SwitchAudit],
-                  new_switches: list[str] | None = None) -> Table:
+                  new_switches: list[str] | None = None,
+                  plan: MigrationPlan | None = None) -> Table:
     """Sheet 2: the DC cabling worksheet - connected ports only, with empty
     columns the technicians fill in as they re-patch.
+
+    With a `plan`, the NEW switch / port / MLT columns come pre-filled with the
+    plan's proposal and 'Plan note' says which rule placed each link. They stay
+    editable: what a human changes is read back as a pin next time. 'Done' is
+    ticked when the cable has actually moved, so a verification mid-window
+    checks the moved rows and leaves the planned ones pending.
 
     Laid out in the order the work actually happens: what the link is, where it
     is now (rack, switch, port), where it goes (rack, switch, port), and only
@@ -200,14 +211,15 @@ def build_cabling(audits: list[SwitchAudit],
     """
     t = Table("Cabling", [
         "Port ID", "Usage", "Type", "Untagged VLAN", "End device / neighbor",
+        "Port name",
         # where the link is today
         "Rack (old)", "Old switch", "Old port",
         # filled in by the technician / planner during the migration
         "Rack (new)", "NEW switch", "NEW port", "NEW MLT ID", "NEW MLT name",
-        "NEW VLAN",
+        "NEW VLAN", "Done", "Plan note",
         # what has to end up configured on the new port
         "Tagging", "VLAN -> I-SID",
-        "MLT ID", "MLT name", "MLT VLAN -> I-SID",
+        "MLT ID", "MLT name", "LACP", "MLT VLAN -> I-SID",
         "Port VLANs", "Port I-SIDs", "MLT VLANs", "MLT I-SIDs",
         "MAC addresses", "Media", "Why", "VLAN source",
     ])
@@ -215,14 +227,14 @@ def build_cabling(audits: list[SwitchAudit],
                          "End device / neighbor", "Old switch", "Old port",
                          "MLT ID"]
     t.manual_columns = ["Rack (old)", "Rack (new)", "NEW switch", "NEW port",
-                        "NEW MLT ID", "NEW MLT name", "NEW VLAN"]
+                        "NEW MLT ID", "NEW MLT name", "NEW VLAN", "Done"]
     t.int_columns = ["NEW MLT ID", "NEW VLAN"]
     t.wrap_columns = ["VLAN -> I-SID", "MLT VLAN -> I-SID", "MAC addresses",
                       "Why", "End device / neighbor"]
     t.page_break_column = "Old switch"
     # Port ID, Usage, Type and the neighbour stay visible while the technician
     # scrolls right into the columns they are filling in
-    t.freeze_columns = 5
+    t.freeze_columns = 6
     if new_switches:
         t.choice_columns = {"NEW switch": sorted(set(new_switches))}
 
@@ -230,19 +242,27 @@ def build_cabling(audits: list[SwitchAudit],
         mlt_by_id = {m.mlt_id: m for m in audit.mlts}
         # in-use ports first so the techs work top-down; likely-dead ports stay
         # on the sheet (never silently dropped) but sort to the bottom
-        for p in sorted(audit.ports, key=lambda x: (_usage_rank(x), x.port)):
+        for p in sorted(audit.ports,
+                        key=lambda x: (_usage_rank(x), port_sort_key(x.port))):
             if not _connected(p) and not p.usage:
                 continue
             kind = "uplink" if p.is_uplink else ("mlt" if p.mlt_id is not None
                                                  else "access")
             mlt = mlt_by_id.get(p.mlt_id) if p.mlt_id is not None else None
+            move = plan.move_for(audit.name, p.port) if plan else None
+            new = (["", move.new_switch, move.new_port,
+                    move.new_mlt_id if move.new_mlt_id is not None else "",
+                    move.new_mlt_name, "", "", move.note] if move
+                   else ["", "", "", "", "", "", "", _not_moved_note(plan, audit.name, p.port)])
             t.add([
-                p.uid, p.usage, kind, _untagged_vlan(p), _neighbor(p),
+                p.uid, p.usage, kind, _untagged_vlan(p), _neighbor(p), p.name,
                 "", audit.name, p.port,             # Rack (old) is filled in by hand
-                "", "", "", "", "", "",             # rack/switch/port/MLT/VLAN: theirs
+                *new,                               # rack/switch/port/MLT/VLAN/done/note
                 _tagging(p), _pairs_cell(p.bindings),
                 p.mlt_id if p.mlt_id is not None else "",
                 p.mlt_name,
+                # carried to --generate-mlt, which must never invent LACP
+                _fmt_bool(p.lacp, "yes", "no") if p.mlt_id is not None else "",
                 _pairs_cell(mlt.bindings) if mlt else "",
                 ",".join(map(str, p.vlans)), ",".join(map(str, p.isids)),
                 ",".join(map(str, mlt.vlans)) if mlt else "",
@@ -250,6 +270,45 @@ def build_cabling(audits: list[SwitchAudit],
                 _macs_cell(p), p.media, p.usage_evidence, _sources_cell(p),
             ], "warn" if p.usage == usage.DEGRADED else None)
     return t
+
+
+def _not_moved_note(plan: MigrationPlan | None, switch: str, port: str) -> str:
+    if plan is None:
+        return ""
+    for item in plan.not_moved:
+        if item.link.key == (switch, port):
+            return f"not planned: {item.reason}"
+    return ""
+
+
+def build_plan_tables(plan: MigrationPlan) -> list[Table]:
+    """The plan at a glance: how full each new switch is, what does not move
+    and why, and what a human should look at before the sheet goes out."""
+    fill = Table("Plan", ["New switch", "Peer", "Access ports", "Dual-homed (from 1)",
+                          "Single-homed (from the top)", "Pinned", "Free"])
+    for f in plan.fill:
+        fill.add([f.name, f.peer, f.access_ports, f.dual, f.single, f.pinned, f.free],
+                 "error" if f.free < 0 else ("warn" if f.free == 0 else None))
+    # 'Switch'/'Port', not 'Old ...': this is not a fill-in sheet and must never
+    # be read back as one
+    not_moved = Table("Not moved", ["Port ID", "Switch", "Port", "On it", "Why"])
+    not_moved.wrap_columns = ["Why"]
+    for item in sorted(plan.not_moved, key=lambda n: (n.link.old_switch,
+                                                      port_sort_key(n.link.old_port))):
+        not_moved.add([item.link.uid, item.link.old_switch, item.link.old_port,
+                       item.link.neighbor, item.reason],
+                      "error" if item.reason.startswith(OVERFLOW) else None)
+    notes = Table("Plan notes", ["Kind", "Note"])
+    notes.wrap_columns = ["Note"]
+    for problem in plan.problems:
+        notes.add(["problem", problem], "warn")
+    for hint in plan.hints:
+        notes.add(["hint", hint])
+    for move in plan.moves:
+        for flag in [*move.link.flags, *move.flags]:
+            notes.add(["check", f"{move.link.old_switch} {move.link.old_port} -> "
+                                f"{move.new_switch} {move.new_port}: {flag}"])
+    return [fill, not_moved, notes]
 
 
 def build_commands(audits: list[SwitchAudit], new_switch: str = "") -> str:

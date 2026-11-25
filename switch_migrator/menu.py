@@ -37,6 +37,7 @@ from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator import handover as handover_mod
 from switch_migrator import health as health_mod
 from switch_migrator import location as location_mod
+from switch_migrator import mac_check
 from switch_migrator import manifest as manifest_mod
 from switch_migrator import profiles as profiles_mod
 from switch_migrator import snapshot as snapshot_mod
@@ -73,6 +74,9 @@ class Session:
     # provenance: set when the data came from a snapshot rather than devices
     loaded_from: Path | None = None
     commands_by_device: dict = field(default_factory=dict)
+    # the last migration-check MAC snapshot taken in this session (the
+    # baseline the verification offers by default)
+    mac_snapshot: Path | None = None
 
     @property
     def has_data(self) -> bool:
@@ -97,6 +101,7 @@ class Session:
             debug=False, dry_run=False, save_snapshot=None, from_snapshot=None,
             manifest=self.write_manifest,
             split_by_location=self.split_by_location, location_group=[],
+            mac_snapshot=None, mac_baseline=[], mac_watch=False,
         )
         base.update(over)
         return argparse.Namespace(**base)
@@ -201,6 +206,8 @@ def _status_panel(s: Session) -> Panel:
                      + (f", incl. {', '.join(extras)}" if extras else "") + ")")
     else:
         lines.append("[bold yellow]Data:[/bold yellow]      not collected yet")
+    if s.mac_snapshot:
+        lines.append(f"[bold]MAC base:[/bold]  {s.mac_snapshot}")
     return Panel("\n".join(lines), title="switch-migrator", title_align="left")
 
 
@@ -218,6 +225,7 @@ _ENTRIES = [
     ("9", "Dry run", "list every command a collection would send - connects to nothing"),
     ("h", "Health check", "go/no-go before the window: what is already broken?"),
     ("m", "Generate MLT blocks", "new switches' MLT config from a filled-in cabling sheet"),
+    ("r", "Rack sheet", "print version of a filled-in cabling sheet for the technicians"),
     ("v", "Verify migration", "after the window: check every re-patched link"),
     ("b", "Handover bundle", "one folder with every output and an index to hand over"),
     ("p", "Profiles", "load or save a named scenario (inventory + settings)"),
@@ -356,6 +364,11 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     want_config = _yes(console, "Also pull running-config? (needed for config "
                                 "extract; also gives the sheets tagged/untagged)")
     want_macs = _yes(console, "Also collect MAC tables? (needed for migration sheets)")
+    # the migration-check baseline: taken on the same sessions, so it costs a
+    # few extra show commands per switch and no extra login
+    want_mac_snapshot = mac_check.available() and _yes(
+        console, "Also save a MAC snapshot for the after-check? (the baseline "
+                 "migration-check compares the new switches against)", want_macs)
 
     creds, dvr_creds = creds_fn(s, console)
     if creds is None:
@@ -374,6 +387,13 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
     started = datetime.now()
     commands: dict = {}
     fabric = FabricState()
+    recorder = None
+    if want_mac_snapshot:
+        path = s.output_dir / f"mac-snapshot-{started:%Y%m%d-%H%M%S}"
+        try:
+            recorder = mac_check.SnapshotRecorder(path, label=path.name)
+        except Exception as exc:  # noqa: BLE001 - the collection itself still runs
+            console.print(f"[yellow]MAC snapshot skipped: {exc}[/yellow]")
     # the fabric read and the switch reads are independent - overlap them so
     # the DvR round-trip is not in front of every device
     with make_progress(console, len(s.selected),
@@ -382,9 +402,14 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
             future = (pool.submit(collect_fabric, s.cfg.dvr_controllers,
                                   dvr_creds, s.cfg, args, prog)
                       if want_fabric else None)
-            audits = run_collection(s.selected, creds, s.cfg, args, prog, commands)
+            audits = run_collection(s.selected, creds, s.cfg, args, prog, commands,
+                                    mac_recorder=recorder)
             if future is not None:
                 fabric = future.result()
+    if recorder is not None:
+        s.mac_snapshot = recorder.finish()
+        console.print(f"[green]MAC snapshot:[/green] {s.mac_snapshot} "
+                      f"[dim](offered as the baseline in 'v')[/dim]")
     if want_fabric:
         if not fabric.dvrs_ok:
             console.print("[red]No DvR controller could be read - continuing "
@@ -433,7 +458,7 @@ def action_collect(s: Session, console: Console, creds_fn) -> None:
 
 def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
                    extract_config: bool, migration_sheets: bool,
-                   title: str) -> None:
+                   title: str, plan=None) -> None:
     """Build the tables for one use case and write the report files."""
     from switch_migrator.cli import _write_config_extracts
     from switch_migrator.compare import compare_switch, resolve_binding_isids
@@ -441,7 +466,7 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     from switch_migrator.report.excel import write_excel
     from switch_migrator.report.migration import (
         assign_port_uids, build_cabling, build_cabling_by_location,
-        build_commands, build_port_info, new_switch_names)
+        build_commands, build_plan_tables, build_port_info, new_switch_names)
     from switch_migrator.report.tables import build_all
 
     fabric = s.fabric or FabricState()
@@ -452,17 +477,27 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     tables = build_all(s.audits, fabric, comparisons, no_fabric=no_fabric)
     if migration_sheets:
         assign_port_uids(s.audits)
+        if plan is not None:
+            from switch_migrator.cli import _print_plan
+            from switch_migrator.plan import make_plan
+
+            layout, pins = plan
+            plan = make_plan(s.audits, new_switch_names(s.new_switch), layout,
+                             mlt_name=s.cfg.plan.mlt_name, pins=pins)
+            _print_plan(plan, console)
         tables.append(build_port_info(s.audits))
         if s.split_by_location:
             rules = s.location_rules()
             tables += build_cabling_by_location(
-                s.audits, rules, new_switch_names(s.new_switch))
+                s.audits, rules, new_switch_names(s.new_switch), plan)
             console.print("[dim]Cabling split by location:[/dim]")
             for line in location_mod.describe(rules, [a.name for a in s.audits]):
                 console.print(f"  [dim]{line}[/dim]")
         else:
             tables.append(
-                build_cabling(s.audits, new_switch_names(s.new_switch)))
+                build_cabling(s.audits, new_switch_names(s.new_switch), plan))
+        if plan is not None:
+            tables += build_plan_tables(plan)
 
     console_report.render(tables, console, verbose=False)
 
@@ -478,6 +513,10 @@ def _write_outputs(s: Session, console: Console, *, no_fabric: bool,
     if extract_config:
         written += _write_config_extracts(s.audits, s.output_dir, comparisons,
                                           s.cfg, console)
+    if plan is not None:
+        from switch_migrator.cli import write_new_switch_configs
+        written += write_new_switch_configs(s.audits, plan, s.cfg, s.output_dir,
+                                            console)
     for path in written:
         console.print(f"[green]Written:[/green] {path}")
 
@@ -504,11 +543,47 @@ def action_sheets(s: Session, console: Console) -> None:
                       "yes to the MAC question for full sheets.[/yellow]")
         if not _yes(console, "Continue anyway?", default=False):
             return
-    if not s.new_switch:
-        s.new_switch = _ask(console, "Name of the NEW switch (for the commands file)")
+    s.new_switch = _ask(console, "NEW switch(es), comma-separated (A,B = one vIST "
+                                 "pair, A,B,C,D = two)", default=s.new_switch)
+    plan = _ask_plan(s, console) if s.new_switch else None
     _write_outputs(s, console, no_fabric=not s.collected_fabric,
                    extract_config=False, migration_sheets=True,
-                   title="migration-sheets")
+                   title="migration-sheets", plan=plan)
+
+
+def _ask_plan(s: Session, console: Console):
+    """Plan the new ports? Returns (layout, pins) or None. The answers become
+    this session's defaults."""
+    from switch_migrator import cabling_sheet
+    from switch_migrator.plan import Layout, pins_from_sheet
+
+    if not _yes(console, "Plan where every link goes (pre-fill NEW switch/port)?",
+                default=True):
+        return None
+    while True:
+        ports = _ask(console, "Ports on the new switch model",
+                     default=str(s.cfg.plan.ports or ""))
+        uplinks = _ask(console, "How many of the LAST ports are uplinks",
+                       default=str(s.cfg.plan.uplinks if s.cfg.plan.uplinks is not None
+                                   else ""))
+        if not ports or not uplinks:
+            console.print("[yellow]No layout given - sheets without a plan.[/yellow]")
+            return None
+        try:
+            layout = Layout(ports=int(ports), uplinks=int(uplinks))
+            break
+        except ValueError as exc:
+            console.print(f"[red]{exc or 'enter two numbers'}[/red]")
+    s.cfg.plan.ports, s.cfg.plan.uplinks = layout.ports, layout.uplinks
+    pins = {}
+    raw = _ask(console, "Keep the NEW ports of an edited cabling sheet? (path, "
+                        "blank: plan from scratch)", path=True)
+    if raw:
+        try:
+            pins = pins_from_sheet(cabling_sheet.load(Path(raw)).rows)
+        except cabling_sheet.SheetError as exc:
+            console.print(f"[yellow]{exc} - planning from scratch[/yellow]")
+    return layout, pins
 
 
 def action_config(s: Session, console: Console) -> None:
@@ -619,9 +694,12 @@ def action_dry_run(s: Session, console: Console) -> None:
         return
     want_config = _yes(console, "Include the running-config pull?", False)
     want_macs = _yes(console, "Include the MAC/optics collection?", True)
+    want_mac_snapshot = mac_check.available() and _yes(
+        console, "Include the MAC snapshot for migration-check?", False)
     args = s.to_args(extract_config=want_config, migration_sheets=want_macs)
-    render_dry_run(preview_commands(s.selected, s.cfg, args,
-                                    dvrs=s.cfg.dvr_controllers), console)
+    render_dry_run(preview_commands(
+        s.selected, s.cfg, args, dvrs=s.cfg.dvr_controllers,
+        mac_for={t.name for t in s.selected} if want_mac_snapshot else ()), console)
 
 
 def action_health(s: Session, console: Console) -> None:
@@ -684,6 +762,24 @@ def action_generate_mlt(s: Session, console: Console) -> None:
     console.print(f"[green]Written:[/green] {out}")
 
 
+def action_rack_sheet(s: Session, console: Console) -> None:
+    """Cabling sheet in, printable rack sheet out. Touches no device."""
+    from switch_migrator import cabling_sheet
+    from switch_migrator.cli import write_rack_sheet
+
+    raw = _ask(console, "Filled-in cabling sheet (.xlsx or .csv)", path=True)
+    if not raw:
+        return
+    try:
+        sheet = cabling_sheet.load(Path(raw))
+    except cabling_sheet.SheetError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    path = write_rack_sheet(sheet, s.output_dir)
+    console.print(f"[green]Rack sheet[/green] ({len(sheet.migrated)} of "
+                  f"{len(sheet.rows)} link(s) planned): {path}")
+
+
 def action_verify(s: Session, console: Console, creds_fn) -> None:
     """Read the filled-in sheet, collect the NEW switches, check every link."""
     from switch_migrator import cabling_sheet, verify
@@ -711,14 +807,24 @@ def action_verify(s: Session, console: Console, creds_fn) -> None:
                   f"{', '.join(names)}")
     targets = [SwitchTarget(name=n, host=n, platform=Platform.VOSS)
                for n in names]
+    baselines, watching = _ask_mac_baselines(s, console)
 
     creds, _ = creds_fn(s, console)
     if creds is None:
         return
     # the MACs on the new ports are the evidence, so collect them
     args = s.to_args(no_fabric=True, migration_sheets=True)
+    started = datetime.now()
+    stamp = f"{started:%Y%m%d-%H%M%S}"
+    recorder = None
+    if baselines:
+        recorder = mac_check.SnapshotRecorder(
+            mac_check.after_snapshot_path(s.output_dir, stamp, watching), label="after")
     with make_progress(console, len(targets)) as prog:
-        audits = run_collection(targets, creds, s.cfg, args, prog, {})
+        audits = run_collection(targets, creds, s.cfg, args, prog, {},
+                                mac_recorder=recorder)
+    if recorder is not None:
+        recorder.finish()
 
     report = verify.verify(sheet, audits)
     extra = verify.unexpected_ports(sheet, audits)
@@ -734,9 +840,47 @@ def action_verify(s: Session, console: Console, creds_fn) -> None:
     for problem in report.problems:
         console.print(f"  [yellow]{problem}[/yellow]")
     s.output_dir.mkdir(parents=True, exist_ok=True)
-    out = s.output_dir / f"verification-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+    out = s.output_dir / f"verification-{stamp}.xlsx"
     write_excel(tables, out)
     console.print(f"[green]Written:[/green] {out}")
+
+    if recorder is not None:
+        from switch_migrator.cli import make_runner, run_mac_check
+
+        try:
+            run_mac_check(
+                baselines, recorder.path, sheet, s.output_dir, stamp,
+                watch=s.cfg.mac_check if watching else None, targets=targets,
+                open_runner=lambda t: make_runner(t.name, t.host, t.platform, creds,
+                                                  s.cfg, args, console=t.console),
+                workers=s.cfg.ssh.workers, console=console)
+        except Exception as exc:  # noqa: BLE001 - the verification is already written
+            console.print(f"[red]MAC check could not run: {exc}[/red]")
+
+
+def _ask_mac_baselines(s: Session, console: Console) -> tuple[list[Path], bool]:
+    """The MAC baseline folder(s) for migration-check, and whether to watch.
+    Nothing to ask when migration-check is not installed - verification runs as
+    it always did."""
+    if not mac_check.available():
+        return [], False
+    raw = _ask(console, "MAC baseline folder(s) for the after-check, comma-"
+                        "separated (blank: skip)",
+               default=str(s.mac_snapshot or ""), path=True)
+    baselines = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    missing = [str(p) for p in baselines if not p.is_dir()]
+    if missing:
+        console.print(f"[yellow]No such folder: {', '.join(missing)} - the MAC "
+                      f"check is skipped.[/yellow]")
+        return [], False
+    for folder in mac_check.unreadable_baselines(baselines):
+        console.print(f"[yellow]{folder}: an old VOSS --save-raw capture; its MAC "
+                      f"table cannot be read and is left out.[/yellow]")
+    watching = bool(baselines) and _yes(
+        console, f"Re-read the new switches until every MAC is back? (every "
+                 f"{s.cfg.mac_check.interval_seconds:g} s, at most "
+                 f"{s.cfg.mac_check.max_rounds} rounds)", False)
+    return baselines, watching
 
 
 def _set_offline(s: Session, console: Console) -> None:
@@ -1065,6 +1209,7 @@ def run_menu(config_path: Path, inventory_path: Path | None = None,
         "9": lambda: action_dry_run(s, console),
         "h": lambda: action_health(s, console),
         "m": lambda: action_generate_mlt(s, console),
+        "r": lambda: action_rack_sheet(s, console),
         "v": lambda: action_verify(s, console, creds_fn),
         "b": lambda: action_handover(s, console),
         "p": lambda: action_profiles(s, console),

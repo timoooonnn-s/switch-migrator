@@ -8,7 +8,8 @@ from switch_migrator import mlt_generate as G
 
 HEADERS = ["Port ID", "Type", "End device / neighbor", "NEW switch", "NEW port",
            "NEW MLT ID", "NEW MLT name", "NEW VLAN", "Old switch", "Old port",
-           "MLT ID", "MLT name", "MLT VLANs", "Port VLANs", "Port I-SIDs"]
+           "MLT ID", "MLT name", "LACP", "MLT VLANs", "Port VLANs", "Port I-SIDs",
+           "Usage"]
 
 
 def _sheet(tmp_path: Path, rows: list[dict]) -> CS.Sheet:
@@ -24,7 +25,7 @@ def _sheet(tmp_path: Path, rows: list[dict]) -> CS.Sheet:
 def _member(port: str, new_port: str, **kw) -> dict:
     row = {"Old switch": "gx-01", "Old port": port, "NEW switch": "leaf-01",
            "NEW port": new_port, "MLT ID": "35", "MLT name": "MLT035.srv",
-           "Type": "mlt"}
+           "Type": "mlt", "LACP": "yes"}
     row.update(kw)
     return row
 
@@ -82,9 +83,57 @@ def test_a_plain_access_port_is_not_an_mlt(tmp_path):
     assert result.plans == []
 
 
-def test_an_aggregation_of_one_is_flagged(tmp_path):
-    result = G.plan(_sheet(tmp_path, [_member("1/1", "1/11")]))
+def test_an_aggregation_of_one_is_flagged_without_smlt(tmp_path):
+    result = G.plan(_sheet(tmp_path, [_member("1/1", "1/11")]), smlt=False)
     assert any("only one member" in x for x in result.plans[0].problems)
+
+
+def test_a_one_member_smlt_leg_is_the_normal_server_shape(tmp_path):
+    """Production: f110, f143 ... - one port per vIST peer. Nothing to flag."""
+    result = G.plan(_sheet(tmp_path, [
+        _member("1/10", "1/1", **{"MLT ID": "196", "MLT name": "f110"}),
+        _member("1/10", "1/1", **{"MLT ID": "196", "MLT name": "f110",
+                                  "Old switch": "gx-02", "NEW switch": "leaf-02"}),
+    ]))
+    assert [p.problems for p in result.plans] == [[], []]
+    assert result.problems == []
+
+
+def test_a_member_not_recorded_yet_is_named(tmp_path):
+    result = G.plan(_sheet(tmp_path, [
+        _member("1/1", "1/11"),
+        _member("1/2", "", **{"NEW switch": ""}),            # not patched yet
+        _member("1/3", "", **{"NEW switch": "", "Usage": "UNUSED"}),  # dead: ignored
+    ]))
+    assert any("1 more link(s) of the old aggregation" in x
+               for x in result.plans[0].problems)
+
+
+def _config_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+
+def test_lacp_is_carried_from_the_sheet_never_invented(tmp_path):
+    static = G.plan(_sheet(tmp_path, [
+        _member("1/1", "1/11", LACP="no"), _member("1/2", "1/12", LACP="no")]))
+    assert static.plans[0].lacp is False
+    assert not any("lacp" in x for x in _config_lines(G.render(static)))
+
+    unknown = G.plan(_sheet(tmp_path, [
+        _member("1/1", "1/11", LACP=""), _member("1/2", "1/12", LACP="")]))
+    assert unknown.plans[0].lacp is None
+    assert not any("lacp" in x for x in _config_lines(G.render(unknown)))
+    assert any("LACP unknown" in x for x in unknown.plans[0].problems)
+
+    forced = G.plan(_sheet(tmp_path, [
+        _member("1/1", "1/11", LACP=""), _member("1/2", "1/12", LACP="")]), lacp=True)
+    assert "lacp enable key 35" in G.render(forced)
+
+
+def test_a_lacp_cell_that_is_not_yes_or_no_is_a_row_problem(tmp_path):
+    sheet = _sheet(tmp_path, [_member("1/1", "1/11", LACP="maybe")])
+    assert sheet.rows[0].lacp is None
+    assert any("neither yes nor no" in x for x in sheet.rows[0].problems)
 
 
 def test_an_id_claimed_twice_on_one_switch_is_a_problem(tmp_path):
@@ -217,7 +266,7 @@ def test_blocks_are_grouped_per_new_switch(tmp_path):
 
 
 def test_problems_are_printed_before_the_config(tmp_path):
-    result = G.plan(_sheet(tmp_path, [_member("1/1", "1/11")]))
+    result = G.plan(_sheet(tmp_path, [_member("1/1", "1/11")]), smlt=False)
     text = G.render(result)
     assert "[!] only one member" in text
     assert text.index("[!]") < text.index("mlt 35 enable")

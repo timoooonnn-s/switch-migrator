@@ -97,6 +97,40 @@ class SshSettings:
 
 
 @dataclass
+class MacCheckSettings:
+    """How --mac-watch re-reads the new switches (migration-check's `watch`).
+
+    The first after snapshot always over-reports: a host that has not sent a frame
+    since the cutover is in no MAC table yet. So the new switches are read again
+    every `interval_seconds`, until every MAC is back, the number not back has not
+    fallen for `stable_rounds` rounds, or `max_rounds` is reached.
+    """
+    interval_seconds: float = 120.0
+    max_rounds: int = 15
+    stable_rounds: int = 3
+
+
+@dataclass
+class PlanSettings:
+    """The new switches a plan fills (`plan:` in config.yaml).
+
+    `ports` is every port of the new model (1/1..1/<ports>); the last `uplinks` of
+    them are the fabric uplinks and never planned (round 2, R1). Both have no
+    default on purpose: a wrong guess plans servers onto uplink ports.
+    `mlt_name` names new MLTs: {slot}, {port} (the first member) and {id}.
+    `port_lines` close every new flex-UNI access port - the hygiene set seen on
+    the production access port.
+    """
+    ports: int | None = None
+    uplinks: int | None = None
+    mlt_name: str = "f{slot}{port}"
+    port_lines: list[str] = field(default_factory=lambda: list(DEFAULT_PORT_LINES))
+
+
+DEFAULT_PORT_LINES = ("slpp-guard enable timeout 0", "spanning-tree mstp edge-port true")
+
+
+@dataclass
 class Credentials:
     username: str
     password: str
@@ -129,6 +163,10 @@ class Config:
     # optional terminal server for switches with a `console:` line
     console_server: ConsoleServerSettings = field(
         default_factory=ConsoleServerSettings)
+    # --mac-watch pacing (the MAC check by migration-check)
+    mac_check: MacCheckSettings = field(default_factory=MacCheckSettings)
+    # the new switches a --plan fills
+    plan: PlanSettings = field(default_factory=PlanSettings)
 
 
 def _require(data: dict, key: str, path: Path):
@@ -255,6 +293,40 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         device_type=str(cs_raw.get("device_type") or "generic_termserver"),
     )
 
+    mc_raw = data.get("mac_check") or {}
+    if not isinstance(mc_raw, dict):
+        raise ConfigError(f"{path}: 'mac_check' must be a mapping with "
+                          f"'interval', 'rounds' and/or 'stable'")
+    try:
+        mac_check = MacCheckSettings(
+            interval_seconds=float(mc_raw.get("interval", 120)),
+            max_rounds=int(mc_raw.get("rounds", 15)),
+            stable_rounds=int(mc_raw.get("stable", 3)),
+        )
+    except (TypeError, ValueError):
+        raise ConfigError(f"{path}: mac_check interval/rounds/stable must be "
+                          f"numbers") from None
+    if (mac_check.interval_seconds < 0 or mac_check.max_rounds < 1
+            or mac_check.stable_rounds < 1):
+        raise ConfigError(f"{path}: mac_check needs interval >= 0, rounds >= 1 "
+                          f"and stable >= 1")
+
+    plan_raw = data.get("plan") or {}
+    if not isinstance(plan_raw, dict):
+        raise ConfigError(f"{path}: 'plan' must be a mapping with 'ports', "
+                          f"'uplinks' and/or 'mlt_name'")
+    try:
+        plan = PlanSettings(
+            ports=int(plan_raw["ports"]) if plan_raw.get("ports") is not None else None,
+            uplinks=(int(plan_raw["uplinks"]) if plan_raw.get("uplinks") is not None
+                     else None),
+            mlt_name=str(plan_raw.get("mlt_name") or "f{slot}{port}"),
+            port_lines=[str(x) for x in plan_raw["port_lines"]]
+            if plan_raw.get("port_lines") is not None else list(DEFAULT_PORT_LINES),
+        )
+    except (TypeError, ValueError):
+        raise ConfigError(f"{path}: plan ports/uplinks must be numbers") from None
+
     return Config(
         dvr_controllers=dvrs,
         core_switch_patterns=[str(p) for p in (data.get("core_switch_patterns") or [])],
@@ -269,6 +341,8 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         inventory=inventory,
         command_overrides=command_overrides,
         console_server=console_server,
+        mac_check=mac_check,
+        plan=plan,
     )
 
 

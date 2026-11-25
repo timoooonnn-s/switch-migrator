@@ -10,6 +10,17 @@ from switch_migrator.models import LldpNeighbor
 # 1/1  1/1/1  (VSP channelized)  49  2/49 (ERS stack)
 PORT_RE = re.compile(r"^\d+(?:/\d+){0,2}$")
 
+
+def port_sort_key(port: str) -> tuple:
+    """Faceplate order: '1/2' before '1/10', '2' before '10', unit by unit.
+
+    Every run of digits compares as a number, so slot/port, channelized
+    slot/port/sub-port and flat ERS numbering all sort the way the ports sit on
+    the hardware. Anything without digits sorts last, by its text.
+    """
+    numbers = tuple(int(n) for n in re.findall(r"\d+", str(port or "")))
+    return (0, numbers, "") if numbers else (1, (), str(port or ""))
+
 log = logging.getLogger(__name__)
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")

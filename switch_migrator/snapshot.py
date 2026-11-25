@@ -103,6 +103,10 @@ def _build(cls, data: dict):
     if not isinstance(data, dict):
         raise SnapshotError(f"expected an object for {cls.__name__}, "
                             f"got {type(data).__name__}")
+    # fields that were renamed: an older file still says it the old way
+    for old, new in _RENAMED.get(cls.__name__, {}).items():
+        if old in data and new not in data:
+            data = {**data, new: data[old]}
     kwargs = {}
     for f in fields(cls):
         if f.name not in data:
@@ -110,6 +114,10 @@ def _build(cls, data: dict):
         kwargs[f.name] = _coerce(f.type, data[f.name])
     return cls(**kwargs)
 
+
+# old field name -> new field name, per dataclass (PortState.description held
+# the media type and was renamed to say so)
+_RENAMED = {"PortState": {"description": "media"}}
 
 _NESTED = {"PortState": PortState, "MltState": MltState, "VlanInfo": VlanInfo,
            "IstState": IstState, "FabricIsid": FabricIsid,

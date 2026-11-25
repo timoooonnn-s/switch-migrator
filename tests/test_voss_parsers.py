@@ -14,7 +14,7 @@ def test_parse_ports(fixture):
     assert by_port["1/48"].admin_up is False
     assert by_port["2/1/1"].oper_up is True  # channelized port
     # descriptions come from the Port Interface section, not Port Name
-    assert by_port["1/1"].description == "1000BaseTX"
+    assert by_port["1/1"].media == "1000BaseTX"
 
 
 def test_parse_ports_without_section_banner(fixture):
@@ -328,7 +328,7 @@ ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR
 # the DESCRIPTION column of the Port Interface table
 # ---------------------------------------------------------------------------
 
-def test_port_interface_description_is_media_or_empty_never_a_shifted_column():
+def test_port_interface_media_is_media_or_empty_never_a_shifted_column():
     out = """\
                                       Port Interface
 PORT                               LINK  PORT           PHYSICAL          STATUS
@@ -338,8 +338,8 @@ NUM      INDEX DESCRIPTION         TRAP  LOCK     MTU   ADDRESS           ADMIN 
 1/9      200                       true  false    1950  b0:ad:aa:41:b4:09 down   down
 """
     ports = {p.port: p for p in voss_parsers.parse_ports(out)}
-    assert ports["1/1"].description == "10GbSR"
-    assert ports["1/9"].description == ""     # blank media, not 'true'
+    assert ports["1/1"].media == "10GbSR"
+    assert ports["1/9"].media == ""     # blank media, not 'true'
 
 
 # --------------------------------------------------------------------------- #

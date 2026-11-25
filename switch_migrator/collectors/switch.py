@@ -114,7 +114,7 @@ def _merge_port_details(audit: SwitchAudit, extra: list[PortState]) -> None:
         if port is None:
             audit.ports.append(other)
             continue
-        port.description = port.description or other.description
+        port.media = port.media or other.media
         if port.admin_up is None:
             port.admin_up = other.admin_up
         if port.oper_up is None:
@@ -149,7 +149,7 @@ def _collect_voss(audit: SwitchAudit, runner: BaseRunner) -> None:
             # leaves the media type blank. Keep going to the 'interface'
             # variant and merge that column in rather than sending a second
             # command later; both tables are one narrow row per port.
-            if all(p.description for p in parsed):
+            if all(p.media for p in parsed):
                 break
             continue
         _merge_port_details(audit, parsed)
@@ -328,10 +328,17 @@ def _config_bindings(audit: SwitchAudit,
             vlans = {vid: (model.vlan_names.get(vid, ""), model.vlan_isid.get(vid))
                      for vid in set(model.vlan_members) | set(model.vlan_names)
                      | set(model.vlan_isid)}
+            names = dict(model.port_names)
         else:
             model = ers_config.parse_ers_config(audit.running_config)
             ports, mlts = ers_config.port_bindings(model), {}
             vlans = {vid: (v.name, None) for vid, v in model.vlans.items()}
+            names = {p: port.name for p, port in model.ports.items() if port.name}
+        # the configured port names ride along: the same config, no extra command
+        by_port = {p.port: p for p in audit.ports}
+        for port_id, name in names.items():
+            if port_id in by_port and not by_port[port_id].name:
+                by_port[port_id].name = name
     except Exception as exc:                       # never lose a run to a config
         audit.warnings.append(f"running-config not usable as a VLAN source: {exc}")
         audit.record_source("running-config", False, str(exc)[:120])

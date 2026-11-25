@@ -7,6 +7,7 @@ import concurrent.futures as cf
 import logging
 import sys
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,8 @@ from switch_migrator.connection import (
 from switch_migrator.models import FabricState, Platform, SwitchAudit
 from switch_migrator import cabling_sheet, handover, health, location
 from switch_migrator import manifest as manifest_mod
-from switch_migrator import mlt_generate, snapshot as snapshot_mod, verify
+from switch_migrator import mac_check, mlt_generate, snapshot as snapshot_mod, standard, verify
+from switch_migrator.plan import Layout as PlanLayout, make_plan, pins_from_sheet
 from switch_migrator.report import console as console_report
 from switch_migrator.report.migration_tables import (
     build_health,
@@ -58,6 +60,7 @@ from switch_migrator.report.migration import (
     build_cabling,
     build_cabling_by_location,
     build_commands,
+    build_plan_tables,
     build_port_info,
     new_switch_names,
 )
@@ -105,9 +108,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "commands file with per-port MAC checks for the "
                              "new switch. Combine with --extract-config to "
                              "include the device config in that file.")
-    parser.add_argument("--new-switch", metavar="NAME", default="",
-                        help="name of the target switch, used in the "
-                             "--migration-sheets command file")
+    parser.add_argument("--new-switch", metavar="NAME[,NAME...]", default="",
+                        help="the new switch(es): A,B for one vIST pair, "
+                             "A,B,C,D for two. The cabling sheet offers them in "
+                             "a dropdown; --plan fills them pair by pair.")
+    parser.add_argument("--plan", action="store_true",
+                        help="plan where every old link goes on the --new-switch "
+                             "pair(s) and pre-fill the cabling sheet: dual-homed "
+                             "links from port 1 up (same port on both peers, MLT "
+                             "4xx), single-homed from the last access port down, "
+                             "the last --new-uplinks ports never. Implies "
+                             "--migration-sheets; works with --from-snapshot.")
+    parser.add_argument("--new-ports", type=int, metavar="N",
+                        help="--plan: ports on the new switch model (config "
+                             "plan.ports)")
+    parser.add_argument("--new-uplinks", type=int, metavar="N",
+                        help="--plan: how many of the LAST ports are fabric "
+                             "uplinks and never planned (config plan.uplinks)")
+    parser.add_argument("--pins", type=Path, metavar="SHEET",
+                        help="--plan: keep every NEW switch/port an edited "
+                             "cabling sheet already has, and plan the rest "
+                             "around them")
     parser.add_argument("--split-by-location", action="store_true",
                         help="give the cabling sheet one worksheet per "
                              "location instead of one for everything, so each "
@@ -170,14 +191,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "link on the NEW switches - link up, expected MACs "
                              "back, LLDP neighbor, VLANs and MLT membership. "
                              "The switches named here are the ones to collect.")
+    parser.add_argument("--mac-snapshot", type=Path, metavar="DIR",
+                        help="also save a migration-check snapshot of every "
+                             "switch read in this run, on the same sessions - "
+                             "the baseline for --mac-baseline. Take it of the "
+                             "OLD switches before the window (the day before "
+                             "and right before is better than once). DIR must "
+                             "not exist yet. Needs migration-check installed.")
+    parser.add_argument("--mac-baseline", type=Path, action="append",
+                        default=[], metavar="DIR",
+                        help="with --verify-migration: also check every "
+                             "end-device MAC the old switches learned - back "
+                             "anywhere, right VLAN, on the port the sheet "
+                             "says? DIR is a --mac-snapshot folder, a "
+                             "migration-check snapshot, or a --save-raw folder "
+                             "of old ERS switches taken with --migration-sheets. "
+                             "Repeatable: several baselines are merged. "
+                             "Needs migration-check installed.")
+    parser.add_argument("--mac-watch", action="store_true",
+                        help="with --mac-baseline: read the new switches again "
+                             "every interval until every MAC is back or the "
+                             "number stops falling (config mac_check: "
+                             "interval / rounds / stable; default 120 s, 15 "
+                             "rounds, 3)")
     parser.add_argument("--sheet-name", metavar="NAME", default="",
                         help="worksheet to read from the .xlsx given to "
-                             "--verify-migration / --generate-mlt (default: "
+                             "--verify-migration / --generate-mlt / "
+                             "--rack-sheet (default: "
                              "the 'Cabling' sheet)")
     parser.add_argument("--generate-mlt", type=Path, metavar="SHEET",
                         help="generate the VOSS MLT config blocks for the new "
                              "switches from a filled-in cabling sheet, to "
                              "<output>/config/mlt-blocks.cfg. Reads no device.")
+    parser.add_argument("--rack-sheet", type=Path, metavar="SHEET",
+                        help="print version of a filled-in cabling sheet for "
+                             "the technicians: one page per old switch, in "
+                             "faceplate order, what is on each port and where "
+                             "it goes, a box to tick. Writes "
+                             "<output>/rack-sheet-<stamp>.xlsx. Reads no device.")
     parser.add_argument("--no-smlt", action="store_true",
                         help="--generate-mlt: emit plain single-switch MLTs "
                              "instead of SMLT pairs")
@@ -257,7 +308,8 @@ def _needs_config(args: argparse.Namespace) -> bool:
 def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
                      args: argparse.Namespace,
                      progress: NullProgress | None = None,
-                     command_sink: dict[str, list[dict]] | None = None
+                     command_sink: dict[str, list[dict]] | None = None,
+                     mac_recorder: mac_check.SnapshotRecorder | None = None
                      ) -> SwitchAudit:
     progress = progress or NullProgress()
     failed = SwitchAudit(name=target.name, host=target.host,
@@ -273,16 +325,26 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         except ConnectionFailed as exc:
             failed.errors.append(str(exc))
             log.error("%s", exc)
+            if mac_recorder is not None:
+                mac_recorder.unreachable(target, str(exc))
             return failed
         except Exception as exc:  # noqa: BLE001 - one bad device must not kill the run
             failed.errors.append(
                 f"unexpected connect error: {exc.__class__.__name__}: {exc}")
             log.exception("[%s] unexpected connect error", target.name)
+            if mac_recorder is not None:
+                mac_recorder.unreachable(target, str(exc))
             return failed
         runner.on_command = progress.device_command
+        # with a MAC snapshot to record, the collectors talk to the switch
+        # through a memo, so migration-check's commands that were already sent
+        # are taken from there instead of being sent a second time
+        memo = (mac_check.AnswerMemo(runner)
+                if mac_recorder is not None and mac_recorder.wants(target.name)
+                else None)
         try:
             audit = collect_switch(
-                target, runner, cfg,
+                target, memo or runner, cfg,
                 pull_config=_needs_config(args),
                 keep_config=bool(getattr(args, "extract_config", False)),
                 # verification needs the learned MACs on the NEW ports - they
@@ -296,6 +358,8 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
             log.exception("[%s] collection crashed", target.name)
             return failed
         finally:
+            if memo is not None:
+                _record_mac_snapshot(mac_recorder, target, runner, memo, audit)
             runner.close()
     finally:
         sent = list(getattr(runner, "command_log", []) or [])
@@ -304,17 +368,34 @@ def audit_one_switch(target: SwitchTarget, creds: Credentials, cfg: Config,
         progress.device_done(audit, len(sent))
 
 
+def _record_mac_snapshot(recorder: mac_check.SnapshotRecorder, target: SwitchTarget,
+                         runner: BaseRunner, memo: mac_check.AnswerMemo,
+                         audit: SwitchAudit) -> None:
+    """migration-check's commands on the session that is still open. Its failure
+    is the MAC snapshot's problem, never the collection's."""
+    try:
+        recorder.record(target, runner, memo)
+    except Exception as exc:  # noqa: BLE001 - the audit is already complete
+        log.exception("[%s] MAC snapshot failed", target.name)
+        audit.warnings.append(f"MAC snapshot (migration-check) failed: "
+                              f"{exc.__class__.__name__}: {exc}")
+
+
 def run_collection(targets: list[SwitchTarget], creds: Credentials, cfg: Config,
                    args: argparse.Namespace,
                    progress: NullProgress | None = None,
-                   command_sink: dict[str, list[dict]] | None = None
+                   command_sink: dict[str, list[dict]] | None = None,
+                   mac_recorder: mac_check.SnapshotRecorder | None = None
                    ) -> list[SwitchAudit]:
     """Collect every target in parallel, name-sorted. Shared by the flag
-    interface and the interactive menu so both behave identically."""
+    interface and the interactive menu so both behave identically.
+
+    With `mac_recorder`, migration-check's commands are sent on each switch's
+    session as well and written to that snapshot; the caller finishes it."""
     audits: list[SwitchAudit] = []
     with cf.ThreadPoolExecutor(max_workers=cfg.ssh.workers) as pool:
         futures = [pool.submit(audit_one_switch, t, creds, cfg, args,
-                               progress, command_sink)
+                               progress, command_sink, mac_recorder)
                    for t in targets]
         for future in cf.as_completed(futures):
             audits.append(future.result())
@@ -324,7 +405,8 @@ def run_collection(targets: list[SwitchTarget], creds: Credentials, cfg: Config,
 
 def preview_commands(targets: list[SwitchTarget], cfg: Config,
                      args: argparse.Namespace,
-                     dvrs: list[DvrTarget] | None = None) -> dict[str, list[str]]:
+                     dvrs: list[DvrTarget] | None = None,
+                     mac_for: Collection[str] = ()) -> dict[str, list[str]]:
     """--dry-run: what each device WOULD be asked, without connecting.
 
     The preview is produced by running the REAL collectors against a runner
@@ -332,15 +414,22 @@ def preview_commands(targets: list[SwitchTarget], cfg: Config,
     So the list cannot drift away from what the tool does, and because empty
     output sends the collectors down every fallback branch it is the full set
     of commands that could be sent - not just the subset one release accepts.
+
+    `mac_for` names the switches a MAC snapshot would be recorded for; their
+    list includes migration-check's commands, minus those already sent.
     """
     preview: dict[str, list[str]] = {}
     for target in targets:
         runner = DryRunRunner(target.name, target.platform,
                               command_overrides=cfg.command_overrides)
+        memo = mac_check.AnswerMemo(runner) if target.name in mac_for else None
         try:
-            collect_switch(target, runner, cfg,
+            collect_switch(target, memo or runner, cfg,
                            pull_config=_needs_config(args),
-                           pull_macs=getattr(args, "migration_sheets", False))
+                           pull_macs=bool(getattr(args, "migration_sheets", False)
+                                          or getattr(args, "verify_migration", None)))
+            if memo is not None:
+                mac_check.send_remaining(target.platform, runner, memo)
         except Exception:  # noqa: BLE001 - a preview must never fail the run
             log.exception("[%s] dry-run preview incomplete", target.name)
         preview[target.name] = runner.commands
@@ -412,6 +501,37 @@ def collect_fabric(dvrs: list[DvrTarget], creds: Credentials, cfg: Config,
     return fabric
 
 
+def write_new_switch_configs(audits: list[SwitchAudit], plan, cfg: Config,
+                             output_dir: Path, console: Console) -> list[Path]:
+    """--plan: one config per new switch (+ an I-SID decision worksheet when a
+    VLAN still needs one) into <output>/config/new/. Shared with the menu."""
+    from switch_migrator.new_switch_config import render_all
+
+    out_dir = output_dir / "config" / "new"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for result in render_all(audits, plan, cfg):
+        path = out_dir / f"{result.switch}.cfg"
+        path.write_text(result.text, encoding="utf-8")
+        written.append(path)
+        if result.decisions:
+            sheet = out_dir / f"{result.switch}.isid-decisions.txt"
+            sheet.write_text(build_worksheet(result.decisions,
+                                             device_name=result.switch),
+                             encoding="utf-8")
+            written.append(sheet)
+        flags = []
+        if result.decisions:
+            flags.append(f"{len(result.decisions)} I-SID decision(s) needed")
+        if result.problems:
+            flags.append(f"{len(result.problems)} problem(s)")
+        if result.unverified:
+            flags.append(f"{len(result.unverified)} unverified line kind(s)")
+        console.print(f"Config for {result.switch}: {path}"
+                      + (f" [yellow]({', '.join(flags)})[/yellow]" if flags else ""))
+    return written
+
+
 def _write_config_extracts(audits: list[SwitchAudit], output_dir: Path,
                            comparisons: dict, cfg: Config,
                            console: Console) -> list[Path]:
@@ -468,6 +588,155 @@ def _targets_from_sheet(args: argparse.Namespace,
                   f"sheet: {', '.join(names)} [dim](assumed VOSS; use -s to "
                   f"say otherwise)[/dim]")
     return [SwitchTarget(name=n, host=n, platform=Platform.VOSS) for n in names]
+
+
+def _check_mac_args(args: argparse.Namespace, from_snapshot: Path | None,
+                    console: Console | None = None) -> None:
+    """--mac-snapshot / --mac-baseline / --mac-watch: everything that can be
+    wrong, before any switch is read."""
+    if not (args.mac_snapshot or args.mac_baseline or args.mac_watch):
+        return
+    if args.mac_watch and not args.mac_baseline:
+        raise ConfigError("--mac-watch goes with --mac-baseline")
+    if args.mac_baseline and not args.verify_migration:
+        raise ConfigError("--mac-baseline goes with --verify-migration")
+    if args.mac_snapshot and args.verify_migration:
+        raise ConfigError("--mac-snapshot records a baseline of the OLD switches; "
+                          "a verification with --mac-baseline saves the new "
+                          "switches' snapshot by itself (mac-check-<stamp>/after)")
+    if from_snapshot or args.generate_mlt:
+        raise ConfigError("the MAC options read switches; they cannot run from a "
+                          "saved snapshot or with --generate-mlt")
+    if args.mac_snapshot and args.mac_snapshot.exists() and (
+            not args.mac_snapshot.is_dir() or any(args.mac_snapshot.iterdir())):
+        raise ConfigError(f"--mac-snapshot: {args.mac_snapshot} exists and is not "
+                          f"an empty folder - a snapshot is never overwritten")
+    missing = [str(p) for p in args.mac_baseline if not p.is_dir()]
+    if missing:
+        raise ConfigError(f"--mac-baseline: no such folder: {', '.join(missing)}")
+    mac_check.require("--mac-snapshot" if args.mac_snapshot else "--mac-baseline")
+    unreadable = mac_check.unreadable_baselines(list(args.mac_baseline))
+    if unreadable and console is not None:
+        console.print(
+            f"[bold yellow]MAC baseline:[/bold yellow] {len(unreadable)} old VOSS "
+            f"folder(s) hold only 'show interfaces gigabitEthernet fdb-entry', which "
+            f"migration-check cannot read - their MACs are left out of the "
+            f"comparison: {', '.join(unreadable)}. Take VOSS baselines with "
+            f"--mac-snapshot.")
+
+
+def _check_plan_args(args: argparse.Namespace, cfg: Config):
+    """--plan: the new switches and their layout, and the pins. Everything that can
+    be wrong is found before any switch is read."""
+    args.migration_sheets = True
+    names = new_switch_names(args.new_switch)
+    if not names:
+        raise ConfigError("--plan needs the new switches: --new-switch A,B "
+                          "(a vIST pair; A,B,C,D for two pairs)")
+    if len(set(names)) != len(names):
+        raise ConfigError(f"--new-switch names a switch twice: {args.new_switch}")
+    ports = args.new_ports if args.new_ports is not None else cfg.plan.ports
+    uplinks = args.new_uplinks if args.new_uplinks is not None else cfg.plan.uplinks
+    if ports is None or uplinks is None:
+        raise ConfigError("--plan needs the new model's layout: --new-ports N "
+                          "--new-uplinks N (or plan: {ports: 52, uplinks: 4} in "
+                          "config.yaml) - the last N ports are the fabric uplinks")
+    try:
+        layout = PlanLayout(ports=ports, uplinks=uplinks)
+        standard.mlt_name_for_new_lag("1/1", cfg.plan.mlt_name)
+    except (ValueError, standard.ConventionError) as exc:
+        raise ConfigError(f"--plan: {exc}") from None
+    pins = {}
+    if args.pins:
+        try:
+            pins = pins_from_sheet(_load_sheet(args.pins, args).rows)
+        except cabling_sheet.SheetError as exc:
+            raise ConfigError(f"--pins: {exc}") from None
+    return layout, pins
+
+
+def _print_plan(plan, console: Console) -> None:
+    for fill in plan.fill:
+        console.print(f"Plan {fill.name}: {fill.dual} dual-homed + {fill.single} "
+                      f"single-homed + {fill.pinned} pinned of {fill.access_ports} "
+                      f"access ports, {fill.free} free")
+    console.print(f"Plan: {len(plan.moves)} link(s) placed, "
+                  f"{len(plan.not_moved)} not moved (see the 'Not moved' sheet)")
+    for problem in plan.problems:
+        console.print(f"  [bold yellow]![/bold yellow] {problem}")
+    if plan.hints:
+        console.print(f"  [dim]{len(plan.hints)} hint(s) on the 'Plan notes' sheet[/dim]")
+
+
+def _mac_check_targets(targets: list[SwitchTarget],
+                       sheet: cabling_sheet.Sheet) -> list[SwitchTarget]:
+    """Only the switches links moved onto: an inventory given with -i may also
+    name the old switches, which are the baseline, not the result."""
+    new_switches = set(sheet.by_new_switch())
+    return [t for t in targets if t.name in new_switches] or targets
+
+
+def run_mac_check(baselines: list[Path], after: Path, sheet: cabling_sheet.Sheet,
+                  output_dir: Path, stamp: str, *, watch, targets: list[SwitchTarget],
+                  open_runner, workers: int, console: Console) -> mac_check.MacCheck:
+    """The MAC comparison after a verification, with its console output. Shared by
+    the flag interface and the menu."""
+    if watch is not None:
+        console.print(f"MAC check: watching the new switches every "
+                      f"{watch.interval_seconds:g} s, at most {watch.max_rounds} "
+                      f"round(s) [dim](Ctrl-C stops)[/dim]")
+    check = mac_check.check(
+        baselines, after, sheet, output_dir, stamp, watch=watch, targets=targets,
+        open_runner=open_runner, workers=workers,
+        on_round=lambda line: console.print(f"  {line.strip()}"))
+    if check.stopped:
+        console.print(f"  [dim]{check.stopped}[/dim]")
+    color = "bold green" if check.settled else "bold yellow"
+    console.print(f"[{color}]MAC check:[/{color}] {check.summary}")
+    for _, device, problem in check.comparison.problems:
+        console.print(f"  [yellow]{device}: {problem}[/yellow]")
+    console.print(f"  [dim]details: {check.text}[/dim]")
+    return check
+
+
+def _mac_recorder(args: argparse.Namespace, targets: list[SwitchTarget],
+                  stamp: str) -> mac_check.SnapshotRecorder | None:
+    """The MAC snapshot this run records on its sessions, if any: the baseline
+    (--mac-snapshot), or the after side of the MAC check (--mac-baseline)."""
+    if args.mac_snapshot:
+        return mac_check.SnapshotRecorder(args.mac_snapshot,
+                                          label=args.mac_snapshot.name)
+    if args.mac_baseline:
+        sheet = _load_sheet(args.verify_migration, args)
+        return mac_check.SnapshotRecorder(
+            mac_check.after_snapshot_path(args.output_dir, stamp, args.mac_watch),
+            label="after",
+            only={t.name for t in _mac_check_targets(targets, sheet)})
+    return None
+
+
+def _run_rack_sheet(args: argparse.Namespace, console: Console) -> int:
+    """--rack-sheet: filled-in cabling sheet in, printable rack sheet out."""
+    try:
+        sheet = _load_sheet(args.rack_sheet, args)
+    except cabling_sheet.SheetError as exc:
+        console.print(f"[bold red]Cabling sheet:[/bold red] {exc}")
+        return 2
+    path = write_rack_sheet(sheet, args.output_dir)
+    for problem in sheet.problems:
+        console.print(f"[yellow]{problem}[/yellow]")
+    console.print(f"Rack sheet: {len(sheet.migrated)} of {len(sheet.rows)} link(s) "
+                  f"have a new port planned. Written: [bold]{path}[/bold]")
+    return 0
+
+
+def write_rack_sheet(sheet: cabling_sheet.Sheet, output_dir: Path) -> Path:
+    """The rack sheet workbook, next to the other reports. Shared with the menu."""
+    from switch_migrator.report.rack_sheet import build_rack_sheets
+
+    path = output_dir / f"rack-sheet-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+    write_excel(build_rack_sheets(sheet), path)
+    return path
 
 
 def _run_generate_mlt(args: argparse.Namespace, console: Console) -> int:
@@ -582,6 +851,11 @@ def main(argv: list[str] | None = None) -> int:
                         profile=args.profile,
                         profiles_file=args.profiles_file)
 
+    # the rack sheet is paperwork: a sheet in, a print version out - no
+    # config, no credentials, no device
+    if args.rack_sheet:
+        return _run_rack_sheet(args, console)
+
     # Reporting from a saved snapshot: no config, no credentials, no device is
     # touched - every sheet below is a pure function of the collected state.
     from_snapshot = getattr(args, "from_snapshot", None)
@@ -614,6 +888,8 @@ def main(argv: list[str] | None = None) -> int:
             # the sheet already names the switches to check: the new ones the
             # links were moved onto. They are fabric leaves, hence VOSS.
             targets = _targets_from_sheet(args, console)
+        _check_mac_args(args, from_snapshot, console)
+        plan_setup = _check_plan_args(args, cfg) if args.plan else None
         if not targets and not from_snapshot and not args.generate_mlt:
             raise ConfigError("no switches given: use -i inventory.yaml and/or "
                               "-s NAME:PLATFORM[:HOST]")
@@ -643,9 +919,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.dry_run:
+        mac_for: set[str] = set()
+        if args.mac_snapshot:
+            mac_for = {t.name for t in targets}
+        elif args.mac_baseline:
+            mac_for = {t.name for t in _mac_check_targets(
+                targets, _load_sheet(args.verify_migration, args))}
         render_dry_run(preview_commands(
             targets, cfg, args,
-            dvrs=[] if args.no_fabric else cfg.dvr_controllers), console)
+            dvrs=[] if args.no_fabric else cfg.dvr_controllers,
+            mac_for=mac_for), console)
         return 0
 
     # generating the MLT blocks is pure paperwork: sheet in, config out
@@ -653,7 +936,21 @@ def main(argv: list[str] | None = None) -> int:
         return _run_generate_mlt(args, console)
 
     started = datetime.now()
+    stamp = started.strftime("%Y%m%d-%H%M%S")
     commands_by_device: dict[str, list[dict]] = {}
+    try:
+        mac_recorder = _mac_recorder(args, targets, stamp)
+    except Exception as exc:  # noqa: BLE001 - checked above; this is the unexpected rest
+        console.print(f"[bold red]MAC snapshot could not be started:[/bold red] {exc}")
+        return 2
+
+    def finish_mac_snapshot() -> None:
+        if mac_recorder is None:
+            return
+        mac_recorder.finish()
+        if args.mac_snapshot:
+            console.print(f"MAC snapshot (migration-check baseline): "
+                          f"[bold]{mac_recorder.path}[/bold]")
 
     if from_snapshot:
         try:
@@ -672,7 +969,8 @@ def main(argv: list[str] | None = None) -> int:
         fabric = FabricState()
         with make_progress(console, len(targets)) as progress:
             audits = run_collection(targets, creds, cfg, args,
-                                    progress, commands_by_device)
+                                    progress, commands_by_device, mac_recorder)
+        finish_mac_snapshot()
     else:
         console.print(f"[bold]switch-migrator {__version__}[/bold] - read-only "
                       f"audit of {len(targets)} switch(es) against "
@@ -687,8 +985,11 @@ def main(argv: list[str] | None = None) -> int:
                     collect_fabric, cfg.dvr_controllers, dvr_creds, cfg, args,
                     progress)
                 audits = run_collection(targets, creds, cfg, args,
-                                        progress, commands_by_device)
+                                        progress, commands_by_device, mac_recorder)
                 fabric = fabric_future.result()
+        # before the DvR check below: a baseline taken of the switches is worth
+        # keeping even when the fabric could not be read
+        finish_mac_snapshot()
         if not fabric.dvrs_ok:
             console.print("[bold red]No DvR controller could be read - aborting, "
                           "there is no fabric state to compare against.[/bold red]")
@@ -721,11 +1022,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # 4) Report
     tables = build_all(audits, fabric, comparisons, no_fabric=args.no_fabric)
+    migration_plan = None
     if args.migration_sheets:
         assign_port_uids(audits)
         targets = new_switch_names(args.new_switch)
+        if plan_setup is not None:
+            layout, pins = plan_setup
+            migration_plan = make_plan(audits, targets, layout,
+                                       mlt_name=cfg.plan.mlt_name, pins=pins)
+            _print_plan(migration_plan, console)
         tables += [build_port_info(audits),
-                   build_cabling(audits, targets)]
+                   build_cabling(audits, targets, migration_plan)]
+        if migration_plan is not None:
+            tables += build_plan_tables(migration_plan)
 
     if args.migration_sheets and (args.split_by_location or args.location_group):
         rules = cfg.locations
@@ -739,7 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
         # answers gets lost
         tables = [t for t in tables if t.title != "Cabling"]
         tables += build_cabling_by_location(
-            audits, rules, new_switch_names(args.new_switch))
+            audits, rules, new_switch_names(args.new_switch), migration_plan)
         console.print("Cabling sheet split by location:")
         for line in location.describe(rules, [a.name for a in audits]):
             console.print(f"  {line}")
@@ -782,7 +1091,25 @@ def main(argv: list[str] | None = None) -> int:
                               f"{v.why}")
 
     written: list[Path] = []
-    stamp = started.strftime("%Y%m%d-%H%M%S")
+    mac_check_failed = False
+    if args.mac_baseline and verify_report is not None and mac_recorder is not None:
+        # later --mac-watch rounds re-read the new switches on fresh sessions;
+        # without --save-raw, so a round never overwrites the run's raw capture
+        round_args = argparse.Namespace(**{**vars(args), "save_raw": False})
+        try:
+            check = run_mac_check(
+                args.mac_baseline, mac_recorder.path, sheet, args.output_dir, stamp,
+                watch=cfg.mac_check if args.mac_watch else None,
+                targets=_mac_check_targets(targets, sheet),
+                open_runner=lambda t: make_runner(t.name, t.host, t.platform, creds,
+                                                  cfg, round_args, console=t.console),
+                workers=cfg.ssh.workers, console=console)
+        except Exception as exc:  # noqa: BLE001 - the other reports must still be written
+            mac_check_failed = True
+            log.exception("MAC check failed")
+            console.print(f"[bold red]MAC check could not run:[/bold red] {exc}")
+        else:
+            written += [check.text, check.json]
     if not args.no_excel:
         xlsx = args.output_dir / f"migration-audit-{stamp}.xlsx"
         write_excel(tables, xlsx)
@@ -792,6 +1119,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.extract_config:
         written.extend(_write_config_extracts(
             audits, args.output_dir, comparisons, cfg, console))
+    if migration_plan is not None:
+        written.extend(write_new_switch_configs(audits, migration_plan, cfg,
+                                                args.output_dir, console))
     if args.migration_sheets:
         cmd_path = args.output_dir / f"migration-commands-{stamp}.txt"
         cmd_path.write_text(build_commands(audits, new_switch=args.new_switch),
@@ -820,6 +1150,10 @@ def main(argv: list[str] | None = None) -> int:
     if health_report is not None and health_report.verdict == health.BLOCK:
         code = 1
     if verify_report is not None and not verify_report.ok:
+        code = 1
+    # a MAC not back yet is a warning, like 'no MAC yet' in the verification; a
+    # check that could not run at all is an error a script must see
+    if mac_check_failed:
         code = 1
 
     if args.manifest:

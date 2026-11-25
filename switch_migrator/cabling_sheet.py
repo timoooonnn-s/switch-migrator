@@ -49,6 +49,7 @@ class CablingRow:
     rack_new: str = ""
     # what the port carried before the move - the expectations to verify
     neighbor: str = ""
+    port_name: str = ""              # the old port's configured name
     macs: list[str] = field(default_factory=list)
     port_vlans: list[int] = field(default_factory=list)
     port_isids: list[int] = field(default_factory=list)
@@ -56,6 +57,11 @@ class CablingRow:
     mlt_name: str = ""
     mlt_vlans: list[int] = field(default_factory=list)
     mlt_isids: list[int] = field(default_factory=list)
+    # did the OLD aggregation run LACP? None = the sheet does not say
+    lacp: bool | None = None
+    # ticked by the technician once the cable is moved; None = left blank
+    done: bool | None = None
+    plan_note: str = ""              # why the plan put it there, or did not
     media: str = ""
     usage: str = ""
     usage_why: str = ""
@@ -98,6 +104,20 @@ class Sheet:
     def pending(self) -> list[CablingRow]:
         return [r for r in self.rows if not r.migrated]
 
+    @property
+    def tracks_done(self) -> bool:
+        """Has anybody ticked the Done column? Then NEW switch/port is the PLAN,
+        and only ticked rows have actually moved. Nobody ticked anything: the
+        sheet is read as before, NEW switch/port meaning moved."""
+        return any(r.done for r in self.rows)
+
+    @property
+    def moved(self) -> list[CablingRow]:
+        """Rows whose cable has moved - what a verification checks."""
+        if not self.tracks_done:
+            return self.migrated
+        return [r for r in self.migrated if r.done]
+
     def by_new_switch(self) -> dict[str, list[CablingRow]]:
         out: dict[str, list[CablingRow]] = {}
         for row in self.migrated:
@@ -121,6 +141,7 @@ _COLUMNS = {
     "racknew": "rack_new",
     "tagging": "tagging",
     "enddeviceneighbor": "neighbor",
+    "portname": "port_name",
     "macaddresses": "macs",
     "portvlans": "port_vlans",
     "portisids": "port_isids",
@@ -128,6 +149,9 @@ _COLUMNS = {
     "mltname": "mlt_name",
     "mltvlans": "mlt_vlans",
     "mltisids": "mlt_isids",
+    "lacp": "lacp",
+    "done": "done",
+    "plannote": "plan_note",
     "media": "media",
     "usage": "usage",
     "why": "usage_why",
@@ -145,6 +169,10 @@ _WRITE_ONLY = {"vlanisid", "mltvlanisid", "vlansource"}
 _INT_FIELDS = {"new_mlt_id", "new_vlan", "mlt_id"}
 _LIST_INT_FIELDS = {"port_vlans", "port_isids", "mlt_vlans", "mlt_isids"}
 _LIST_STR_FIELDS = {"macs"}
+_BOOL_FIELDS = {"lacp", "done"}
+_TRUE = {"yes", "y", "true", "enable", "enabled", "on", "1", "x", "ok", "done",
+         "\u2713", "\u2714", "ja", "j"}
+_FALSE = {"no", "n", "false", "disable", "disabled", "off", "0"}
 
 _REQUIRED = ("old_switch", "old_port")
 # how the required columns are spelled on the sheet, for the error message
@@ -205,6 +233,15 @@ def _build_row(mapping: dict[str, str], number: int) -> CablingRow:
             setattr(row, field_name, _ints(text))
         elif field_name in _LIST_STR_FIELDS:
             setattr(row, field_name, _macs(text))
+        elif field_name in _BOOL_FIELDS:
+            word = text.lower()
+            if word in _TRUE:
+                setattr(row, field_name, True)
+            elif word in _FALSE:
+                setattr(row, field_name, False)
+            elif word not in ("", "?", "-"):
+                row.problems.append(
+                    f"{field_name.upper()} '{text}' is neither yes nor no")
         elif field_name in ("old_port", "new_port"):
             setattr(row, field_name, normalise_port(text))
         else:
@@ -273,6 +310,14 @@ def _rows_from_xlsx(path: Path,
             names = [sheet_name]
         else:
             names = list(wb.sheetnames)
+        # A workbook this tool wrote (it carries the stamp) also holds tables
+        # that are not fill-in sheets but have an 'Old port' column (Not moved,
+        # Verification). Reading those as cabling rows would count a link twice,
+        # so in such a workbook only the Cabling tabs count - unless a human
+        # renamed them all, in which case the header decides as for any file.
+        if stamp and not sheet_name:
+            cabling_tabs = [n for n in names if n.lower().startswith("cabling")]
+            names = cabling_tabs or names
         out = []
         for name in names:
             if name == STAMP_SHEET:

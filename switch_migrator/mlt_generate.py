@@ -35,10 +35,11 @@ failure wearing the costume of a redundant one.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
+from switch_migrator import usage
 from switch_migrator.cabling_sheet import CablingRow, Sheet
+from switch_migrator.parsers.common import port_sort_key
 
 
 @dataclass
@@ -49,7 +50,7 @@ class MltPlan:
     name: str
     members: list[str] = field(default_factory=list)
     smlt: bool = False
-    lacp: bool = False
+    lacp: bool | None = False   # None: the sheet did not say
     flex_uni: bool = False
     # where the id/name came from, so the file can say so
     id_source: str = ""            # sheet / carried over from <old switch>
@@ -98,9 +99,7 @@ def _group(rows: list[CablingRow]) -> dict[tuple, list[CablingRow]]:
 
 
 def _sorted_ports(ports: list[str]) -> list[str]:
-    def key(p: str):
-        return [int(n) for n in re.findall(r"\d+", p)] or [0]
-    return sorted(set(ports), key=key)
+    return sorted(set(ports), key=port_sort_key)
 
 
 def _pick_name(rows: list[CablingRow], mlt_id: int) -> tuple[str, str]:
@@ -119,8 +118,9 @@ def plan(sheet: Sheet, smlt: bool = True, lacp: bool | None = None,
     """Work out the MLTs to create from a filled-in cabling sheet.
 
     smlt/flex_uni describe the target design (SMLT pairs on flex-UNI leaves).
-    lacp=None carries the old MLT's LACP state forward per MLT; True/False
-    forces it.
+    lacp=None carries the old MLT's LACP state forward per MLT, from the
+    sheet's LACP column; where the sheet does not say, no LACP line is emitted
+    and the MLT says so. True/False forces it for every MLT.
     """
     result = MltGenerateResult()
     rows = sheet.migrated
@@ -145,8 +145,7 @@ def plan(sheet: Sheet, smlt: bool = True, lacp: bool | None = None,
             switch=switch, mlt_id=mlt_id, name=name,
             members=_sorted_ports([r.new_port for r in members]),
             smlt=smlt, flex_uni=flex_uni,
-            lacp=bool(lacp) if lacp is not None else any(
-                r.kind == "mlt" or r.mlt_id is not None for r in members),
+            lacp=lacp if lacp is not None else _lacp_from_sheet(members),
             id_source=id_source if id_source == "sheet" else name_source,
             old_mlt=", ".join(old_mlts),
             neighbors=sorted({r.neighbor for r in members if r.neighbor}),
@@ -154,11 +153,26 @@ def plan(sheet: Sheet, smlt: bool = True, lacp: bool | None = None,
             isids=sorted({i for r in members
                           for i in (r.port_isids or r.mlt_isids)}),
         )
-        if len(p.members) == 1:
+        if p.lacp is None:
             p.problems.append(
-                "only one member: an aggregation of one is a normal port with "
-                "extra steps - check whether the second link has been patched "
-                "and recorded yet")
+                "LACP unknown: the sheet does not say whether the old "
+                "aggregation ran LACP, so no 'lacp' line is emitted - add "
+                "'lacp enable key <id>' by hand if the far end runs it")
+        elif lacp is None and len({r.lacp for r in members} - {None}) > 1:
+            p.problems.append(
+                "the old member links disagree on LACP (some yes, some no) - "
+                "LACP is emitted; check the far end")
+        not_yet = _members_not_recorded(sheet.rows, members)
+        if not_yet:
+            p.problems.append(
+                f"{not_yet} more link(s) of the old aggregation have no NEW "
+                f"switch/port yet - this block is incomplete until they do")
+        elif len(p.members) == 1 and not smlt:
+            # a one-member SMLT leg per peer is the normal dual-homed server
+            # shape; a one-member plain MLT is a port with extra steps
+            p.problems.append(
+                "only one member: an aggregation of one on a single switch is "
+                "a normal port with extra steps")
         p.problems += _member_warnings(members)
         result.plans.append(p)
 
@@ -166,6 +180,34 @@ def plan(sheet: Sheet, smlt: bool = True, lacp: bool | None = None,
     if smlt:
         result.problems += _smlt_pairing_problems(result.plans)
     return result
+
+
+def _lacp_from_sheet(members: list[CablingRow]) -> bool | None:
+    """The old aggregation's LACP state, as the sheet carries it. Yes wins over
+    no (a member that ran LACP proves the far end speaks it); None when no row
+    says either - LACP is never invented."""
+    states = {r.lacp for r in members} - {None}
+    if True in states:
+        return True
+    if states == {False}:
+        return False
+    return None
+
+
+def _members_not_recorded(all_rows: list[CablingRow],
+                          members: list[CablingRow]) -> int:
+    """Links of the same old aggregation(s) that have no NEW switch/port yet.
+
+    Counted over the whole sheet, not per new switch: the two legs of a
+    dual-homed server land on two different new switches by design, so one
+    member per new switch is complete as long as nothing is still pending.
+    """
+    old = {(r.old_switch, r.mlt_id) for r in members if r.mlt_id is not None}
+    # a member the usage classification called dead is not expected to move
+    dead = {usage.UNUSED.lower(), usage.LIKELY_UNUSED.lower()}
+    return sum(1 for r in all_rows
+               if not r.migrated and (r.old_switch, r.mlt_id) in old
+               and r.usage.strip().lower() not in dead)
 
 
 def _member_warnings(members: list[CablingRow]) -> list[str]:
@@ -261,6 +303,44 @@ _HEADER = """\
 """
 
 
+def render_sections(plans: list[MltPlan],
+                    interface_extra: dict[int, list[str]] | None = None
+                    ) -> tuple[list[str], list[str]]:
+    """The two sections a VOSS box prints for its MLTs, for one switch:
+    (MLT CONFIGURATION lines, MLT INTERFACE CONFIGURATION lines). Shared by
+    --generate-mlt and the per-new-switch config; `interface_extra` adds lines
+    to an MLT's interface block (by MLT id)."""
+    definitions: list[str] = []
+    interfaces: list[str] = []
+    for p in plans:
+        definitions.append("")
+        definitions.append(f"# MLT {p.mlt_id} \"{p.name}\" - id/name {p.id_source}")
+        if p.old_mlt:
+            definitions.append(f"#   was: {p.old_mlt}")
+        if p.neighbors:
+            definitions.append(f"#   far end: {', '.join(p.neighbors)}")
+        if p.vlans:
+            definitions.append(f"#   carried VLAN(s): {','.join(map(str, p.vlans))}"
+                               + (f"  I-SID(s): {','.join(map(str, p.isids))}"
+                                  if p.isids else ""))
+        for problem in p.problems:
+            definitions.append(f"# [!] {problem}")
+        definitions.append(f"mlt {p.mlt_id} enable name \"{p.name}\"")
+        definitions.append(f"mlt {p.mlt_id} member {','.join(p.members)}")
+    for p in plans:
+        interfaces.append("")
+        interfaces.append(f"interface mlt {p.mlt_id}")
+        if p.smlt:
+            interfaces.append("smlt")
+        if p.lacp:
+            interfaces.append(f"lacp enable key {p.mlt_id}")
+        if p.flex_uni:
+            interfaces.append("flex-uni enable")
+        interfaces += (interface_extra or {}).get(p.mlt_id, [])
+        interfaces.append("exit")
+    return definitions, interfaces
+
+
 def render(result: MltGenerateResult, source: str = "") -> str:
     out = [_HEADER.format(source=source or "cabling sheet").rstrip()]
     if result.problems:
@@ -272,32 +352,10 @@ def render(result: MltGenerateResult, source: str = "") -> str:
         return "\n".join(out) + "\n"
 
     for switch, plans in sorted(result.by_switch.items()):
+        definitions, interfaces = render_sections(plans)
         out.append(f"\n#\n# ===== {switch} =====\n#")
         out.append("#\n# MLT CONFIGURATION\n#")
-        for p in plans:
-            out.append("")
-            out.append(f"# MLT {p.mlt_id} \"{p.name}\" - id/name {p.id_source}")
-            if p.old_mlt:
-                out.append(f"#   was: {p.old_mlt}")
-            if p.neighbors:
-                out.append(f"#   far end: {', '.join(p.neighbors)}")
-            if p.vlans:
-                out.append(f"#   carried VLAN(s): {','.join(map(str, p.vlans))}"
-                           + (f"  I-SID(s): {','.join(map(str, p.isids))}"
-                              if p.isids else ""))
-            for problem in p.problems:
-                out.append(f"# [!] {problem}")
-            out.append(f"mlt {p.mlt_id} enable name \"{p.name}\"")
-            out.append(f"mlt {p.mlt_id} member {','.join(p.members)}")
+        out += definitions
         out.append("\n#\n# MLT INTERFACE CONFIGURATION\n#")
-        for p in plans:
-            out.append("")
-            out.append(f"interface mlt {p.mlt_id}")
-            if p.smlt:
-                out.append("smlt")
-            if p.lacp:
-                out.append(f"lacp enable key {p.mlt_id}")
-            if p.flex_uni:
-                out.append("flex-uni enable")
-            out.append("exit")
+        out += interfaces
     return "\n".join(out).rstrip() + "\n"

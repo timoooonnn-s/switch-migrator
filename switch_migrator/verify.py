@@ -216,7 +216,8 @@ def verify(sheet: Sheet, audits: list[SwitchAudit]) -> VerifyReport:
     by_name = {a.name: a for a in audits}
     ports_by_name = {a.name: _index_ports(a) for a in audits}
 
-    named = {r.new_switch for r in sheet.migrated}
+    named = {r.new_switch for r in sheet.moved}
+    moved = {id(r) for r in sheet.moved}
     missing = sorted(n for n in named if n not in by_name)
     if missing:
         report.problems.append(
@@ -224,11 +225,13 @@ def verify(sheet: Sheet, audits: list[SwitchAudit]) -> VerifyReport:
             f"collected: {', '.join(missing)}")
 
     for row in sheet.rows:
-        if not row.migrated:
+        if id(row) not in moved:
+            why = ("planned, not ticked Done yet" if row.migrated
+                   else "no NEW switch/port recorded in the sheet yet")
             report.verdicts.append(PortVerdict(
                 uid=row.uid, old_switch=row.old_switch, old_port=row.old_port,
-                new_switch="", new_port="", result=PENDING,
-                reasons=["no NEW switch/port recorded in the sheet yet"]))
+                new_switch=row.new_switch, new_port=row.new_port, result=PENDING,
+                reasons=[why]))
             continue
         report.verdicts.append(_verify_row(
             row, by_name.get(row.new_switch),

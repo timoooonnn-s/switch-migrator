@@ -95,13 +95,13 @@ def _audit_with_ports() -> SwitchAudit:
     a = SwitchAudit(name="old-01", host="old-01", platform=Platform.VOSS,
                     reachable=True)
     a.ports = [
-        PortState(port="1/1", description="10GbSR", admin_up=True, oper_up=True,
+        PortState(port="1/1", media="10GbSR", admin_up=True, oper_up=True,
                   lldp_neighbor="srv-a", macs=["00:11:22:00:00:01"], mac_total=1,
                   vlans=[695], isids=[2500695], tagging="untagged",
                   bindings=[VlanBinding(vlan=695, isid=2500695, tagging=UNTAGGED,
                                         source="running-config")]),
-        PortState(port="1/2", description="10GbSR", admin_up=True, oper_up=False),
-        PortState(port="1/48", description="10GbSR", admin_up=True, oper_up=True,
+        PortState(port="1/2", media="10GbSR", admin_up=True, oper_up=False),
+        PortState(port="1/48", media="10GbSR", admin_up=True, oper_up=True,
                   lldp_neighbor="core-01", is_uplink=True, mlt_id=1,
                   mlt_name="uplink", lacp=True),
     ]
@@ -352,3 +352,53 @@ def test_per_location_cabling_sheets_stay_out_of_the_console():
     buf = io.StringIO()
     console_report.render([t], Console(file=buf, width=100), verbose=True)
     assert "x" in buf.getvalue()           # -v shows it
+
+
+def test_ports_are_in_faceplate_order_not_text_order():
+    from switch_migrator.models import PortState, SwitchAudit
+    from switch_migrator.parsers.common import port_sort_key
+    from switch_migrator.report.migration import (
+        assign_port_uids, build_cabling, build_port_info)
+
+    assert sorted(["1/10", "1/2", "2/1", "1/1/2", "1/1"], key=port_sort_key) == \
+        ["1/1", "1/1/2", "1/2", "1/10", "2/1"]
+    assert sorted(["10", "2", "1"], key=port_sort_key) == ["1", "2", "10"]
+
+    ports = [PortState(port=p, oper_up=True, usage="IN USE") for p in ("1/10", "1/2", "1/1")]
+    audit = SwitchAudit(name="sw", host="sw", platform=Platform.VOSS,
+                        reachable=True, ports=ports)
+    assign_port_uids([audit])
+    assert {p.port: p.uid for p in ports} == {"1/1": "P0001", "1/2": "P0002",
+                                              "1/10": "P0003"}
+    for table in (build_cabling([audit]), build_port_info([audit])):
+        column = table.headers.index("Old port" if "Old port" in table.headers else "Port")
+        assert [row[column] for row in table.rows] == ["1/1", "1/2", "1/10"]
+
+
+@pytest.mark.parametrize("platform, fixture, port, name", [
+    (Platform.ERS, "ers", "49", "uplink-a"),
+    (Platform.VOSS, "voss", "1/1", "core-s74-w5"),
+])
+def test_the_configured_port_name_reaches_the_sheets(tmp_path, platform, fixture,
+                                                     port, name):
+    from switch_migrator.report.migration import build_cabling, build_port_info
+
+    shutil.copytree(FIXTURES / fixture, tmp_path / "sw")
+    if platform is Platform.VOSS:
+        # the fixture names 2/1, which its port table does not list: move the
+        # name onto a port both know
+        config = tmp_path / "sw" / "show_running_config.txt"
+        config.write_text(config.read_text().replace(
+            "interface GigabitEthernet 2/1", "interface GigabitEthernet 1/1"))
+    cfg = Config(dvr_controllers=[], core_switch_patterns=[], isid_offsets=[],
+                 isid_explicit={}, excluded_vlans=set(), ssh=SshSettings())
+    audit = collect_switch(SwitchTarget("sw", "sw", platform),
+                           OfflineRunner("sw", tmp_path), cfg, pull_config=True)
+    assert {p.port: p.name for p in audit.ports}.get(port) == name
+    info = build_port_info([audit])
+    row = next(r for r in info.rows if r[info.headers.index("Port")] == port)
+    assert row[info.headers.index("Port name")] == name
+    cabling = build_cabling([audit])
+    names = [r[cabling.headers.index("Port name")] for r in cabling.rows]
+    assert name in names or not any(
+        r[cabling.headers.index("Old port")] == port for r in cabling.rows)

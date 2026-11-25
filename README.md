@@ -110,6 +110,8 @@ Key settings in `config.yaml` (see the example file for full comments):
 | `inventory` | Default inventory file, so a plain `switch-migrator` needs no `-i` (a `./switches.yaml` is picked up even without this key). |
 | `commands` | Per-command spelling overrides (e.g. `'show mlt': 'show mlt all'`), applied at the runner so dry-run, raw capture and offline replay all see the same spelling. Replacements are validated read-only. |
 | `console_server` | Terminal server for switches without a management IP: SSH to the console server, land on the switch's serial console, continue there (see below). |
+| `plan` | The new switch model for `--plan`: `ports` (all of them) and `uplinks` (how many of the last ones are fabric uplinks), `mlt_name` (template for new MLT names: `{slot}`, `{port}`, `{id}`; default `f{slot}{port}`) and `port_lines` (closing lines of every new access port; default `slpp-guard enable timeout 0`, `spanning-tree mstp edge-port true`). |
+| `mac_check` | Pacing of `--mac-watch`: `interval` seconds between rounds, at most `rounds`, stop after `stable` rounds without progress (defaults 120 / 15 / 3). |
 
 ### Console server (terminal server)
 
@@ -232,13 +234,14 @@ switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
   2  Collect from devices  connect once; all outputs below reuse this data
   3  Audit vs fabric       compare every VLAN against the DvR fabric state
   4  Inventory report      port/MLT/VLAN state only, no fabric comparison
-  5  Migration sheets      port info + DC cabling sheet + MAC-check commands
+  5  Migration sheets      port info + DC cabling sheet (+ the plan) + MAC-check commands
   6  Config extract        neutralized VOSS config / generated ERS->VOSS draft
   7  Everything            run 3-6 in one go with the collected data
   8  Snapshot              save this session's data, or load an earlier one
   9  Dry run               list every command a collection would send
   h  Health check          go/no-go before the window: what is already broken?
   m  Generate MLT blocks   new switches' MLT config from a filled-in cabling sheet
+  r  Rack sheet            print version of a filled-in cabling sheet for the technicians
   v  Verify migration      after the window: check every re-patched link
   b  Handover bundle      one folder with every output and an index to hand over
   s  Settings              output directory, offline replay, manifest, target switch
@@ -326,8 +329,8 @@ file. Every port gets a **sequential migration ID** (`P0001`, …) assigned acro
 the whole run — the key that ties both sheets together when several old
 switches consolidate onto fewer new ones.
 
-* **Port Info** (all ports) — Port ID, switch, port, device on the port (LLDP
-  name / IP / SysDescr), MAC addresses, untagged VLAN, tagging, the
+* **Port Info** (all ports, in faceplate order) — Port ID, switch, port, the
+  port's configured **name**, device on the port (LLDP name / IP / SysDescr), MAC addresses, untagged VLAN, tagging, the
   **VLAN → I-SID pairs**, the flat VLAN/I-SID lists, admin & oper state, LACP,
   MLT ID & name, transceiver, media, uplink flag, usage and the VLAN source.
 * **Cabling** (connected ports only — what actually gets re-patched) —
@@ -336,16 +339,22 @@ switches consolidate onto fewer new ones.
 
   | | Columns |
   |---|---|
-  | What the link is | Port ID, Usage, Type (access/mlt/uplink), Untagged VLAN, End device / neighbor |
+  | What the link is | Port ID, Usage, Type (access/mlt/uplink), Untagged VLAN, End device / neighbor, Port name |
   | Where it is now | **Rack (old)** ✎, Old switch, Old port |
   | Where it goes | **Rack (new)** ✎, **NEW switch** ✎, **NEW port** ✎, **NEW MLT ID** ✎, **NEW MLT name** ✎, **NEW VLAN** ✎ |
-  | What to configure | Tagging, VLAN → I-SID, MLT ID, MLT name, MLT VLAN → I-SID, the flat VLAN/I-SID lists |
+  | What to configure | Tagging, VLAN → I-SID, MLT ID, MLT name, **LACP** (did the old MLT run it), MLT VLAN → I-SID, the flat VLAN/I-SID lists |
   | Evidence | MAC addresses, Media, Why, VLAN source |
 
   ✎ = filled in by hand. Those columns are shaded, unlocked and wide enough to
   write in; everything derived from the devices is locked so it cannot be
   edited by accident. **Rack (old)** and **Rack (new)** are new and deliberately
   empty — no switch knows which rack it is in.
+
+  Within each old switch the rows run in-use first, then in **faceplate
+  order** (`1/2` before `1/10`); Port IDs are assigned in faceplate order too.
+  **Port name** is the name configured on the old port (VOSS `name`, ERS
+  `name port`), read from the running-config the sheets already pull — often
+  the only identity a device without LLDP has.
 * **`migration-commands-<stamp>.txt`** — per-port
   `show interfaces gigabitEthernet fdb-entry` commands to run on the **new**
   switch (each annotated with the Port ID, the
@@ -428,6 +437,89 @@ VOSS has **no** `show mac-address-table`; the forwarding database is read with
 command) is tried first, and releases that insist on a port argument fall back
 to querying only the ports that are operationally **up**. ERS/BOSS uses the
 classic `show mac-address-table`.
+
+### Planning the new ports (`--plan`)
+
+```bash
+# collect once (or plan from a snapshot as often as you like, no SSH)
+switch-migrator -i old-switches.yaml --plan --new-switch leaf-01,leaf-02 \
+                --new-ports 52 --new-uplinks 4
+# changed some ports by hand in the sheet? plan again around them
+switch-migrator --from-snapshot output/snapshot-<stamp>.json --plan \
+                --new-switch leaf-01,leaf-02 --pins edited-cabling.xlsx
+```
+
+`--plan` decides where every old link goes and pre-fills the cabling sheet's
+**NEW switch / NEW port / NEW MLT ID / NEW MLT name**, with a **Plan note**
+saying which rule placed it. It is the rule the planners used by hand:
+
+* **Dual-homed** — real MLTs, and an old SMLT across a vIST pair — from
+  **port 1 upward, at the same port number on both new peers**. Two links per
+  side take consecutive ports. The MLT id is **4xx of the first port** (1/1 →
+  MLT 401) and the name comes from `plan.mlt_name` (default `f{slot}{port}`:
+  `f11`, `f110`).
+* **Single-homed** from the **last access port downward**, balanced so both
+  peers fill equally.
+* The **last N ports** (`--new-uplinks`) are the fabric uplinks and are never
+  planned. Uplinks to the core and the old vIST link do not move.
+* **Unused ports** are left out but listed (sheet *Not moved*, and on the rack
+  sheet as "check that no cable is plugged in"); **uncertain** ports are planned
+  and flagged.
+* `--new-switch A,B,C,D` fills the pair A,B first, then C,D. What fits nowhere
+  is reported, never squeezed in.
+* The same input always gives the same plan (old switch, then old port, in
+  faceplate order). The sheet stays editable: `--pins SHEET` keeps every NEW
+  switch/port a human changed and plans the rest around it.
+
+A server teamed across two switches **without** LACP looks to the switch like
+two servers; the plan lists such candidates (same neighbour name on two
+switches or units) under *Plan notes* and leaves them as two plain ports. Give
+them the same NEW port on both peers by hand and plan again.
+
+The new sheets: **Plan** (how full each new switch is), **Not moved** (and
+why), **Plan notes** (problems, hints, every flagged link).
+
+Because the NEW columns now hold the *plan*, the cabling sheet has a **Done**
+column. Once anybody ticks it (`x`, `yes`, `✓`), `--verify-migration` checks
+the ticked rows and leaves the rest *pending* — a run in the middle of the
+window no longer fails every link that has not moved yet. Nobody ticked
+anything: the sheet is read as before.
+
+#### The config for each new switch
+
+Every `--plan` run also writes `config/new/<new switch>.cfg`: what has to be
+pasted on that switch, on the **new** port numbers, in the order the switch
+prints its own config.
+
+* **MLTs** — `mlt 4xx enable name …`, `mlt 4xx member …`, and `interface mlt`
+  with `smlt` (when the switch has a peer), `lacp enable key 4xx` only where
+  the old aggregation ran LACP, and `flex-uni enable`.
+* **Ports** — phase I `encapsulation dot1q` for ports that carry tagged
+  traffic; phase II `default-vlan-id 0`, the old port's name, `flex-uni
+  enable`, `no shutdown` (`shutdown` if the old port was admin-down) and the
+  access hygiene lines from `plan.port_lines`.
+* **I-SID services** — `i-sid <id> elan` with `c-vid <vlan> port|mlt …` for
+  tagged and `untagged-traffic port|mlt …` for untagged traffic, taken from
+  the old port's VLAN bindings (the running-config says which is which).
+
+The I-SID per VLAN: your `isid_conventions.explicit` decision, else the I-SID
+the old switch or the fabric already uses, else a commented-out `[REVIEW]`
+block plus `<switch>.isid-decisions.txt` — never a guess. VLANs 1 and 31 and
+`excluded_vlans` are never configured.
+
+**Not in the file, on purpose:** everything ZTP set (domain, DNS, syslog, SSH,
+SNMP, mgmt), the vIST and the NNI uplinks. There is no code path that could
+emit them.
+
+Lines no real capture has shown yet are marked `[UNVERIFIED]` and listed in the
+file's header — today `c-vid … mlt`, `encapsulation dot1q` on an MLT, and the
+LACP member-port lines. Check them on the first switch. Ports whose old tagging
+is unknown, and a port that would get two untagged services, are named under
+PROBLEMS. Edit the sheet, re-plan with `--pins` (from the snapshot, no SSH) and
+the configs follow.
+
+Only the flex-UNI (I-SID) form is generated so far; platform-VLAN config for
+the cases where you choose it is not built yet.
 
 ### Splitting the cabling sheet by location (`--split-by-location`)
 
@@ -584,15 +676,42 @@ when they didn't — so it produces something useful from a half-filled sheet an
 gets more precise as the sheet does. `--no-smlt` emits plain single-switch MLTs
 instead of SMLT pairs.
 
+**LACP is carried, never invented.** `lacp enable key <id>` is emitted only
+when the sheet's **LACP** column says the old aggregation ran it. Where the
+sheet says nothing (`?` — ERS MLTs today, whose LACP state the tool does not
+read yet), no LACP line is emitted and the MLT carries a `# [!] LACP unknown`
+note to set it by hand.
+
 It refuses to guess where guessing is dangerous. **No I-SID, c-vid or VLAN
 binding is ever emitted** — that is `--extract-config` and the I-SID decision
 worksheet's job, and they have their own rules about what may be assumed.
 Anything it only half understands is written into the file as a `# [!]` line
-rather than silently configured: an aggregation of one member, an id claimed
-twice on one switch, members facing three different neighbours, or an SMLT
-that ended up on only one of the two peers (a single point of failure wearing
-the costume of a redundant one). An uplink facing **two** neighbours is the
-normal SMLT-pair shape and is not flagged.
+rather than silently configured: an old aggregation with links that have no
+NEW port yet (the block is incomplete), an id claimed twice on one switch,
+members facing three different neighbours, a one-member plain MLT
+(`--no-smlt`), or an SMLT that ended up on only one of the two peers (a single
+point of failure wearing the costume of a redundant one). A **one-member SMLT
+leg per peer** is the normal dual-homed server shape and is not flagged;
+neither is an uplink facing **two** neighbours. Members the usage
+classification called dead are not expected to move.
+
+### During: the rack sheet (`--rack-sheet`)
+
+```bash
+switch-migrator --rack-sheet cabling.xlsx      # -> output/rack-sheet-<stamp>.xlsx
+```
+
+The print version of the filled-in cabling sheet, for the technicians in the
+aisle: one landscape page per old switch, ports in **faceplate order**, ten
+columns — Port ID, port, link (access / MLT / uplink), what is on it (LLDP
+neighbour and the configured port name), usage, NEW switch, NEW port, rack
+(new), a **Done** box and a note. Dead ports are left out; a port that was down
+says "identify at the rack", a port nothing identifies says "read the cable
+label", a link with no new port planned yet says so. Reads no device.
+
+It is deliberately **not** a second fill-in document: one link is written down
+in exactly one place, the cabling sheet. The rack sheet has no `Old port`
+column, so it is never read back by mistake.
 
 ### After: verification (`--verify-migration`)
 
@@ -615,6 +734,62 @@ turn into passes on their own. A `FAIL` sets exit code 1.
 The summary sheet also lists **ports that are up on a new switch but appear in
 no sheet row** — the other direction: a link somebody patched without writing
 it down.
+
+### Every MAC, across all switches (`--mac-snapshot` / `--mac-baseline`)
+
+The verification above checks each link a technician wrote down. With a MAC
+baseline it also hands the run to
+[migration-check](../pre-migration-checker), which asks the scope-wide question:
+is every end-device MAC the old switches learned back *anywhere*?
+
+```bash
+# before the window (the day before and right before is better than once):
+# the old switches, with migration-check's MAC snapshot taken on the same sessions
+switch-migrator -i old-switches.yaml --migration-sheets --mac-snapshot output-pre/mac-pre
+
+# after the window: verify every link, and every MAC
+switch-migrator --verify-migration cabling.xlsx --mac-baseline output-pre/mac-pre
+
+# ... and keep reading the new switches until quiet hosts have spoken
+switch-migrator --verify-migration cabling.xlsx --mac-baseline output-pre/mac-pre --mac-watch
+```
+
+Each MAC that was on an access port before comes out as found, **other port**
+(back on an access port, but not the one the sheet says: swapped cables), wrong
+VLAN, elsewhere (only over an uplink or through the fabric) or missing. Results
+are grouped by old port, with IP and LLDP neighbour where known. MACs learned on
+uplinks are never counted. The report is `mac-check-<timestamp>.txt` / `.json`;
+the new switches' raw output is kept as a migration-check snapshot in
+`mac-check-<timestamp>/after/` (one `round-NN` per round with `--mac-watch`).
+
+- **No second login.** migration-check's commands are sent on the session this
+  tool already has open, and any command the collection already sent is reused,
+  not sent again. On ERS that is all of them (with `--migration-sheets`); on VOSS
+  it adds `show vlan mac-address-entry`, `show interfaces gigabitEthernet name`,
+  `show ip arp` and, where the summary form answered, `show lldp neighbor`.
+  `--dry-run` with the same options lists them.
+- Everything this tool can reach, the MAC check can: legacy SSH for old ERS, the
+  console server, `--offline` replay.
+- `--mac-snapshot DIR` works with any collecting run (audit, `--no-fabric`,
+  `--migration-sheets`); `DIR` must not exist yet. Repeat `--mac-baseline` to
+  merge several baselines (a quiet device is caught by either). A
+  `migration-check snap` folder works as a baseline too, and so does a
+  `--save-raw` folder of old **ERS** switches taken with `--migration-sheets`. A
+  `--save-raw` folder of old **VOSS** switches does not (it holds `show
+  interfaces gigabitEthernet fdb-entry`, which migration-check does not read);
+  the run names such folders before it starts. Take VOSS baselines with
+  `--mac-snapshot`.
+- `--mac-watch` re-reads the new switches every interval until every MAC is
+  back, the number not back stops falling, or the round limit is reached.
+  Ctrl-C ends the watch, not the run. Pacing in `config.yaml`:
+  `mac_check: {interval: 120, rounds: 15, stable: 3}`.
+- A MAC not back yet does **not** change the exit code (the same reasoning as
+  "no MAC yet" above). A MAC check that could not run at all does.
+- In the menu: option 2 offers the MAC snapshot when MAC tables are collected,
+  and option `v` offers the last one as the baseline, with or without watching.
+- Needs migration-check 0.2+ on Python 3.11+:
+  `pip install -e ../fabric-engine-parser -e ../pre-migration-checker`. Without
+  it, everything else works as before and the MAC options say how to install it.
 
 ### Reading the sheet back
 
@@ -727,10 +902,13 @@ Output goes to `./output/` by default:
   `--verify-migration`,
 * `migration-commands-<timestamp>.txt` with `--migration-sheets`,
 * `config/<device>.cfg` (+ `<device>.isid-decisions.txt` for ERS) with
-  `--extract-config`; `config/mlt-blocks.cfg` with `--generate-mlt`,
+  `--extract-config`; `config/new/<new switch>.cfg` (+ decisions) with `--plan`; `config/mlt-blocks.cfg` with `--generate-mlt`,
 * `csv-<timestamp>/*.csv` with `--csv` — one file per sheet,
 * `snapshot-<timestamp>.json` with `--save-snapshot`,
 * `manifest-<timestamp>.json` with `--manifest`,
+* `<DIR>/` (a migration-check snapshot) with `--mac-snapshot DIR`;
+  `mac-check-<timestamp>.txt/.json` and `mac-check-<timestamp>/after/` with
+  `--mac-baseline`,
 * `handover-<timestamp>/` with `--handover` — every file above plus an
   `index.html` tying them together,
 * `raw/<device>/<command>.txt` with `--save-raw`,
@@ -942,6 +1120,10 @@ switch_migrator/
 ├── cabling_sheet.py    # read the filled-in cabling sheet back (.xlsx/.csv)
 ├── mlt_generate.py     # cabling sheet -> new switches' MLT config blocks
 ├── verify.py           # post-migration: did every link come back up?
+├── mac_check.py        # glue to migration-check: MAC snapshots + the MAC comparison
+├── plan.py             # where every old link goes on the new switches (--plan)
+├── new_switch_config.py # the config for each new switch, from the plan
+├── standard.py         # company conventions: I-SID, MLT 4xx, LACP key, names
 ├── snapshot.py         # save/load the whole collected state as JSON
 ├── manifest.py         # per-run audit trail: commands, outcomes, files
 ├── handover.py         # one folder + index.html to hand the run over
@@ -957,6 +1139,7 @@ switch_migrator/
 └── report/
     ├── tables.py       # builds report tables once, shared by all renderers
     ├── migration.py    # port info + cabling sheets, migration commands
+    ├── rack_sheet.py   # print version of the cabling sheet for the technicians
     ├── migration_tables.py  # health-check and verification tables
     ├── progress.py     # live per-device progress during collection
     └── excel.py        # xlsx + csv export; console.py renders to terminal

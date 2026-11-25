@@ -189,3 +189,27 @@ ssh:
 #   host: tsserver
 #   username_template: "{username}:70{port}"    # Avocent-style
 #   # tcp_port_template: "70{port}"             # OpenGear-style (TCP port per line)
+
+# --- MAC check (migration-check) -----------------------------------------------
+# Pacing of --mac-watch: after the window, the new switches are read again every
+# `interval` seconds until every MAC the old switches learned is back, the
+# number not back has not fallen for `stable` rounds, or `rounds` is reached.
+# mac_check:
+#   interval: 120
+#   rounds: 15
+#   stable: 3
+
+# --- Port plan (--plan) ---------------------------------------------------------
+# The new switch model. `ports` is every port (1/1..1/<ports>); the LAST
+# `uplinks` of them are the fabric uplinks and never planned. No defaults on
+# purpose: a wrong guess plans servers onto uplink ports. --new-ports /
+# --new-uplinks override these per run.
+# `mlt_name` names new MLTs: {slot}, {port} (first member port), {id} (4xx).
+# plan:
+#   ports: 52
+#   uplinks: 4
+#   mlt_name: "f{slot}{port}"
+#   # closing lines of every new flex-UNI access port (the production set)
+#   port_lines:
+#     - "slpp-guard enable timeout 0"
+#     - "spanning-tree mstp edge-port true"

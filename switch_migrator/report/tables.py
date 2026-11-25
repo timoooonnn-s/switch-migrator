@@ -127,12 +127,12 @@ def build_vlan_inventory(audits: list[SwitchAudit]) -> Table:
 
 
 def build_ports(audits: list[SwitchAudit]) -> Table:
-    t = Table("Ports", ["Switch", "Port", "Description", "Admin", "Oper",
+    t = Table("Ports", ["Switch", "Port", "Media", "Port name", "Admin", "Oper",
                         "Reason", "LLDP neighbor", "LLDP IP", "LLDP SysDescr",
                         "Uplink"])
     for a in audits:
         for p in a.ports:
-            t.add([a.name, p.port, p.description,
+            t.add([a.name, p.port, p.media, p.name,
                    _fmt_bool(p.admin_up, "enable", "disable"),
                    _fmt_bool(p.oper_up), p.state_reason, p.lldp_neighbor,
                    p.lldp_neighbor_ip, p.lldp_sys_descr,

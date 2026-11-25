@@ -101,7 +101,13 @@ class SourceStatus:
 @dataclass
 class PortState:
     port: str
-    description: str = ""
+    # physical media from the Port Interface DESCRIPTION column (10GbSR,
+    # Gbic1000BaseT, ...). Not a description someone wrote: that is `name`.
+    media: str = ""
+    # the port's configured name ('name' in its config: VOSS interface block,
+    # ERS 'name port'), from the running-config. Often the only identity a
+    # device without LLDP has.
+    name: str = ""
     admin_up: bool | None = None
     oper_up: bool | None = None
     state_reason: str = ""        # VOSS `show int gig state` REASON column (e.g. SSH)
@@ -134,12 +140,6 @@ class PortState:
         """Which sources the VLAN/I-SID cell was built from (provenance)."""
         return ",".join(sorted({part for b in self.bindings
                                 for part in b.source.split(",") if part}))
-
-    @property
-    def media(self) -> str:
-        """Physical media from the Port Interface DESCRIPTION column
-        (10GbSR, Gbic1000BaseT, 40GbCR4, ...)."""
-        return self.description
 
 
 @dataclass

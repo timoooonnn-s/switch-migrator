@@ -50,7 +50,7 @@ from switch_migrator.report.tables import Table
 
 # Bumped whenever the cabling sheet's columns change in a way that a read-back
 # should know about. Recorded in the hidden stamp sheet.
-SHEET_SCHEMA = 2
+SHEET_SCHEMA = 4
 STAMP_SHEET = "_migrator"
 
 _FILLS = {

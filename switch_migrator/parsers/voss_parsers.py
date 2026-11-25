@@ -23,7 +23,7 @@ _UPDOWN_TOKEN = re.compile(r"^(up|down|testing)$", re.IGNORECASE)
 _MAC_TOKEN = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
 
 
-def _description(tokens: list[str]) -> str:
+def _media(tokens: list[str]) -> str:
     """DESCRIPTION column of the Port Interface table ('10GbSR', '1000BaseTX').
 
     It is the third column, but it is blank on ports with no media, which
@@ -73,7 +73,7 @@ def parse_ports(output: str) -> list[PortState]:
         seen.add(tokens[0])
         ports.append(PortState(
             port=tokens[0],
-            description=_description(tokens),
+            media=_media(tokens),
             admin_up=parse_updown(updown[-2]),
             oper_up=parse_updown(updown[-1]),
         ))
