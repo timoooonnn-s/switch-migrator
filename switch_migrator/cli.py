@@ -204,7 +204,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "the baseline for --mac-baseline. Take it of the "
                              "OLD switches before the window (the day before "
                              "and right before is better than once). DIR must "
-                             "not exist yet. Needs migration-check installed.")
+                             "not exist yet.")
     parser.add_argument("--mac-baseline", type=Path, action="append",
                         default=[], metavar="DIR",
                         help="with --verify-migration: also check every "
@@ -213,8 +213,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "says? DIR is a --mac-snapshot folder, a "
                              "migration-check snapshot, or a --save-raw folder "
                              "of old ERS switches taken with --migration-sheets. "
-                             "Repeatable: several baselines are merged. "
-                             "Needs migration-check installed.")
+                             "Repeatable: several baselines are merged.")
     parser.add_argument("--mac-watch", action="store_true",
                         help="with --mac-baseline: read the new switches again "
                              "every interval until every MAC is back or the "
@@ -316,7 +315,12 @@ def _check_mac_args(args: argparse.Namespace, from_snapshot: Path | None,
     if args.mac_watch and not args.mac_baseline:
         raise ConfigError("--mac-watch goes with --mac-baseline")
     if args.mac_baseline and not args.verify_migration:
-        raise ConfigError("--mac-baseline goes with --verify-migration")
+        raise ConfigError(
+            "--mac-baseline goes with --verify-migration: it is the BEFORE side, and "
+            "the verification reads the AFTER side off the new switches. To compare "
+            "two folders you already have, with no switch touched, use the menu's "
+            "'Compare MAC snapshots' or `migration-check diff --before DIR --after DIR` "
+            "(same install)")
     if args.mac_snapshot and args.verify_migration:
         raise ConfigError("--mac-snapshot records a baseline of the OLD switches; "
                           "a verification with --mac-baseline saves the new "
@@ -331,7 +335,6 @@ def _check_mac_args(args: argparse.Namespace, from_snapshot: Path | None,
     missing = [str(p) for p in args.mac_baseline if not p.is_dir()]
     if missing:
         raise ConfigError(f"--mac-baseline: no such folder: {', '.join(missing)}")
-    mac_check.require("--mac-snapshot" if args.mac_snapshot else "--mac-baseline")
     unreadable = mac_check.unreadable_baselines(list(args.mac_baseline))
     if unreadable and console is not None:
         console.print(

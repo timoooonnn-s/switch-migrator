@@ -266,6 +266,7 @@ _ENTRIES = [
     ("m", "Generate MLT blocks", "new switches' MLT config from a filled-in cabling sheet"),
     ("r", "Rack sheet", "print version of a filled-in cabling sheet for the technicians"),
     ("v", "Verify migration", "after the window: check every re-patched link"),
+    ("c", "Compare MAC snapshots", "two saved MAC folders, by MAC - connects to nothing"),
     ("b", "Handover bundle", "one folder with every output and an index to hand over"),
     ("p", "Profiles", "load or save a named scenario (inventory + settings)"),
     ("s", "Settings", "change one setting at a time; nothing else is touched"),
@@ -435,7 +436,7 @@ def _ask_collect_choices(s: Session, console: Console) -> _CollectChoices:
     want_macs = _yes(console, "Also collect MAC tables? (needed for migration sheets)")
     # the migration-check baseline: taken on the same sessions, so it costs a
     # few extra show commands per switch and no extra login
-    want_mac_snapshot = mac_check.available() and _yes(
+    want_mac_snapshot = _yes(
         console, "Also save a MAC snapshot for the after-check? (the baseline "
                  "migration-check compares the new switches against)", want_macs)
     return _CollectChoices(want_fabric, want_config, want_macs, want_mac_snapshot)
@@ -748,7 +749,7 @@ def action_dry_run(s: Session, console: Console) -> None:
         return
     want_config = _yes(console, "Include the running-config pull?", False)
     want_macs = _yes(console, "Include the MAC/optics collection?", True)
-    want_mac_snapshot = mac_check.available() and _yes(
+    want_mac_snapshot = _yes(
         console, "Include the MAC snapshot for migration-check?", False)
     render_dry_run(preview_commands(
         s.selected, s.cfg,
@@ -892,12 +893,62 @@ def action_verify(s: Session, console: Console, creds_fn: CredsFn) -> None:
             console.print(f"[red]MAC check could not run: {exc}[/red]")
 
 
+def action_mac_compare(s: Session, console: Console) -> None:
+    """Compare two MAC snapshot folders that already exist, without SSH.
+
+    Option `v` takes the after side itself, from the switches. This is the same
+    comparison on folders you already have - a baseline against an after side a
+    `v` run saved, a baseline against one somebody mailed you, or two baselines
+    taken days apart to see what moved before the window even started. It needs
+    no collected data and no credentials, so it also works while the session is
+    empty. The command-line equivalent is `migration-check diff`.
+    """
+    raw = _ask(console, "Baseline folder(s) (the BEFORE side), comma-separated",
+               default=str(s.mac_snapshot or ""), path=True)
+    baselines = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    if not baselines:
+        return
+    after_raw = _ask(console, "After folder (the AFTER side)", path=True)
+    if not after_raw:
+        return
+    after = Path(after_raw)
+    missing = [str(p) for p in [*baselines, after] if not p.is_dir()]
+    if missing:
+        console.print(f"[red]No such folder: {', '.join(missing)}[/red]")
+        return
+    for folder in mac_check.unreadable_baselines(baselines):
+        console.print(f"[yellow]{folder}: an old VOSS --save-raw capture; its MAC "
+                      f"table cannot be read and is left out.[/yellow]")
+
+    # the sheet is optional here: without it a MAC only has to be back in the
+    # right VLAN somewhere, with it the verdicts are port-exact
+    sheet = None
+    sheet_raw = _ask(console, "Cabling sheet for the port map (blank: compare "
+                              "without one)", path=True)
+    if sheet_raw:
+        try:
+            sheet = cabling_sheet.load(Path(sheet_raw))
+        except cabling_sheet.SheetError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+        console.print(f"[dim]Port map: {len(sheet.moved)} moved link(s) from the "
+                      f"sheet.[/dim]")
+    else:
+        console.print("[dim]No port map: a MAC back in the right VLAN on an "
+                      "unexpected port cannot be told from one behind an "
+                      "uplink.[/dim]")
+
+    s.output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    job = mac_check.MacCheckJob(baselines, after, sheet, s.output_dir, stamp)
+    try:
+        run_mac_check(job, None, console)
+    except Exception as exc:  # broad on purpose: a bad folder must not end the session
+        console.print(f"[red]Comparison could not run: {exc}[/red]")
+
+
 def _ask_mac_baselines(s: Session, console: Console) -> tuple[list[Path], bool]:
-    """The MAC baseline folder(s) for migration-check, and whether to watch.
-    Nothing to ask when migration-check is not installed - verification runs as
-    it always did."""
-    if not mac_check.available():
-        return [], False
+    """The MAC baseline folder(s) for migration-check, and whether to watch."""
     raw = _ask(console, "MAC baseline folder(s) for the after-check, comma-"
                         "separated (blank: skip)",
                default=str(s.mac_snapshot or ""), path=True)
@@ -1272,6 +1323,7 @@ def _menu_actions(s: Session, console: Console,
         "m": lambda: action_generate_mlt(s, console),
         "r": lambda: action_rack_sheet(s, console),
         "v": lambda: action_verify(s, console, creds_fn),
+        "c": lambda: action_mac_compare(s, console),
         "b": lambda: action_handover(s, console),
         "p": lambda: action_profiles(s, console),
         "s": lambda: action_settings(s, console),

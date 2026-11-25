@@ -13,9 +13,13 @@ from switch_migrator.cabling_sheet import Sheet
 from switch_migrator.config import SwitchTarget
 
 
-def mac_check_targets(targets: list[SwitchTarget], sheet: Sheet) -> list[SwitchTarget]:
+def mac_check_targets(targets: list[SwitchTarget],
+                      sheet: Sheet | None) -> list[SwitchTarget]:
     """Only the switches links moved onto: an inventory may also name the old
-    switches, which are the baseline, not the result."""
+    switches, which are the baseline, not the result. Without a sheet there is
+    nothing to narrow by, so every target is read."""
+    if sheet is None:
+        return targets
     new_switches = set(sheet.by_new_switch())
     return [t for t in targets if t.name in new_switches] or targets
 

@@ -7,7 +7,7 @@ name = "switch-migrator"
 version = "1.0.0"
 description = "Pre-migration audit & compare tool for Extreme VOSS/Fabric Engine and ERS switches against SPB fabric (BCB) state"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"  # the work server (docs/decisions/0008, D13)
 dependencies = [
     "netmiko>=4.3,<5",
     # paramiko 4.x removed ssh-dss host keys still used by old ERS/BOSS gear
@@ -15,6 +15,10 @@ dependencies = [
     "PyYAML>=6.0",
     "rich>=13.0",
     "openpyxl>=3.1",
+    # our own package: installed from vendor/ (bundle) or the sibling checkout
+    # ../fabric-engine-parser, never from an index - see README "Installing"
+    # (the name is not reserved on PyPI)
+    "fabric-weft>=0.1,<0.2",
 ]
 
 [project.optional-dependencies]
@@ -27,34 +31,51 @@ dev = [
 
 [project.scripts]
 switch-migrator = "switch_migrator.cli:main"
+# the MAC check on its own, same install (D14): snap | show | diff | watch
+migration-check = "migration_check.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["switch_migrator*"]
+include = ["switch_migrator*", "migration_check*"]
+
+[tool.setuptools.package-data]
+migration_check = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-# the same rule families as pre-migration-checker
+# one rule set for both packages (D11, D14)
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "C4", "PIE", "RET", "PT"]
 
+[tool.ruff.lint.per-file-ignores]
+# migration_check moved in from pre-migration-checker (D14) with the four ignores
+# its own config carried, reasons and all. Scoped to that package, so D11's
+# stricter bar for switch_migrator ("split the function instead") is unchanged;
+# converging the two is a job for whoever next touches these files.
+"migration_check/**" = [
+    "PLR2004",  # magic values: column counts and VLAN bounds read better inline
+    "PLR0913",  # dataclass-like constructors
+    "PLC0415",  # netmiko and PyYAML are imported where needed, on purpose (0008)
+    "PLR0911",  # a decision table of early returns (roles.py) beats nesting
+]
+# the expected number in an assertion is what the test is about
+"tests/**" = ["PLR2004"]
+
+[tool.ruff.lint.isort]
+# mac_check_samples is a test helper in tests/, not a third-party package
+known-first-party = ["switch_migrator", "migration_check", "mac_check_samples"]
+
 [tool.mypy]
-python_version = "3.10"
-files = ["switch_migrator"]
+python_version = "3.11"
+files = ["switch_migrator", "migration_check"]
 strict = true
 
 [[tool.mypy.overrides]]
 # third-party packages without type information
 module = ["netmiko", "netmiko.*", "paramiko", "paramiko.*", "openpyxl", "openpyxl.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-# optional, Python 3.11+ (it uses enum.StrEnum): not checkable against 3.10
-module = ["migration_check", "migration_check.*", "fabric_weft", "fabric_weft.*"]
-follow_imports = "skip"
 ignore_missing_imports = true

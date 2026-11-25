@@ -13,22 +13,23 @@ import shutil
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from switch_migrator import cli, mac_check
+from migration_check.platforms.boss import COMMANDS, LLDP, MAC_TABLE
+from switch_migrator import cli, mac_check, menu
 from switch_migrator.cabling_sheet import CablingRow, Sheet
 from switch_migrator.collectors.switch import Reads
-from switch_migrator.config import ConfigError, MacCheckSettings, SwitchTarget, load_config
+from switch_migrator.config import (
+    ConfigError,
+    Credentials,
+    MacCheckSettings,
+    SwitchTarget,
+    load_config,
+)
 from switch_migrator.connection import BaseRunner, CommandError, OfflineRunner
 from switch_migrator.models import Platform
 from switch_migrator.workflow.collect import CollectOptions, preview_commands
 from switch_migrator.workflow.macs import mac_check_targets
-
-pytest.importorskip("migration_check")
-from migration_check.platforms.boss import COMMANDS, LLDP, MAC_TABLE
-from rich.console import Console
-
-from switch_migrator import menu
-from switch_migrator.config import Credentials
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

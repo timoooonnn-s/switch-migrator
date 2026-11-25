@@ -62,13 +62,13 @@ def test_an_update_keeps_the_sites_files_and_drops_what_is_gone(
     mb, script = bundle
     _run(script, cwd=tmp_path)
     target = tmp_path / mb.FOLDER
-    own = target / "snapshots" / "before.json"          # the site's: never touched
+    own = target / ".venv" / "pyvenv.cfg"               # the site's: never touched
     own.parent.mkdir()
     own.write_text("mine")
     gone = target / "dropped-in-this-version.txt"       # an earlier bundle's file
     gone.write_text("old")
     with (target / _manifest(mb)).open("a") as manifest:
-        manifest.write("dropped-in-this-version.txt\nsnapshots/before.json\n")
+        manifest.write("dropped-in-this-version.txt\n.venv/pyvenv.cfg\n")
 
     done = _run(script, cwd=target)                      # inside a copy: update in place
     assert done.returncode == 0, done.stderr

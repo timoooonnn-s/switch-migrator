@@ -1,0 +1,39 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 12:54:31 2026 UTC
+************************************************************************************
+
+=======================================================================================================
+                                               Vlan Fdb
+=======================================================================================================
+VLAN            MAC                                   SMLT                       
+ID   STATUS     ADDRESS            INTERFACE          REMOTE   TUNNEL            
+-------------------------------------------------------------------------------------------------------
+10   learned    00:50:79:66:68:01  Port-1/2           false    fe-04             
+10   self       0c:03:90:b8:01:02  Port-cpp           false    -                 
+103  learned    00:50:79:66:68:09  Port-1/6           false    -                 
+103  self       0c:03:90:b8:01:01  Port-cpp           false    -                 
+4051 self       02:00:11:ff:ff:ff  Port-1/1           false    -                 
+4051 self       02:00:12:ff:ff:ff  Port-1/2           false    -                 
+4051 self       02:00:13:ff:ff:ff  Port-cpp           false    -                 
+4051 self       02:00:14:ff:ff:ff  Port-1/1           false    -                 
+4051 self       09:00:2b:00:00:05  Port-cpp           false    -                 
+4051 self       0c:03:90:b8:00:84  Port-cpp           false    -                 
+4051 self       0c:04:d2:70:00:84  Port-1/1           false    -                 
+4051 self       0c:91:dc:31:00:84  Port-1/2           false    -                 
+4051 self       0c:a3:de:d8:00:84  Port-1/1           false    -                 
+4052 self       02:00:11:ff:ff:ff  Port-1/1           false    -                 
+4052 self       02:00:12:ff:ff:ff  Port-1/2           false    -                 
+4052 self       02:00:13:ff:ff:ff  Port-cpp           false    -                 
+4052 self       02:00:14:ff:ff:ff  Port-1/2           false    -                 
+4052 self       09:00:2b:00:00:05  Port-cpp           false    -                 
+4052 self       0c:03:90:b8:00:84  Port-cpp           false    -                 
+4052 self       0c:04:d2:70:00:84  Port-1/1           false    -                 
+4052 self       0c:91:dc:31:00:84  Port-1/2           false    -                 
+4052 self       0c:a3:de:d8:00:84  Port-1/2           false    -                 
+
+c: customer vid   u: untagged-traffic
+
+22 out of 22 entries in all fdb(s) displayed.
+
+Total peer MAC move count : 0
+

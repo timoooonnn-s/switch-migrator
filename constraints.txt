@@ -1,0 +1,31 @@
+# Tested versions of every third-party package, for the work server (Linux x86_64,
+# Python 3.11). A bundle install uses it in its first pip step:
+#     .venv/bin/pip install -c constraints.txt -r requirements.txt setuptools
+# Our own packages (switch-migrator, migration-check, fabric-weft) are not listed:
+# they come from vendor/ with --no-index.
+#
+# Made with (2026-11-25):
+#     uv pip compile requirements.txt <(echo setuptools) --python-version 3.11 \
+#         --python-platform x86_64-unknown-linux-gnu --no-header --no-annotate
+# Once a migration ran well on the server, replace the list with what is really there:
+#     .venv/bin/pip freeze --all --exclude-editable
+# Change a version only together with a test run, then commit both.
+bcrypt==5.0.0
+cffi==2.1.1
+cryptography==50.0.2
+et-xmlfile==2.0.0
+markdown-it-py==4.3.0
+mdurl==0.1.2
+netmiko==4.8.0
+ntc-templates==9.4.0
+openpyxl==3.1.5
+paramiko==3.5.1
+pycparser==3.12
+pygments==2.21.0
+pynacl==1.6.2
+pyserial==3.5
+pyyaml==6.0.4
+rich==15.0.0
+scp==0.16.2
+setuptools==84.2.1
+textfsm==2.1.1

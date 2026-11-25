@@ -10,6 +10,7 @@ import pytest
 from rich.console import Console
 
 import switch_migrator.menu as menu_mod
+from mac_check_samples import FE_LAB2, FE_LAB6
 from switch_migrator import connection as C
 from switch_migrator import menu as M
 from switch_migrator.collectors.switch import Reads
@@ -338,6 +339,43 @@ def test_verify_action_collects_the_switches_the_sheet_names(env):
     s = _session(env)
     M.action_verify(s, ScriptedConsole([str(sheet)]), _offline_creds)
     assert list((tmp / "out").glob("verification-*.xlsx"))
+
+
+def test_mac_compare_action_compares_two_folders_without_ssh(env):
+    """Option `c`: the MAC comparison on folders that already exist (D14). The
+    session is empty and no credential function is passed - it must not need
+    either."""
+    tmp, _cfg_path, _inv, _raw = env
+    console = ScriptedConsole([str(FE_LAB2), str(FE_LAB6), ""])   # before, after, no sheet
+    M.action_mac_compare(_session(env), console)
+
+    text = list((tmp / "out").glob("mac-check-*.txt"))
+    assert len(text) == 1
+    assert list((tmp / "out").glob("mac-check-*.json"))
+    assert "edge MACs" in console.file.getvalue()
+
+
+def test_mac_compare_action_takes_the_sheet_as_the_port_map(env):
+    tmp, _cfg_path, _inv, _raw = env
+    sheet = tmp / "cabling.csv"
+    with sheet.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Old switch", "Old port", "NEW switch", "NEW port", "Port ID"])
+        w.writerow(["fe-01", "1/1", "fe-02", "1/1", "P0001"])
+    console = ScriptedConsole([str(FE_LAB2), str(FE_LAB6), str(sheet)])
+    M.action_mac_compare(_session(env), console)
+
+    assert "Port map: 1 moved link(s)" in console.file.getvalue()
+    assert list((tmp / "out").glob("mac-check-*.txt"))
+
+
+def test_mac_compare_action_names_a_folder_that_is_not_there(env):
+    tmp, _cfg_path, _inv, _raw = env
+    console = ScriptedConsole([str(tmp / "nope"), str(FE_LAB6), ""])
+    M.action_mac_compare(_session(env), console)
+
+    assert "No such folder" in console.file.getvalue()
+    assert not list((tmp / "out").glob("mac-check-*"))
 
 
 # ------------------- auto-snapshot, pre-flight, profiles ---------------------

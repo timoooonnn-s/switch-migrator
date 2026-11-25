@@ -1,5 +1,6 @@
-# what a bundle installed (tools/make-bundle.py)
+# what a bundle installed (tools/make-bundle.py), and the libraries it brings along
 .switch-migrator-files
+vendor/
 
 # Python
 __pycache__/
@@ -17,6 +18,13 @@ output/
 *.log
 snapshot*.json
 manifest*.json
+# MAC-check snapshots and results (migration-check: rule R8, its decision 0002)
+snapshots/
+*.snapshot/
+mac-check-*/
+mac-check-*.txt
+mac-check-*.json
+result*.json
 
 # Local configs with real device data
 config.yaml

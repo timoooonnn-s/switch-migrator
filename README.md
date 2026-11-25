@@ -80,7 +80,7 @@ The DvR state is authoritative. Match results per VLAN:
 
 ## Requirements
 
-* Python **3.10+** on a Linux host with direct SSH reachability to all devices
+* Python **3.11+** on a Linux host with direct SSH reachability to all devices
 * Legacy switches: Extreme **VOSS / Fabric Engine** (tested formats 8.x–9.4.x)
   and **ERS / BOSS** stackables
 * DvR controllers: VOSS / Fabric Engine
@@ -89,34 +89,64 @@ The DvR state is authoritative. Match results per VLAN:
 
 ## Installation
 
+switch-migrator needs one of our own packages: **fabric-weft**, the Fabric Engine
+output parser (repo `fabric-engine-parser`). The MAC check itself (`migration_check`,
+the `migration-check` command) is part of this repository - it used to be
+`pre-migration-checker` and moved in with D14. Check both out side by side, then
+install in two steps, in this order:
+
 ```bash
-git clone <this repo>
+git clone <switch-migrator> && git clone <fabric-engine-parser>
 cd switch-migrator
-python3 -m venv .venv && source .venv/bin/activate
-pip install .            # or: pip install -r requirements.txt
-switch-migrator --version
+python3 -m venv .venv
+# 1. everything third-party, from the index, at the tested versions
+.venv/bin/pip install -c constraints.txt -r requirements.txt setuptools
+# 2. our two packages from the checkouts - never from an index
+.venv/bin/pip install --no-index --no-build-isolation \
+    -e ../fabric-engine-parser -e .
+.venv/bin/switch-migrator --version
+.venv/bin/migration-check --version     # the MAC check on its own, same install
 ```
+
+**Never a plain `pip install .` into a fresh venv.** pip would look `fabric-weft`
+up on PyPI, where that name is not ours: whatever someone uploaded under it would
+be installed and run (dependency confusion). Step 2's `--no-index` is what prevents
+that, until the name is reserved on PyPI or an internal index serves it.
+
+`constraints.txt` holds the versions this was tested with on Linux x86_64 /
+Python 3.11 (it says how it was made); change one only together with a test run.
 
 ### One-file bundle (no git on the target)
 
-For a jump host that cannot reach the repository, pack the tool into one
-self-extracting text file and send that instead:
+For a jump host that cannot reach the repositories, pack everything into one
+self-extracting text file and send that instead. It carries switch-migrator and
+fabric-weft (the latter under `vendor/`), built from the two checkouts side by
+side. The MAC check needs no vendoring - it is part of switch-migrator:
 
 ```bash
-python3 tools/make-bundle.py     # -> dist/switch-migrator-bundle-<version>.py
+python3 tools/make-bundle.py
+# -> dist/switch-migrator-bundle-1.0.0-fabric-weft-0.1.0.py
 ```
 
-On the target, with Python 3.8+ for the unpacking (3.10+ for the tool):
+On the target, with Python 3.8+ for the unpacking (3.11+ for the tool):
 
 ```bash
-python3 switch-migrator-bundle-1.0.0.py          # new ./switch-migrator, or update the copy you are in
-python3 switch-migrator-bundle-1.0.0.py --list   # what is inside
+python3 switch-migrator-bundle-<versions>.py          # new ./switch-migrator, or update the copy you are in
+python3 switch-migrator-bundle-<versions>.py --list   # what is inside
 ```
 
-It prints what to do next: the `pip install -e .` into a `.venv` on the first
-unpack, again only when an update changed the dependencies, and which example
-configs to copy. The Python packages themselves still come from pip (PyPI or
-your mirror).
+It prints what to do next - the venv and the two pip steps above, with
+`vendor/` in place of the sibling checkouts:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -c constraints.txt -r requirements.txt setuptools
+.venv/bin/pip install --no-index --no-build-isolation -e vendor/fabric-weft -e .
+```
+
+The first step needs the package index (or `pip --proxy ...`); the second
+needs no network at all. On an update the steps are printed again only when
+`pyproject.toml`, `requirements.txt` or `constraints.txt` changed.
 
 * **Updates in place.** Running a newer bundle inside an existing copy rewrites
   only what changed and removes files an earlier bundle installed that the new
@@ -128,14 +158,16 @@ your mirror).
   before anything is written.
 * **What goes in:** every file git tracks, as it is on disk (uncommitted edits
   are listed while building; untracked files are listed and left out), minus
-  `council/`. Commit first to ship a new file.
-* **One name, one content.** The name carries `__version__`, which must match
-  `pyproject.toml`. Building the same contents again is a no-op; different
-  contents under an existing name are refused until you bump the version
-  (`--force` overrides).
-* **The MAC check** needs migration-check in the same venv: send the
-  pre-migration-checker bundle along (it carries fabric-weft too) and install it
-  with the line this bundle prints.
+  `council/`; of the two libraries only `pyproject.toml`, `README.md`, `LICENSE`
+  and `src/`. `migration_check/`, its tests, its fixtures and its decision
+  records are switch-migrator's own files and go in with the rest. Commit first
+  to ship a new file.
+* **One name, one content.** The name carries both `__version__`s, each of
+  which must match its `pyproject.toml`. Building the same contents again is a
+  no-op; different contents under an existing name are refused until you bump
+  a version (`--force` overrides).
+* fabric-engine-parser has a bundle of its own, for using it on its own;
+  switch-migrator does not need it.
 
 ## Configuration
 
@@ -296,6 +328,7 @@ switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
   m  Generate MLT blocks   new switches' MLT config from a filled-in cabling sheet
   r  Rack sheet            print version of a filled-in cabling sheet for the technicians
   v  Verify migration      after the window: check every re-patched link
+  c  Compare MAC snapshots two saved MAC folders, by MAC - connects to nothing
   b  Handover bundle      one folder with every output and an index to hand over
   s  Settings              output directory, offline replay, manifest, target switch
   0  Quit
@@ -805,9 +838,10 @@ it down.
 ### Every MAC, across all switches (`--mac-snapshot` / `--mac-baseline`)
 
 The verification above checks each link a technician wrote down. With a MAC
-baseline it also hands the run to
-[migration-check](../pre-migration-checker), which asks the scope-wide question:
-is every end-device MAC the old switches learned back *anywhere*?
+baseline it also hands the run to the MAC check
+([`migration_check/`](migration_check), its own decision records in
+[`docs/decisions/`](docs/decisions)), which asks the scope-wide question: is
+every end-device MAC the old switches learned back *anywhere*?
 
 ```bash
 # before the window (the day before and right before is better than once):
@@ -854,9 +888,37 @@ the new switches' raw output is kept as a migration-check snapshot in
   "no MAC yet" above). A MAC check that could not run at all does.
 - In the menu: option 2 offers the MAC snapshot when MAC tables are collected,
   and option `v` offers the last one as the baseline, with or without watching.
-- Needs migration-check 0.2+ on Python 3.11+:
-  `pip install -e ../fabric-engine-parser -e ../pre-migration-checker`. Without
-  it, everything else works as before and the MAC options say how to install it.
+  Option **`c`** compares two folders you already have, with no switch touched -
+  see below.
+
+#### The same check on folders you already have
+
+Both commands above read switches. When the two snapshots already exist - a
+baseline against an after side a `--verify-migration` run saved, a baseline
+against one somebody mailed you, or two baselines taken days apart to see what
+moved before the window started - nothing needs to be connected to:
+
+```bash
+# in the menu: option 'c', Compare MAC snapshots (no collected data, no credentials)
+# on the command line, the same comparison:
+migration-check diff --before output-pre/mac-pre --after output/mac-check-<stamp>/after
+migration-check show output-pre/mac-pre          # what one snapshot holds, per device
+```
+
+The menu writes `mac-check-<timestamp>.txt` / `.json` into the output folder just
+like a verification does, so the handover bundle picks it up. It asks for a
+cabling sheet as the port map and works without one - without it a MAC only has
+to be back in the right VLAN *somewhere*, so `other port` cannot be told from
+`elsewhere`. `migration-check` has `snap` and `watch` as well, for reading
+switches with no switch-migrator inventory at all; `--help` lists them.
+
+- **`migration-check` is this package.** Same repository, same install, same
+  version (D14) - it is not a separate dependency to install and cannot be out
+  of step. It imports nothing from `switch_migrator`, which a test enforces, so
+  it stays liftable. See [Installation](#installation).
+- **[`docs/MAC-CHECK.md`](docs/MAC-CHECK.md)** is the MAC check's own guide: every
+  `migration-check` command, how a verdict is decided, and what the check cannot
+  see. [`docs/decisions/`](docs/decisions) holds the records behind it.
 
 ### Reading the sheet back
 
@@ -1151,21 +1213,25 @@ not failures.
 ## Development
 
 ```bash
-pip install -e '.[dev]'
+# after the two install steps above (fabric-weft is there, so pip does not look for it)
+.venv/bin/pip install -e '.[dev]'
 pytest && ruff check . && mypy
 ```
 
 All three must pass before a change goes in:
 
 * **pytest** — the suite (offline, see below).
-* **ruff** — the same rule families as pre-migration-checker, at ruff's
-  default complexity limits (12 branches, 50 statements, 6 returns, 5
-  arguments per function), over the tests as well. There is no ignore list and
-  no `noqa` anywhere: a function past a limit is split, a long parameter list
-  becomes a small dataclass, and a number a test checks gets a name that says
-  what it is.
-* **mypy** — `strict`, against Python 3.10, with no `type: ignore`.
-  migration-check and fabric-weft are skipped: they are optional and need 3.11.
+* **ruff** — one rule set for both packages, at ruff's default complexity
+  limits (12 branches, 50 statements, 6 returns, 5 arguments per function),
+  over the tests as well. In `switch_migrator/` there is no ignore and no
+  `noqa`: a function past a limit is split, a long parameter list becomes a
+  small dataclass, and a number a test checks gets a name that says what it is.
+  Two scoped exceptions, both in `pyproject.toml` with their reasons:
+  `migration_check/` keeps the four ignores it arrived with (D14 - rewriting
+  moved code during the move would have buried the move), and `tests/` allows a
+  bare expected number in an assertion.
+* **mypy** — `strict`, against Python 3.11, with no `type: ignore`, over both
+  packages. `fabric_weft` is checked through too (it ships type information).
 
 The test suite runs entirely offline against captured CLI fixtures in
 `tests/fixtures/` — including a full end-to-end pipeline test through
@@ -1178,18 +1244,21 @@ for yet — replace them with real `--save-raw` output when you have it, and
 keep the tests.
 
 `docs/CONNECTIONS.md` documents the connection layer in depth (both platforms,
-its invariants, and how to add a third one).
+its invariants, and how to add a third one). `docs/MAC-CHECK.md` documents the
+MAC check as a tool in its own right, and `docs/decisions/` holds its decision
+records; decisions about the repository as a whole are in
+`council/DECISIONS.md`.
 
 ### Project layout
 
 ```
-switch_migrator/
+switch_migrator/        # the migrator; `switch-migrator` on the command line
 ├── cli.py              # flags -> workflow options, checks, console output
 ├── workflow/           # the pipeline both front ends drive
 │   ├── collect.py      # runners, per-switch collection, fabric, dry run
 │   ├── report.py       # compare, sheets, plan, health, verification -> tables
 │   ├── outputs.py      # workbook, CSV, configs, commands, rack sheet
-│   └── macs.py         # the MAC check steps (migration-check)
+│   └── macs.py         # the MAC check steps (migration_check)
 ├── menu.py             # interactive toolkit menu (session: collect once, reuse)
 ├── config.py           # YAML config/inventory loading, credential resolution
 ├── connection.py       # netmiko SSH runner + offline replay runner
@@ -1204,7 +1273,7 @@ switch_migrator/
 ├── cabling_sheet.py    # read the filled-in cabling sheet back (.xlsx/.csv)
 ├── mlt_generate.py     # cabling sheet -> new switches' MLT config blocks
 ├── verify.py           # post-migration: did every link come back up?
-├── mac_check.py        # glue to migration-check: MAC snapshots + the MAC comparison
+├── mac_check.py        # glue to migration_check: MAC snapshots + the MAC comparison
 ├── plan.py             # where every old link goes on the new switches (--plan)
 ├── new_switch_config.py # the config for each new switch, from the plan
 ├── standard.py         # company conventions: I-SID, MLT 4xx, LACP key, names
@@ -1227,4 +1296,21 @@ switch_migrator/
     ├── migration_tables.py  # health-check and verification tables
     ├── progress.py     # live per-device progress during collection
     └── excel.py        # xlsx + csv export; console.py renders to terminal
+
+migration_check/        # the MAC check; `migration-check` on the command line.
+│                       # Imports nothing from switch_migrator (D14), so it still
+│                       # stands alone - see docs/decisions/ for its own records.
+├── cli.py              # snap | show | diff | watch
+├── capture.py          # read switches over netmiko (its own sessions)
+├── snapshot.py         # the snapshot folder layout, read and write
+├── compare.py          # before vs after, by MAC; the verdicts
+├── report.py           # the text and JSON renderings
+├── model.py            # devices, MAC sightings, neighbours, verdicts
+├── roles.py            # edge port or uplink? (only edge MACs are compared)
+├── portmap.py          # CSV port map: old switch/port -> new switch/port
+├── watch.py            # re-snap until the result settles
+└── platforms/
+    ├── boss.py         # ERS/BOSS adapter (its own parsers)
+    ├── fabric_engine.py # Fabric Engine, through fabric-weft
+    └── common.py       # what both adapters share
 ```

@@ -44,6 +44,9 @@ _DESCRIPTIONS = [
     ("manifest", "What the run actually did: every command sent to every "
                  "device and whether it was accepted. No command output, no "
                  "credentials."),
+    ("mac-check", "The MAC-level before/after check: every end-device address "
+                  "the old switches had learned, and whether it is back - on "
+                  "the planned port, in the planned VLAN, or somewhere else."),
     ("csv-", "The same sheets as CSV, one file each."),
     (".csv", "One report sheet as CSV."),
 ]

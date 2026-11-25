@@ -15,8 +15,11 @@ cables). This module is the only place switch-migrator touches migration-check:
   migrated rows as the port map, optionally re-reading the new switches until the
   result settles (`--mac-watch`), and writes the report as text and JSON.
 
-The dependency points one way: switch-migrator -> migration-check, never back.
-migration-check is optional; without it, the MAC options say how to install it.
+Since D14 `migration_check` is a package of this repository rather than a separate
+distribution, so there is no version gate and no optional-dependency dance. The
+layering is unchanged and enforced by a test: switch_migrator -> migration_check
+-> fabric_weft, never back (migration-check decision 0001). That is what keeps
+`migration-check` usable on its own, from the same install.
 """
 
 from __future__ import annotations
@@ -25,82 +28,31 @@ import concurrent.futures as cf
 import contextlib
 import json
 import logging
-import sys
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from migration_check.capture import looks_rejected
+from migration_check.compare import Comparison, LoadedSnapshot, Verdict, compare, load
+from migration_check.model import Platform as CheckPlatform
+from migration_check.platforms import ADAPTERS
+from migration_check.report import render_text, to_json, trend_line
+from migration_check.snapshot import CommandStatus, SnapshotWriter
+from migration_check.watch import round_folder
+from migration_check.watch import watch as run_watch
 from switch_migrator.cabling_sheet import Sheet
 from switch_migrator.config import ConfigError, MacCheckSettings, SwitchTarget
 from switch_migrator.connection import BaseRunner, CommandError, looks_like_error
 from switch_migrator.models import Platform
 
-# migration-check is optional and needs Python 3.11+: everything this module
-# uses from it is imported here, once; when that fails, problem() says why and
-# no function below is reached (require() runs before any switch is touched)
-_IMPORT_ERROR: ImportError | None = None
-try:
-    import migration_check
-    from migration_check.capture import looks_rejected
-    from migration_check.compare import Comparison, LoadedSnapshot, Verdict, compare, load
-    from migration_check.model import Platform as CheckPlatform
-    from migration_check.platforms import ADAPTERS
-    from migration_check.report import render_text, to_json, trend_line
-    from migration_check.snapshot import CommandStatus, SnapshotWriter
-    from migration_check.watch import round_folder
-    from migration_check.watch import watch as run_watch
-except ImportError as exc:
-    _IMPORT_ERROR = exc
-
 log = logging.getLogger(__name__)
-
-# the oldest migration-check whose API this module uses (watch, port maps,
-# SnapshotWriter); checked by require() so a stale install fails before any switch
-MIN_VERSION = (0, 2, 0)
-MIN_PYTHON = (3, 11)
-INSTALL_HINT = ("pip install -e ../fabric-engine-parser -e ../pre-migration-checker "
-                "(Python 3.11+)")
 
 # raw files that only a switch-migrator VOSS capture holds, and the one
 # migration-check needs instead - a baseline with the first and not the second
 # has a MAC table migration-check cannot read
 _VOSS_FDB_FILE = "show_interfaces_gigabitethernet_fdb_entry.txt"
 _FE_MAC_FILE = "show_vlan_mac_address_entry.txt"
-
-
-def _version(text: str) -> tuple[int, ...]:
-    parts = []
-    for piece in text.split("."):
-        digits = "".join(ch for ch in piece if ch.isdigit())
-        parts.append(int(digits or 0))
-    return tuple(parts)
-
-
-def problem() -> str | None:
-    """Why the MAC check cannot run here, or None when it can."""
-    if sys.version_info < MIN_PYTHON:
-        return (f"migration-check needs Python {'.'.join(map(str, MIN_PYTHON))}+, "
-                f"this is {sys.version_info.major}.{sys.version_info.minor}")
-    if _IMPORT_ERROR is not None:
-        return (f"migration-check is not installed, or too old to have what this "
-                f"needs ({_IMPORT_ERROR}): {INSTALL_HINT}")
-    found = getattr(migration_check, "__version__", "0")
-    if _version(found) < MIN_VERSION:
-        return (f"migration-check {found} is too old, "
-                f"{'.'.join(map(str, MIN_VERSION))}+ is needed: {INSTALL_HINT}")
-    return None
-
-
-def available() -> bool:
-    return problem() is None
-
-
-def require(option: str = "the MAC check") -> None:
-    """Fail early, before any switch is touched, if migration-check cannot run."""
-    reason = problem()
-    if reason:
-        raise ConfigError(f"{option}: {reason}")
 
 
 def unreadable_baselines(baselines: list[Path]) -> list[str]:
@@ -131,9 +83,16 @@ def commands_for(platform: Platform) -> tuple[str, ...]:
     return commands
 
 
-def port_map(sheet: Sheet) -> dict[tuple[str, str], tuple[str, str]]:
+def port_map(sheet: Sheet | None) -> dict[tuple[str, str], tuple[str, str]]:
     """(old switch, old port) -> (new switch, new port) for every row whose cable
-    has moved. The sheet reader has already normalised the ports."""
+    has moved. The sheet reader has already normalised the ports.
+
+    No sheet (an offline comparison of two folders) means no mapping: a MAC is then
+    expected back anywhere in the right VLAN, and `OTHER_PORT` cannot be told from
+    `ELSEWHERE`. Giving the sheet is what makes the verdicts port-exact.
+    """
+    if sheet is None:
+        return {}
     return {(row.old_switch, row.old_port): (row.new_switch, row.new_port)
             for row in sheet.moved}
 
@@ -324,7 +283,7 @@ class MacCheckJob:
     """What one MAC check compares, and where its report goes."""
     baselines: list[Path]
     after: Path                  # the new switches' snapshot, taken during verification
-    sheet: Sheet
+    sheet: Sheet | None          # the port map; None = compare two folders as they are
     output_dir: Path
     stamp: str
 

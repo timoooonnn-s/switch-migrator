@@ -13,7 +13,7 @@ Confusing the two is how a tool ends up calling 300 switches broken.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 # a convention I-SID: three prefix digits, four VLAN digits
 ISID_DIGITS = 7
@@ -27,7 +27,7 @@ class ConventionError(ValueError):
     """The value cannot be expressed under the estate's conventions."""
 
 
-class Environment(str, Enum):
+class Environment(StrEnum):
     PROD = "prod"
     NONPROD = "nonprod"
     SPECIAL = "special"

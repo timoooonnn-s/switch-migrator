@@ -1,0 +1,19 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 18:30:06 2026 UTC
+************************************************************************************
+
+==================================================================================================================================
+                                                          PORT Isid Info
+==================================================================================================================================
+                ISID                   ISID                                 ISID                                        MAC     
+PORTNUM IFINDEX ID       VLANID C-VID  TYPE     ORIGIN                      NAME                             BPDU       SUNI    
+----------------------------------------------------------------------------------------------------------------------------------
+1/4     195     20040    40     N/A    CVLAN    C  ---  -  ---  -  -  --    ISID-20040                                  FALSE   
+----------------------------------------------------------------------------------------------------------------------------------
+
+1 out of 2 Total Num of i-sid endpoints displayed
+
+ORIGIN Legend:
+C: manually configured; D: discovered by FA or EPT; M: FA management; E: discovered by EAP
+A: auto-sense; R: multi-area redist; RV: radius created vlan; S: static routed multicast
+l: discover by local switch  r: discover by remote VIST switch

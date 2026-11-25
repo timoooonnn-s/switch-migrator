@@ -1,0 +1,21 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 18:30:06 2026 UTC
+************************************************************************************
+
+========================================================================================================================
+                                                       Vlan Basic
+========================================================================================================================
+VLAN                                MSTP                                                                L3                
+ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR      SUBNETMASK      VRFID ORIGIN   ACCESS            
+------------------------------------------------------------------------------------------------------------------------
+1     Default          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+40    servers          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+50    lacp-test        byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+60    smlt-test        byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+4000  vist             byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+4048  onboarding-vlan  private      0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+4051  bvlan-1          spbm-bvlan   62      none         N/A             N/A             0     CONFIG   GlobalRouter      
+4052  bvlan-2          spbm-bvlan   62      none         N/A             N/A             0     CONFIG   GlobalRouter      
+
+All 8 out of 8 Total Num of Vlans displayed
+

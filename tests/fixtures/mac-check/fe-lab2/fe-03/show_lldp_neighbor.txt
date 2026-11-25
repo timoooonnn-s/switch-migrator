@@ -1,0 +1,35 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 12:54:40 2026 UTC
+************************************************************************************
+
+==========================================================================================
+                                      LLDP Neighbor
+==========================================================================================
+
+Port: 1/1       Index    : 2    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:04:d2:70:00:00
+                PortId   : IfName             1/2
+                SysName  : fe-01
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/2
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.11
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+
+Port: 1/2       Index    : 1    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:91:dc:31:00:00
+                PortId   : IfName             1/2
+                SysName  : fe-02
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/2
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.12
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+------------------------------------------------------------------------------------------
+Total Neighbors : 2
+------------------------------------------------------------------------------------------
+Capabilities Legend: (Supported/Enabled)
+B= Bridge,    D= DOCSIS,    O= Other,     R= Repeater,
+S= Station,   T= Telephone, W= WLAN,      r= Router

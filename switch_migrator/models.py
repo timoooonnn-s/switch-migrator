@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import TypedDict
 
 
-class Platform(str, Enum):
+class Platform(StrEnum):
     VOSS = "voss"
     ERS = "ers"
 
@@ -281,7 +281,7 @@ class FabricState:
         self.dvrs_ok.extend(other.dvrs_ok)
 
 
-class CompStatus(str, Enum):
+class CompStatus(StrEnum):
     OK = "OK"                                    # convention & DvR attachment agree
     # found via DvR attachment, but no convention match
     OK_NONSTANDARD = "OK_NONSTANDARD"

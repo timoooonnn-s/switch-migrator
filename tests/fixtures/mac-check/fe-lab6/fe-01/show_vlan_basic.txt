@@ -1,0 +1,30 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 18:29:53 2026 UTC
+************************************************************************************
+
+========================================================================================================================
+                                                       Vlan Basic
+========================================================================================================================
+VLAN                                MSTP                                                                L3                
+ID    NAME             TYPE         INST_ID PROTOCOLID   SUBNETADDR      SUBNETMASK      VRFID ORIGIN   ACCESS            
+------------------------------------------------------------------------------------------------------------------------
+1     Default          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+40    servers          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+50    lacp-test        byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+60    smlt-test        byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+70    wrap-test        byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+71    VLAN-71          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+72    VLAN-72          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+73    VLAN-73          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+74    VLAN-74          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+75    VLAN-75          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+76    VLAN-76          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+77    VLAN-77          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+78    VLAN-78          byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+4000  vist             byPort       0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+4048  onboarding-vlan  private      0       none         N/A             N/A             0     CONFIG   GlobalRouter      
+4051  bvlan-1          spbm-bvlan   62      none         N/A             N/A             0     CONFIG   GlobalRouter      
+4052  bvlan-2          spbm-bvlan   62      none         N/A             N/A             0     CONFIG   GlobalRouter      
+
+All 17 out of 17 Total Num of Vlans displayed
+

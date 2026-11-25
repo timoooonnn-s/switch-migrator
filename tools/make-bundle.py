@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Pack switch-migrator into ONE self-extracting text file, e.g. to send it by mail.
+"""Pack switch-migrator into ONE self-extracting text file, e.g. to send it by mail -
+together with fabric-weft, the Fabric Engine parser its MAC check reads with, from the
+sibling checkout ../fabric-engine-parser (into vendor/). The MAC check itself
+(migration_check) is part of switch-migrator since D14 and needs no vendoring.
 
-    python3 tools/make-bundle.py            ->  dist/switch-migrator-bundle-<version>.py
+    python3 tools/make-bundle.py            ->  dist/switch-migrator-bundle-<versions>.py
     python3 tools/make-bundle.py --force    ->  replace a bundle of the same name
     python3 tools/make-bundle.py --out DIR  ->  write it to DIR instead of dist/
 
-The file name carries the version (__version__ in switch_migrator/__init__.py, which must
-match pyproject.toml), so bump it before shipping changed contents: two different bundles
-must never share a name, or someone installs the wrong one.
+The file name carries both versions (__version__ of each, which must match its
+pyproject.toml), so bump one before shipping changed contents: two different bundles must
+never share a name, or someone installs the wrong one.
 
 On the target machine:
 
-    python3 switch-migrator-bundle-<version>.py            # inside an existing copy (or its
+    python3 switch-migrator-bundle-<versions>.py           # inside an existing copy (or its
                                                             # git checkout): update in place;
                                                             # elsewhere: a new ./switch-migrator
-    python3 switch-migrator-bundle-<version>.py /srv/sm    # unpack / update exactly there
-    python3 switch-migrator-bundle-<version>.py --list     # only show what is inside
+    python3 switch-migrator-bundle-<versions>.py /srv/sm   # unpack / update exactly there
+    python3 switch-migrator-bundle-<versions>.py --list    # only show what is inside
 
 The bundle is plain ASCII (a base64-encoded tar.gz) with a SHA-256 checksum, so a damaged
 attachment is detected before anything is written. It never contains, overwrites or removes
@@ -23,9 +26,10 @@ the site's own files (config.yaml, switches.yaml, inventories, profiles.yaml, ou
 snapshots, .venv), so it is also the way to update. Only files under git are packed - as
 they are on disk, uncommitted edits included (they are listed) - and council/ stays home.
 
-Building needs git. Unpacking needs Python 3.8+ and nothing else; the Python packages the
-tool depends on come from pip afterwards, and the bundle prints the command. The same
-contents always give the same checksum, so rebuilding an unchanged tree is a no-op.
+Building needs git and both checkouts. Unpacking needs Python 3.8+ and nothing else.
+Then the bundle prints two pip steps, in the order they must run: the third-party packages
+from the index, pinned by constraints.txt, then our own two packages with --no-index. The
+same contents always give the same checksum, so rebuilding an unchanged tree is a no-op.
 """
 
 from __future__ import annotations
@@ -59,8 +63,16 @@ class Part:
 
 # --- what this bundle is (the only part that differs between the projects) ----------------
 FOLDER = "switch-migrator"              # the folder a fresh unpack creates
+WORK = ROOT.parent                      # the sibling checkout of the one library left
+# fabric-weft, which the MAC check parses Fabric Engine output with - package files only.
+# migration_check is no longer here: it is switch-migrator's own package (D14), so Part
+# one below ships it, its tests, its fixtures and its decision records like any other
+# tracked file - commit a new one before building.
+_LIBRARY = r"^(pyproject\.toml|README\.md|LICENSE|src/)"
 PARTS = (
     Part("switch-migrator", ROOT, "", r"^(?!council/)", "switch_migrator/__init__.py"),
+    Part("fabric-weft", WORK / "fabric-engine-parser", "vendor/fabric-weft/",
+         _LIBRARY, "src/fabric_weft/__init__.py"),
 )
 # the site's own files: never packed, never overwritten, never removed by an update
 SITE_FILES = (
@@ -69,14 +81,21 @@ SITE_FILES = (
     r"|(^|/)inventory(?![^/]*\.example\.)[^/]*\.ya?ml$"
     r"|(^|/)(snapshot|manifest|mac-check)[^/]*\.json$|\.(pyc|log|xlsx)$"
 )
-REQUIRES = (3, 10)                      # the tool's own Python floor (pyproject)
-SETUP = "-e ."                          # pip install arguments, run inside the target
+REQUIRES = (3, 11)                      # the tool's own Python floor (pyproject)
+# in this order, inside the target: first everything from the index, at the tested
+# versions; then our two packages from vendor/ and here - --no-index, so pip never
+# looks their names up on an index (they are not reserved on PyPI)
+INSTALL = (
+    "-c constraints.txt -r requirements.txt setuptools",
+    "--no-index --no-build-isolation -e vendor/fabric-weft -e .",
+)
 EXAMPLES = (("config.yaml", "config.example.yaml"),
             ("switches.yaml", "switches.example.yaml"))
-CHECK = ".venv/bin/switch-migrator --version"
+# both entry points of the one package: the second proves the MAC check still runs alone
+CHECK = ".venv/bin/switch-migrator --version && .venv/bin/migration-check --version"
 NOTES = (
-    "MAC check (optional, Python 3.11+): unpack the pre-migration-checker bundle too, then",
-    "  .venv/bin/pip install -e <its folder>/vendor/fabric-weft -e <its folder>",
+    "Network: the first pip step needs the package index (or pip --proxy ...); the second "
+    "none.",
 )
 # ------------------------------------------------------------------------------------------
 
@@ -160,7 +179,7 @@ def render(name: str, version: str, title: str, raw: bytes) -> str:
         "SHA256": hashlib.sha256(raw).hexdigest(),
         "SITE_FILES": repr(SITE_FILES),
         "REQUIRES": repr(REQUIRES),
-        "SETUP": SETUP,
+        "INSTALL": repr(INSTALL),
         "EXAMPLES": repr(EXAMPLES),
         "CHECK": CHECK,
         "NOTES": repr(NOTES),
@@ -261,10 +280,12 @@ MANIFEST = "@@MANIFEST@@"
 VERSION_FILE = "@@VERSION_FILE@@"
 SITE_FILES = re.compile(@@SITE_FILES@@)
 REQUIRES = @@REQUIRES@@
-SETUP = "@@SETUP@@"
+INSTALL = @@INSTALL@@
 EXAMPLES = @@EXAMPLES@@
 CHECK = "@@CHECK@@"
 NOTES = @@NOTES@@
+# a change to one of these means: run the pip steps again
+DEPENDENCY_FILES = re.compile(r"(^|/)(pyproject\.toml|(requirements|constraints)[^/]*\.txt)$")
 PAYLOAD = """
 @@PAYLOAD@@
 """
@@ -370,12 +391,14 @@ def next_steps(target, changed):
                                                REQUIRES[0], REQUIRES[1], python))
     else:
         python = "python3"
+    steps = ["         .venv/bin/pip install %s" % step for step in INSTALL]
     if not os.path.isdir(os.path.join(target, ".venv")):
-        print("Install: cd %s && %s -m venv .venv && .venv/bin/pip install %s"
-              % (target, python, SETUP))
-    elif any(n.endswith("pyproject.toml") for n in changed):
-        print("Update:  the dependencies changed - cd %s && .venv/bin/pip install %s"
-              % (target, SETUP))
+        print("Install: cd %s" % target)
+        print("         %s -m venv .venv" % python)
+        print("\n".join(steps))
+    elif any(DEPENDENCY_FILES.search(n) for n in changed):
+        print("Update:  the dependencies changed - cd %s, then" % target)
+        print("\n".join(steps))
     else:
         print("Update:  .venv is there and the dependencies did not change - nothing to install.")
     for site, example in EXAMPLES:

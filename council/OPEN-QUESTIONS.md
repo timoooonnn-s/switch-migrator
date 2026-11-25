@@ -121,6 +121,11 @@ anything else? (This becomes the "documentation changes" sheet.)
 
 **R18 (was Q13). Where does it run?** RHEL version, Python version, is
 `pip install` allowed? (`port-preparer` targets Python 3.11.)
+*Partly answered (2026-11-25):* Linux x86_64, Python 3.11, pip can fetch from
+the index (D13). Still open: RHEL version, and whether that index is PyPI or a
+mirror. A mirror could serve `fabric-weft` and close D13's dependency-confusion
+gap - one name rather than three since D14 merged migration-check in, and
+switch-migrator itself is installed from the checkout either way.
 
 **R19 (was Q15). The paper.** Printed or tablet, who fills it in, English or
 German on the sheet?

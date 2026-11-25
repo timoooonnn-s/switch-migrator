@@ -1,3 +1,8 @@
+# The third-party packages, for the first pip step of a bundle install (with
+# -c constraints.txt). Covers switch-migrator - the MAC check (migration_check) is
+# part of this package since D14 and needs nothing beyond netmiko/paramiko, which
+# are here already. fabric-weft and this package itself come from vendor/ in the
+# second step, with --no-index. Keep in step with pyproject.toml.
 netmiko>=4.3,<5
 # paramiko 4.x removed ssh-dss host key support, which old ERS/BOSS
 # switches still present - stay on 3.x for legacy SSH compatibility

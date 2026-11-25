@@ -165,7 +165,7 @@ features first. **Chair:** the plan is both — it is the first new feature
 and it forces the one split that matters. Everything else follows when
 touched.
 
-## D9 — migration-check is the MAC-level verification (2026-11-23)
+## D9 — migration-check is the MAC-level verification (2026-11-23) — *amended by D13 and D14*
 
 `pre-migration-checker` (`migration-check`) stays a separate package; the
 arrow is switch-migrator → migration-check → fabric-weft, never back (its own
@@ -173,6 +173,10 @@ decisions 0001/0012). It is an **optional** dependency: without it everything
 else works and the MAC options say how to install it. It is not declared in
 `pyproject.toml`, because it is not on PyPI and a same-named package there
 would be installed instead (dependency confusion).
+
+> **D14:** the package is no longer separate - it lives in this repository, as
+> `migration_check/`. The *arrow* is unchanged and now has a test. The
+> dependency-confusion point below applies to `fabric-weft` alone.
 
 * **One session per switch.** Its commands ride on the session the collection
   already has open (`mac_check.SnapshotRecorder`), and every command the
@@ -296,6 +300,115 @@ numbering note) and in log timestamps.
   output - and it already leaves the running-config out unless the config
   was asked for.
 * `ruff format`: still as in D11.
+
+## D13 — One bundle, Python 3.11, migration-check required (2026-11-25)
+
+* **Python 3.11** (the work server: Linux x86_64, 3.11 - R18). `requires-python`,
+  ruff and mypy targets; the three `(str, Enum)` classes are `StrEnum`. The
+  fixture replay differs only in paths and timestamps.
+* **migration-check is required**, `migration-check>=0.2,<0.3` in
+  `pyproject.toml` (and migration-check declares `fabric-weft>=0.1,<0.2`). With
+  both on 3.11, D9's reason for optional was gone. The runtime gate
+  (`problem()` / `available()` / `require()`, the version check, the import
+  fallback) is removed; pip guarantees the version, and mypy now checks the
+  calls instead of skipping the package.
+* **D9's dependency-confusion point still stands**: the names are not reserved
+  on PyPI. Our three packages are installed only with `--no-index` - in the
+  bundle's second pip step and in the README. A plain `pip install .` into a
+  fresh venv would fetch them from PyPI and must not be used. *Closing it for
+  good* (placeholder registrations or an internal index) is the user's action
+  and **open**.
+* **One bundle** (`tools/make-bundle.py`): switch-migrator plus
+  `vendor/migration-check/` and `vendor/fabric-weft/`, built from the sibling
+  checkouts. It prints the install in order: third-party packages from the
+  index with `-c constraints.txt`, then our three with `--no-index
+  --no-build-isolation` (the user chose: pip fetches the dependencies, the
+  bundle prints the commands rather than running them).
+* **`constraints.txt`**: every third-party version, compiled for Linux x86_64 /
+  Python 3.11. Tested: a fresh 3.11 venv with pip 24.0 installs from it, `pip
+  check` is clean, and the suite passes from the unpacked copy (468 + the 4
+  bundle-builder tests, which need git). Replace it with the server's `pip
+  freeze --all --exclude-editable` once a migration ran there.
+
+**Not merged.** The repositories stay separate (D9; migration-check's 0001 and
+0012 - it is meant to stand alone and maybe become a TRuffle command).
+*Critic:* three repos for one person's toolchain is overhead if nobody runs
+migration-check on its own. **Recommendation:** revisit after a few real
+migrations - if most migration-check changes need a matching `mac_check.py`
+change and it never ran alone, merge it then.
+
+> **Superseded the same day by D14**, which does what the Critic recommended.
+> The user did not wait for the few real migrations: the three-checkout install
+> was already the most awkward part of D13, and nothing about it was going to
+> read better after a window at 3 a.m. Everything else in D13 stands - Python
+> 3.11, one bundle, `constraints.txt`, and the open PyPI-name item, which now
+> concerns `fabric-weft` only.
+
+## D14 — migration-check moves in; it still runs on its own (2026-11-25)
+
+**Supersedes** the "stays separate" halves of D9 and D13, and
+`pre-migration-checker`'s own 0001 placement. Recorded there as
+[decision 0013](../docs/decisions/0013-one-repository.md).
+
+`migration_check` is a package of **this** repository, beside `switch_migrator`,
+and ships in the same distribution. Nobody ran it alone, and D13's required-
+dependency arrangement cost: three checkouts side by side, a second `pip`
+invocation with `--no-index` so the unreserved PyPI names could not be hijacked,
+`vendor/migration-check/` in every bundle, three `__version__`s in every bundle
+name, and two suites - one of which skipped a test when the checkouts were not
+neighbours.
+
+**It is still usable by itself.** That was 0001's whole reason and it survives:
+
+* `migration-check` is still a console script of this install -
+  `snap | show | diff | watch`, same options, same exit codes.
+* `migration_check` imports nothing from `switch_migrator`. The arrow is
+  switch_migrator → migration_check → fabric_weft, as before, and
+  `tests/test_mac_versions.py` fails on the first import that breaks it. The
+  package can be lifted back out.
+* **fabric-weft stays its own repository.** A parser library with its own tests
+  and records, plausibly useful to something else, and the only part of the
+  toolchain that is. Still installed from `../fabric-engine-parser` or
+  `vendor/fabric-weft/`, still with `--no-index`.
+
+**Used through the whole workflow, not just bolted on.** Everything 0012 and D9
+wired up is unchanged (`--mac-snapshot`, `--verify-migration --mac-baseline`,
+`--mac-watch`, menu option 2 and `v`). Three gaps closed with the move:
+
+* **Menu option `c`, "Compare MAC snapshots"** - the comparison on two folders
+  that already exist, no SSH, no collected data, no credentials. It was only ever
+  reachable by dropping to a shell for `migration-check diff`; the menu is where
+  the field engineer actually is. The cabling sheet is optional there and says
+  what is lost without it (a port-exact verdict).
+* `MacCheckJob.sheet` is `Sheet | None`, so one glue path serves both the
+  collection-driven check and the offline one - the report, its JSON and the
+  handover pickup are identical.
+* The handover index page now **describes** `mac-check-*.txt/.json`. It had been
+  copying them in with no blurb since D9.
+
+**One version, one suite.** `migration_check.__version__` is this repository's,
+asserted against `switch_migrator.__version__` and `pyproject.toml`; it is the
+`tool` field of every `snapshot.json`, while compatibility stays
+`SNAPSHOT_FORMAT`. The tests came in as `tests/test_mac_*.py`, fixtures under
+`tests/fixtures/mac-check/`; the ERS capture is read from `tests/fixtures/ers`
+here, so the formerly-skipped cross-repo test always runs. **528 tests pass, no
+skips** (was 472 here + 56 there, of which one skipped), `ruff check .` and
+`mypy` clean.
+
+*Software Engineer:* two `ruff` bars in one repository - `migration_check` kept
+the four ignores its own config carried (magic values, many arguments, imports
+inside functions, the early-return table in `roles.py`) as `per-file-ignores`,
+while D11 made `switch_migrator` split functions instead. **Accepted:** rewriting
+moved code during a move buries the move in the diff - the same reason D11 left
+`ruff format` alone. The scoped ignores are commented with their reasons and are
+for whoever next touches those files.
+*Critic:* 0001 said the verification should be usable without the migrator, and
+this makes it a thing you get by installing the migrator. **Accepted as the
+trade:** the import boundary and the console script are what "usable without"
+has to mean in practice, and both are kept and tested. If it ever has to stand
+alone again - the TRuffle command 0012 mentions - the test is the guarantee that
+lifting the folder back out still works.
+*Field Engineer:* nothing to relearn. Same commands, one fewer `git clone`.
 
 ## D10 — The cabling sheet is the plan file (2026-11-24)
 
