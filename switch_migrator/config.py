@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+from switch_migrator import paths
 from switch_migrator.location import LocationRules
 from switch_migrator.models import Platform
 
@@ -166,6 +167,9 @@ class Config:
     # default inventory file, so a plain `switch-migrator` needs no -i;
     # resolved relative to the config file's own directory
     inventory: Path | None = None
+    # the file this config was read from, so the inventory beside it can be
+    # found from any working directory (paths.py)
+    source: Path | None = None
     # per-command spelling overrides ({'show mlt': 'show mlt all', ...}),
     # applied at the runner - replacements are restricted to read-only
     # spellings so the tool's licence to run in a change window survives
@@ -196,7 +200,11 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
-        raise ConfigError(f"config file not found: {path}") from None
+        raise ConfigError(paths.missing_config(path)) from None
+    except IsADirectoryError:
+        raise ConfigError(f"{path} is a directory, not a config file") from None
+    except OSError as exc:
+        raise ConfigError(f"config file cannot be read: {path}: {exc}") from None
     except yaml.YAMLError as exc:
         raise ConfigError(f"{path}: invalid YAML: {exc}") from None
     if not isinstance(data, dict):
@@ -219,6 +227,7 @@ def load_config(path: Path, require_fabric: bool = True) -> Config:
         console_server=_console_server(data, path),
         mac_check=_mac_check(data, path),
         plan=_plan(data, path),
+        source=path,
     )
 
 
@@ -322,6 +331,13 @@ def _inventory(data: dict[str, Any], path: Path) -> Path | None:
     return inventory if inventory.is_absolute() else path.parent / inventory
 
 
+# what would turn one override into two commands: a newline is sent to the
+# device as a newline, and ';' chains commands on the CLIs that accept it. The
+# read-only check looks at the START of the value, so anything that can carry a
+# SECOND command past it has to be refused outright.
+_COMMAND_CHAINS = ("\n", "\r", ";")
+
+
 def _command_overrides(data: dict[str, Any], path: Path) -> dict[str, str]:
     raw = data.get("commands") or {}
     if not isinstance(raw, dict):
@@ -330,6 +346,13 @@ def _command_overrides(data: dict[str, Any], path: Path) -> dict[str, str]:
     overrides: dict[str, str] = {}
     for original, replacement in raw.items():
         command = str(replacement).strip()
+        if any(chain in command for chain in _COMMAND_CHAINS):
+            raise ConfigError(
+                f"{path}: commands['{original}'] holds more than one command "
+                f"({command!r}) - an override is a single read-only command, so "
+                f"it may not contain a newline or ';'. Only the first part is "
+                f"checked for being read-only; the rest would be sent "
+                f"unchecked.")
         if not command.startswith(("show", "terminal", "term ", "enable")):
             raise ConfigError(
                 f"{path}: commands['{original}'] = '{command}' is not a read-only "
@@ -412,11 +435,13 @@ def load_inventory(path: Path) -> list[SwitchTarget]:
 
 def default_inventory(cfg: Config) -> Path | None:
     """The inventory to use when none is given: the config's `inventory:` key,
-    else a `switches.yaml` sitting in the working directory."""
+    else a `switches.yaml` next to the config file - never one in whatever
+    directory the tool happened to be started from (paths.py)."""
     if cfg.inventory is not None:
         return cfg.inventory
-    fallback = Path("switches.yaml")
-    return fallback if fallback.is_file() else None
+    beside = (cfg.source.parent if cfg.source is not None
+              else paths.home()) / paths.INVENTORY_NAME
+    return beside if beside.is_file() else None
 
 
 def parse_switch_arg(arg: str) -> SwitchTarget:

@@ -410,6 +410,96 @@ alone again - the TRuffle command 0012 mentions - the test is the guarantee that
 lifting the folder back out still works.
 *Field Engineer:* nothing to relearn. Same commands, one fewer `git clone`.
 
+## D15 — One home directory; the working directory decides nothing (2026-11-26)
+
+switch-migrator is installed once on the work server (D13's bundle, or a `pip`
+install) and run from wherever the engineer is standing. Until now the defaults
+were `./config.yaml`, `./switches.yaml`, `./profiles.yaml` and `./output`, so
+the tool only worked from the one directory it had been unpacked into: run it
+from `/home/me` and it reported a missing config, or - worse - picked up a
+`switches.yaml` that happened to be there. **No default path is relative to the
+working directory any more.** `switch_migrator/paths.py` resolves one home
+directory, in this order:
+
+1. `$SM_HOME` - when set, that directory and nothing else (a typo in it is an
+   error you can see, not a silent fallback to someone else's config);
+2. `$XDG_CONFIG_HOME/switch-migrator`, default `~/.config/switch-migrator`;
+3. `/etc/switch-migrator`, for a server-wide deployment;
+4. the installation directory, when it carries a `config.yaml` - the checkout
+   or unpacked bundle, which is where `cp config.example.yaml config.yaml`
+   has always put it.
+
+The first one holding a `config.yaml` wins, so a per-user config beats the
+server's and both beat the install folder. With none of them holding one, the
+home is the install folder when the tool runs from a checkout or an unpacked
+bundle and the user's config directory otherwise, so the error names the place
+the file should be created - and names every place it looked.
+
+* **Reports** go to `<home>/output`, or `$SM_OUTPUT_DIR`. A home that cannot be
+  written to (`/etc/switch-migrator` as a normal user) sends them to
+  `~/switch-migrator/output`: a run must not fail on the directory it was going
+  to write its log into.
+* **Names resolve to each other.** The config's `inventory:` key already
+  resolved against the config file; every path in a profile now does the same
+  against `profiles.yaml`, and the bare-`switches.yaml` fallback is the one
+  beside the config, not the one in the working directory.
+* **A path the user types stays the user's** - relative to their shell, like
+  every other command's arguments - with one addition: a relative path that is
+  not there is tried in the home directory too (`paths.input_path`), so
+  `-i switches.yaml` works from anywhere. Paths the tool WRITES (`-o`,
+  `--mac-snapshot`, `--save-snapshot FILE`) are taken exactly as typed: a run
+  writes where it was told to.
+* **`--where`** prints the resolved paths and every place searched, and reads
+  nothing else. It is the answer to "which config is it using?", which is asked
+  exactly when nothing else may run.
+* The test session sets `$SM_HOME` to a throwaway directory (`tests/conftest.py`),
+  so no test can read the developer's own config or write into their home.
+
+*Field Engineer:* the bundle's own folder still works as before - it holds a
+`config.yaml`, so it is place 4 and `<home>/output` is the same `output/` as
+yesterday. Nothing to move, and `--where` to check.
+*Critic:* four places is a search path, not "static". **Accepted:** one fixed
+order, printed on demand, with an env variable that short-circuits it. A single
+hard-coded directory would be either unwritable (`/etc`) for the config or
+unshareable (`~`) for a server-wide deployment.
+
+## D16 — What the feature review changed (2026-11-26)
+
+A review of the whole tool alongside D15. Three findings were real; each one
+also settles a rule.
+
+* **A snapshot never overwrites something that is not a snapshot.**
+  `switch-migrator collect switches.yaml` wrote the collected state **over the
+  inventory file**: `--save-snapshot` takes an optional value, so the verb's
+  expansion put it last and the next word on the command line became the file
+  name. The expansion now leads with `--save-snapshot` (its value can only be
+  swallowed from the end), and `snapshot.check_target()` refuses an existing
+  file that is not one of ours - before anything is collected, so a refusal
+  costs no session. Replacing an earlier snapshot is still allowed.
+* **A `commands:` override is ONE command.** The read-only check looked only at
+  the start of the value, so `'show mlt': "show mlt\nreset"` passed and netmiko
+  sent both lines to the device. A value holding a newline or `;` is now
+  rejected outright. The read-only claim is what lets this tool run in a change
+  window; a check that only inspects the first command of a line is not one.
+* **A `.csv` is read with whichever separator Excel wrote.** The sheet goes
+  through a data centre and comes back as a CSV from somebody's laptop, where
+  Excel uses the locale's list separator - a semicolon across most of Europe.
+  The reader assumed a comma and reported the result as a header row "missing
+  the 'Old switch', 'Old port' column(s)", which sends you looking at the
+  columns instead of the file. The separator is now read off the header line
+  (comma, semicolon or tab), which quoted data cannot shift.
+
+Reported and not fixed, as judgement calls rather than defects:
+
+* `plan.py` `_apply_pins` accepts a pin to a NEW switch that is not on
+  `--new-switch`: the link is planned onto a switch this run knows nothing
+  about, with no warning. Fixing it means deciding whether that is a typo or a
+  deliberate hand-placement outside the planned pairs.
+* The health summary line counts BLOCK/WARN/OK switches; a switch whose verdict
+  is UNKNOWN is in neither total.
+* `health.py` writes the literal `8` and `10` beside `SHOW_DEGRADED` and
+  `SHOW_VLANS`: right today, a lie the day a constant changes.
+
 ## D10 — The cabling sheet is the plan file (2026-11-24)
 
 D2 said "a YAML file the Excel sheet round-trips into". Two edit surfaces for one

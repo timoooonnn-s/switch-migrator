@@ -27,7 +27,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table as RichTable
 
-from switch_migrator import cabling_sheet, connection, mac_check, mlt_generate, verify
+from switch_migrator import (
+    cabling_sheet,
+    connection,
+    mac_check,
+    mlt_generate,
+    paths,
+    verify,
+)
 from switch_migrator import handover as handover_mod
 from switch_migrator import health as health_mod
 from switch_migrator import location as location_mod
@@ -78,7 +85,7 @@ class Session:
     inventory_path: Path | None = None
     all_targets: list[SwitchTarget] = field(default_factory=list)
     selected: list[SwitchTarget] = field(default_factory=list)
-    output_dir: Path = Path("output")
+    output_dir: Path = field(default_factory=paths.output_root)
     offline_dir: Path | None = None
     save_raw: bool = False
     write_manifest: bool = False
@@ -88,8 +95,7 @@ class Session:
     split_by_location: bool = False
     location_groups: dict[str, list[str]] = field(default_factory=dict)
     new_switch: str = ""
-    profiles_path: Path = field(
-        default_factory=lambda: profiles_mod.DEFAULT_FILE)
+    profiles_path: Path = field(default_factory=profiles_mod.default_file)
     # collected data
     audits: list[SwitchAudit] = field(default_factory=list)
     fabric: FabricState | None = None
@@ -213,22 +219,56 @@ def _ask(console: Console, prompt: str, default: str = "",
     return raw or default
 
 
+def _in_path(raw: str) -> Path:
+    """A file or folder the user typed that the tool will READ: '~' expanded,
+    and tried in the tool's home directory when it is relative and not in the
+    working directory (paths.py) - the menu runs from anywhere on the server."""
+    return paths.input_path(Path(raw.strip()).expanduser())
+
+
+def _out_path(raw: str) -> Path:
+    """A file or folder the user typed that the tool will WRITE: '~' expanded,
+    otherwise exactly as typed. A run writes where it was told to."""
+    return Path(raw.strip()).expanduser()
+
+
 def _yes(console: Console, prompt: str, default: bool = True) -> bool:
     d = "Y/n" if default else "y/N"
     ans = _ask(console, f"{prompt} ({d})").lower()
     return default if not ans else ans.startswith("y")
 
 
+def _short(path: Path) -> str:
+    """A path as a person reads it in the status panel.
+
+    The paths are absolute now that nothing is relative to the working
+    directory (paths.py), and three absolute paths wrap the panel into
+    unreadable thirds. A file inside the home directory is shown by its name
+    alone - the panel names the home once, on its own line - and anything under
+    the user's home keeps a '~'.
+    """
+    home = paths.home()
+    if path == home or home in path.parents:
+        return str(path.relative_to(home))
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+
 def _status_panel(s: Session) -> Panel:
     lines = [
-        f"[bold]Config:[/bold]    {s.config_path}",
-        f"[bold]Inventory:[/bold] {s.inventory_path or '(none - add switches manually)'}",
+        f"[bold]Home:[/bold]      {paths.home()}",
+        f"[bold]Config:[/bold]    {_short(s.config_path)}",
+        "[bold]Inventory:[/bold] "
+        + (_short(s.inventory_path) if s.inventory_path
+           else "(none - add switches manually)"),
         f"[bold]Switches:[/bold]  {len(s.selected)} selected of {len(s.all_targets)}",
-        f"[bold]Output:[/bold]    {s.output_dir}",
+        f"[bold]Output:[/bold]    {_short(s.output_dir)}",
     ]
     if s.offline_dir:
         lines.append(f"[bold]Mode:[/bold]      "
-                     f"[yellow]OFFLINE replay from {s.offline_dir}[/yellow]")
+                     f"[yellow]OFFLINE replay from {_short(s.offline_dir)}[/yellow]")
     if s.has_data:
         when = s.collected_at.strftime("%H:%M:%S") if s.collected_at else "?"
         extras = []
@@ -328,7 +368,7 @@ def _have_inventory(s: Session, console: Console) -> bool:
         _enter_targets(s, console)
         return False
     try:
-        s.inventory_path = Path(path)
+        s.inventory_path = _in_path(path)
         s.all_targets = load_inventory(s.inventory_path)
     except ConfigError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -634,7 +674,7 @@ def _ask_plan(s: Session, console: Console) -> PlanSetup | None:
                         "blank: plan from scratch)", path=True)
     if raw:
         try:
-            rows = cabling_sheet.load(Path(raw)).rows
+            rows = cabling_sheet.load(_in_path(raw)).rows
         except cabling_sheet.SheetError as exc:
             console.print(f"[yellow]{exc} - planning from scratch[/yellow]")
         else:
@@ -699,7 +739,13 @@ def action_snapshot(s: Session, console: Console) -> None:
 
     if choice == "1":
         default = str(s.output_dir / "snapshots" / f"snapshot-{stamp}.json")
-        path = Path(_ask(console, "Snapshot file", default, path=True))
+        path = _out_path(_ask(console, "Snapshot file", default, path=True))
+        try:
+            # never write a collection over something that is not a snapshot
+            snapshot_mod.check_target(path)
+        except snapshot_mod.SnapshotError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
         try:
             written = snapshot_mod.save(path, s.audits,
                                         s.fabric or FabricState(),
@@ -727,7 +773,7 @@ def action_snapshot(s: Session, console: Console) -> None:
     if raw.isdigit() and found and 1 <= int(raw) <= len(found[:15]):
         path = found[int(raw) - 1]
     else:
-        path = Path(raw)
+        path = _in_path(raw)
     try:
         audits, fabric, meta = snapshot_mod.load(path)
     except snapshot_mod.SnapshotError as exc:
@@ -789,7 +835,7 @@ def action_generate_mlt(s: Session, console: Console) -> None:
     raw = _ask(console, "Filled-in cabling sheet (.xlsx or .csv)", path=True)
     if not raw:
         return
-    path = Path(raw)
+    path = _in_path(raw)
     try:
         sheet = cabling_sheet.load(path)
     except cabling_sheet.SheetError as exc:
@@ -818,7 +864,7 @@ def action_rack_sheet(s: Session, console: Console) -> None:
     if not raw:
         return
     try:
-        sheet = cabling_sheet.load(Path(raw))
+        sheet = cabling_sheet.load(_in_path(raw))
     except cabling_sheet.SheetError as exc:
         console.print(f"[red]{exc}[/red]")
         return
@@ -833,7 +879,7 @@ def action_verify(s: Session, console: Console, creds_fn: CredsFn) -> None:
     raw = _ask(console, "Filled-in cabling sheet (.xlsx or .csv)", path=True)
     if not raw:
         return
-    path = Path(raw)
+    path = _in_path(raw)
     try:
         sheet = cabling_sheet.load(path)
     except cabling_sheet.SheetError as exc:
@@ -905,13 +951,13 @@ def action_mac_compare(s: Session, console: Console) -> None:
     """
     raw = _ask(console, "Baseline folder(s) (the BEFORE side), comma-separated",
                default=str(s.mac_snapshot or ""), path=True)
-    baselines = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    baselines = [_in_path(p) for p in raw.split(",") if p.strip()]
     if not baselines:
         return
     after_raw = _ask(console, "After folder (the AFTER side)", path=True)
     if not after_raw:
         return
-    after = Path(after_raw)
+    after = _in_path(after_raw)
     missing = [str(p) for p in [*baselines, after] if not p.is_dir()]
     if missing:
         console.print(f"[red]No such folder: {', '.join(missing)}[/red]")
@@ -927,7 +973,7 @@ def action_mac_compare(s: Session, console: Console) -> None:
                               "without one)", path=True)
     if sheet_raw:
         try:
-            sheet = cabling_sheet.load(Path(sheet_raw))
+            sheet = cabling_sheet.load(_in_path(sheet_raw))
         except cabling_sheet.SheetError as exc:
             console.print(f"[red]{exc}[/red]")
             return
@@ -952,7 +998,7 @@ def _ask_mac_baselines(s: Session, console: Console) -> tuple[list[Path], bool]:
     raw = _ask(console, "MAC baseline folder(s) for the after-check, comma-"
                         "separated (blank: skip)",
                default=str(s.mac_snapshot or ""), path=True)
-    baselines = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    baselines = [_in_path(p) for p in raw.split(",") if p.strip()]
     missing = [str(p) for p in baselines if not p.is_dir()]
     if missing:
         console.print(f"[yellow]No such folder: {', '.join(missing)} - the MAC "
@@ -984,7 +1030,7 @@ def _set_offline(s: Session, console: Console) -> None:
                str(s.offline_dir) if s.offline_dir
                else (str(raw_root) if raw_root.is_dir() else ""),
                path=True)
-    s.offline_dir = Path(off) if off else None
+    s.offline_dir = _in_path(off) if off else None
 
 
 def _set_location_groups(s: Session, console: Console) -> None:
@@ -1044,8 +1090,8 @@ def action_settings(s: Session, console: Console) -> None:
 def _change_setting(s: Session, console: Console, pick: str) -> bool:
     """Change the one setting picked; False when there is no such setting."""
     if pick == "1":
-        s.output_dir = Path(_ask(console, "Output directory",
-                                 str(s.output_dir), path=True))
+        s.output_dir = _out_path(_ask(console, "Output directory",
+                                      str(s.output_dir), path=True))
     elif pick == "2":
         _set_offline(s, console)
     elif pick == "3":
@@ -1248,7 +1294,7 @@ class MenuStart:
     """What the menu opens with: the CLI's -c/-i/-o/--profile/--profiles-file."""
     config_path: Path
     inventory_path: Path | None = None
-    output_dir: Path = Path("output")
+    output_dir: Path = field(default_factory=paths.output_root)
     profile: str = ""
     profiles_file: Path | None = None
 

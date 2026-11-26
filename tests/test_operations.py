@@ -461,8 +461,13 @@ def test_a_profiles_output_dir_gets_the_log_too(tmp_path, monkeypatch):
 
 def test_the_three_verbs_are_shorthands_for_their_flags():
 
+    # --save-snapshot first: its value is optional, so as the last flag of the
+    # expansion it would swallow a file name typed after the verb
     assert expand_verb(["collect", "-i", "x.yaml"]) == [
-        "--migration-sheets", "--save-snapshot", "-i", "x.yaml"]
+        "--save-snapshot", "--migration-sheets", "-i", "x.yaml"]
+    collect = build_arg_parser().parse_args(expand_verb(["collect", "-i", "x.yaml"]))
+    assert (collect.save_snapshot, collect.migration_sheets) == ("", True)
+    assert collect.inventory == Path("x.yaml")
     assert expand_verb(["plan", "--new-switch", "a,b"]) == ["--plan", "--new-switch", "a,b"]
     assert expand_verb(["verify", "sheet.xlsx"]) == ["--verify-migration", "sheet.xlsx"]
     assert expand_verb(["--plan"]) == ["--plan"]               # flags pass through

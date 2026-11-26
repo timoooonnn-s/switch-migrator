@@ -171,12 +171,50 @@ needs no network at all. On an update the steps are printed again only when
 
 ## Configuration
 
+### Where the files live
+
+The tool is installed once and run from anywhere on the server, so **nothing is
+looked up relative to the directory you happen to be standing in**. The config,
+the default inventory and the profiles come from one **home directory**, found
+in a fixed order:
+
+| | Where | |
+|---|---|---|
+| 1 | `$SM_HOME` | when set, that directory and nothing else |
+| 2 | `$XDG_CONFIG_HOME/switch-migrator` | default `~/.config/switch-migrator` |
+| 3 | `/etc/switch-migrator` | a server-wide deployment |
+| 4 | the installation directory | the checkout or unpacked bundle, when it holds a `config.yaml` |
+
+The first one that holds a `config.yaml` is the home, so a per-user config wins
+over the server's and both win over the install folder. Reports, logs and
+snapshots go to `<home>/output`, or to `$SM_OUTPUT_DIR`; if the home cannot be
+written to (`/etc/switch-migrator` as a normal user) they go to
+`~/switch-migrator/output` instead, because a run must not fail on the
+directory it was going to write its log into.
+
 ```bash
-cp config.example.yaml config.yaml       # DvR controllers, conventions, patterns
-cp switches.example.yaml switches.yaml   # the switches to migrate
+switch-migrator --where        # the resolved paths, and every place searched
 ```
 
-Both real files are gitignored — never commit device data.
+Inside the home, names resolve to each other: the config's `inventory:` key and
+every path in a profile are relative to the file they are written in, so one
+config means the same thing from any working directory. A path **you** type
+stays yours - relative to your shell, like any other command's arguments - with
+one addition: a relative path that is not in your working directory is tried in
+the home directory too, so `switch-migrator -i switches.yaml` finds the
+inventory next to the config from anywhere. Paths the tool WRITES (`-o`,
+`--mac-snapshot`, `--save-snapshot FILE`) are always taken exactly as typed.
+
+### The files
+
+```bash
+cp config.example.yaml ~/.config/switch-migrator/config.yaml
+cp switches.example.yaml ~/.config/switch-migrator/switches.yaml
+```
+
+(In a checkout or an unpacked bundle, copying them next to `pyproject.toml`
+works just as well - that is place 4 above.) Both real files are gitignored —
+never commit device data.
 
 Key settings in `config.yaml` (see the example file for full comments):
 
@@ -192,8 +230,8 @@ Key settings in `config.yaml` (see the example file for full comments):
 | `mac_cap` | Learned MACs kept per port in the sheets (default 10). |
 | `locations` | Maps switch names to sites, for `--split-by-location`. |
 | `ssh` | Timeouts, retries, parallel workers, legacy-algorithm support. |
-| `inventory` | Default inventory file, so a plain `switch-migrator` needs no `-i` (a `./switches.yaml` is picked up even without this key). |
-| `commands` | Per-command spelling overrides (e.g. `'show mlt': 'show mlt all'`), applied at the runner so dry-run, raw capture and offline replay all see the same spelling. Replacements are validated read-only. |
+| `inventory` | Default inventory file, so a plain `switch-migrator` needs no `-i`. Relative to the config file; a `switches.yaml` beside the config is picked up even without this key. |
+| `commands` | Per-command spelling overrides (e.g. `'show mlt': 'show mlt all'`), applied at the runner so dry-run, raw capture and offline replay all see the same spelling. A replacement must be ONE read-only command: it has to start with `show`, `terminal`/`term` or `enable`, and may not contain a newline or `;` — only the first command would be checked, and the rest would be sent unchecked. |
 | `console_server` | Terminal server for switches without a management IP: SSH to the console server, land on the switch's serial console, continue there (see below). |
 | `plan` | The new switch model for `--plan`: `ports` (all of them) and `uplinks` (how many of the last ones are fabric uplinks), `mlt_name` (template for new MLT names: `{slot}`, `{port}`, `{id}`; default `f{slot}{port}`) and `port_lines` (closing lines of every new access port; default `slpp-guard enable timeout 0`, `spanning-tree mstp edge-port true`). |
 | `mac_check` | Pacing of `--mac-watch`: `interval` seconds between rounds, at most `rounds`, stop after `stable` rounds without progress (defaults 120 / 15 / 3). |
@@ -235,6 +273,9 @@ instead of six prompts. Menu option `p` loads or saves them; on the command
 line, `--profile NAME` applies one (explicit flags always win), including with
 `--menu`, where the whole profile is applied to the session. Profiles never
 hold credentials.
+
+Every path in a profile is relative to `profiles.yaml` itself, so a profile
+works from any working directory:
 
 ```yaml
 profiles:
@@ -303,11 +344,15 @@ Run it with no arguments and you land in the toolkit menu:
 
 ```bash
 switch-migrator                      # or: switch-migrator --menu
-switch-migrator -c config.yaml -i switches.yaml     # menu, pre-loaded
+switch-migrator -c other.yaml -i site-b.yaml        # menu, pre-loaded
 ```
+
+With no `-c`/`-i`/`-o` it uses the home directory's files, from whatever
+directory you started it in (`--where` prints which).
 
 ```
 ╭─ switch-migrator ───────────────────────────────╮
+│ Home:      /etc/switch-migrator                 │
 │ Config:    config.yaml                          │
 │ Inventory: switches.yaml                        │
 │ Switches:  12 selected of 12                    │
@@ -349,7 +394,7 @@ A few behaviors worth knowing:
 * **Tab completes paths.** Every file/directory prompt has readline tab
   completion.
 * **Default inventory.** With no `-i`, the config's `inventory:` key (or a
-  `./switches.yaml`) is picked up automatically.
+  `switches.yaml` beside the config) is picked up automatically.
 * **Credentials are checked first.** Before the full collection, one quick SSH
   login against one device verifies the credentials — wrong ones fail in
   seconds and can be corrected on the spot, instead of costing a read-timeout
@@ -364,6 +409,9 @@ entry point, not a replacement, so existing scripts and cron jobs are unaffected
 ### Command line
 
 ```bash
+# Where it will read its files from and write its reports to (reads nothing else)
+switch-migrator --where
+
 # Standard audit: inventory file + Excel report + console summary
 switch-migrator -c config.yaml -i switches.yaml
 
@@ -925,7 +973,9 @@ switches with no switch-migrator inventory at all; `--help` lists them.
 The cabling sheet has been through a data centre before it comes back, so
 reading it is deliberately forgiving: columns are matched **by name, not
 position** (add your own columns, reorder them, it does not matter), `.xlsx`
-and `.csv` both work, port ids are normalised (`Port 1/7`, `1 / 7`, `1/7`),
+and `.csv` both work — a `.csv` with whichever separator the laptop's Excel
+writes, comma, semicolon or tab — port ids are normalised (`Port 1/7`, `1 / 7`,
+`1/7`),
 rows nobody has filled in are *pending* rather than errors, and a cell it
 cannot make sense of becomes a note on that row instead of killing the file.
 The one thing it does complain about is a **half-filled row** — a NEW switch
@@ -950,7 +1000,10 @@ produces is a pure function of the collected state — so that state is worth
 keeping.
 
 `--save-snapshot` writes it all to one JSON file (default
-`<output>/snapshot-<stamp>.json`). `--from-snapshot` rebuilds any report from
+`<output>/snapshot-<stamp>.json`). Naming a file that exists and is **not** a
+snapshot is refused before anything is collected, so a mistyped
+`--save-snapshot switches.yaml` cannot write a collection over your inventory.
+`--from-snapshot` rebuilds any report from
 that file: no SSH, no credentials, no load on the devices. The reports are
 byte-identical to the ones the live run produced.
 

@@ -1,5 +1,7 @@
 # Inventory of the switches to be migrated.
-# Copy to switches.yaml (gitignored) and fill in.
+# Copy to switches.yaml (gitignored) and fill in. It belongs beside config.yaml
+# in the tool's home directory (`switch-migrator --where`): a `switches.yaml`
+# there is used when no -i and no `inventory:` key name one.
 #
 #   name:     display name used in the report
 #   host:     IP or DNS name for SSH (optional - defaults to `name`)

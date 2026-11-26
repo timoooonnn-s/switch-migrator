@@ -4,6 +4,13 @@
 # Copy to config.yaml and adjust. config.yaml is gitignored on purpose -
 # never commit real device data.
 #
+# WHERE this file belongs: the tool's home directory, which it finds without
+# help from the working directory - $SM_HOME, else ~/.config/switch-migrator,
+# else /etc/switch-migrator, else the checkout or unpacked bundle it runs from.
+# `switch-migrator --where` prints the one it picked and every place it looked.
+# The inventory (switches.yaml) and profiles.yaml live beside it; paths inside
+# this file are relative to this file.
+#
 # Credentials are NEVER stored here. They come from environment variables or
 # an interactive prompt (see README, section "Credentials").
 # =============================================================================

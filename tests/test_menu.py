@@ -13,6 +13,7 @@ import switch_migrator.menu as menu_mod
 from mac_check_samples import FE_LAB2, FE_LAB6
 from switch_migrator import connection as C
 from switch_migrator import menu as M
+from switch_migrator import paths
 from switch_migrator.collectors.switch import Reads
 from switch_migrator.config import Credentials, load_config, load_inventory
 
@@ -574,3 +575,20 @@ def test_menu_says_so_when_the_named_profile_is_missing(env):
                     creds_fn=_offline_creds)
     assert rc == 0
     assert "No profile 'nope'" in console.export_text()
+
+
+def test_the_panel_shows_the_home_once_and_file_names_after_it(tmp_path,
+                                                               monkeypatch):
+    """Nothing is relative to the working directory any more (paths.py), so the
+    panel would wrap three absolute paths into unreadable thirds."""
+    home = tmp_path / "home"
+    (home / "deep").mkdir(parents=True)
+    monkeypatch.setenv(paths.HOME_ENV, str(home))
+
+    assert M._short(home / "config.yaml") == "config.yaml"
+    assert M._short(home / "deep" / "switches.yaml") == "deep/switches.yaml"
+
+    # outside the home: '~' where it helps, the plain path otherwise
+    monkeypatch.setattr(M.Path, "home", classmethod(lambda _cls: tmp_path / "me"))
+    assert M._short(tmp_path / "me" / "sheets" / "x.xlsx") == "~/sheets/x.xlsx"
+    assert M._short(Path("/srv/other/x.xlsx")) == "/srv/other/x.xlsx"

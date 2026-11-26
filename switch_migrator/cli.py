@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -25,6 +26,7 @@ from switch_migrator import (
     location,
     mac_check,
     mlt_generate,
+    paths,
     standard,
     verify,
     version_check,
@@ -85,16 +87,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                "No arguments at all opens the interactive menu.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-c", "--config", type=Path, default=Path("config.yaml"),
-                        help="config file (default: config.yaml)")
+    parser.add_argument("-c", "--config", type=Path,
+                        help="config file (default: the config.yaml in the "
+                             "tool's home directory, --where shows which)")
     parser.add_argument("-i", "--inventory", type=Path,
                         help="inventory YAML with the switches to migrate")
     parser.add_argument("-s", "--switch", action="append", default=[],
                         metavar="NAME:PLATFORM[:HOST]",
                         help="add a switch on the CLI, e.g. old-sw-01:ers "
                              "(repeatable, combines with -i)")
-    parser.add_argument("-o", "--output-dir", type=Path, default=Path("output"),
-                        help="directory for reports and logs (default: ./output)")
+    parser.add_argument("-o", "--output-dir", type=Path,
+                        help="directory for reports and logs (default: "
+                             "<home>/output, or $SM_OUTPUT_DIR; --where shows "
+                             "which)")
     parser.add_argument("--no-fabric", action="store_true",
                         help="inventory/state report only: read and report each "
                              "switch's port/MLT/IST/VLAN state and do NOT collect "
@@ -245,9 +250,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "flag given explicitly on the command line wins "
                              "over the profile's value.")
     parser.add_argument("--profiles-file", type=Path,
-                        default=Path("profiles.yaml"),
-                        help="where the named profiles live "
-                             "(default: profiles.yaml)")
+                        help="where the named profiles live (default: the "
+                             "profiles.yaml in the tool's home directory)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="also print the ports/MLTs/fabric tables to the console")
     parser.add_argument("--debug", action="store_true",
@@ -257,6 +261,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "default when no arguments are given): select "
                              "switches, collect once, then produce any output "
                              "from that same data")
+    parser.add_argument("--where", action="store_true",
+                        help="print the home directory the config, the "
+                             "inventory and the profiles come from, where the "
+                             "reports go, and every place that was searched - "
+                             "then exit. Reads nothing else.")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -278,6 +287,67 @@ def setup_logging(output_dir: Path, debug: bool) -> None:
         logging.getLogger("paramiko").setLevel(logging.WARNING)
         logging.getLogger("netmiko").setLevel(logging.WARNING)
 
+
+
+# --------------------------------------------------------------------------
+# where the files are
+# --------------------------------------------------------------------------
+
+# the paths that name a file to READ. A relative one is looked up in the
+# working directory first and in the tool's home second (paths.input_path);
+# the ones that name something to WRITE (-o, --mac-snapshot, --save-snapshot)
+# stay exactly as typed, because a run writes where it was told to.
+_INPUT_PATHS = ("inventory", "offline", "from_snapshot", "pins",
+                "verify_migration", "generate_mlt", "rack_sheet")
+
+
+def _resolve_paths(args: argparse.Namespace) -> None:
+    """Fill in the paths the command line left open from the tool's home, and
+    find the relative ones it did name (paths.py).
+
+    Nothing has been read yet when this runs, so the profile, the log file and
+    every report agree on one set of paths - whatever directory the tool was
+    started from. --output-dir is left for later: a profile may still set it.
+    """
+    args.config = (paths.input_path(args.config) if args.config
+                   else paths.config_file())
+    args.profiles_file = (paths.input_path(args.profiles_file) if args.profiles_file
+                          else paths.profiles_file())
+    for attr in _INPUT_PATHS:
+        given = getattr(args, attr)
+        if given is not None:
+            setattr(args, attr, paths.input_path(given))
+    args.mac_baseline = [paths.input_path(p) for p in args.mac_baseline]
+
+
+def _print_where(args: argparse.Namespace, console: Console) -> int:
+    """--where: the resolved paths, and every place that was searched. Reads
+    no config, creates no directory - it answers 'which config is it using?'
+    when something is missing, which is exactly when nothing else may run."""
+    home = paths.home()
+    console.print(f"[bold]switch-migrator {__version__}[/bold]")
+    rows = [
+        ("home", home, "holds config.yaml" if (home / paths.CONFIG_NAME).is_file()
+                       else "[yellow]no config.yaml here yet[/yellow]"),
+        ("config", args.config, "" if args.config.is_file() else "[yellow]missing[/yellow]"),
+        ("inventory", paths.inventory_file(),
+         "used when neither -i nor the config names one"),
+        ("profiles", args.profiles_file,
+         "" if args.profiles_file.is_file() else "none yet"),
+        ("output", args.output_dir or paths.output_root(), ""),
+    ]
+    # soft_wrap: a path cut in half by the terminal width is no answer
+    for name, value, note in rows:
+        console.print(f"  {name:<10} {value}" + (f"  [dim]{note}[/dim]" if note else ""),
+                      soft_wrap=True)
+    for i, place in enumerate(paths.looked_in()):
+        console.print(f"  [dim]{'searched' if i == 0 else '':<10} {place}[/dim]",
+                      soft_wrap=True)
+    for var in (paths.HOME_ENV, paths.OUTPUT_ENV):
+        set_to = os.environ.get(var)
+        console.print(f"  [dim]{var:<13}{set_to if set_to else '(not set)'}[/dim]",
+                      soft_wrap=True)
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -454,7 +524,7 @@ def _apply_cli_profile(args: argparse.Namespace, console: Console) -> None:
                           f"{args.profiles_file} - known: {known}")
     if "inventory" in prof and args.inventory is None:
         args.inventory = prof["inventory"]
-    if "output_dir" in prof and args.output_dir == Path("output"):
+    if "output_dir" in prof and args.output_dir is None:
         args.output_dir = prof["output_dir"]
     if "offline" in prof and args.offline is None:
         args.offline = prof["offline"]
@@ -543,6 +613,11 @@ def _prepare(args: argparse.Namespace, console: Console) -> _Run:
             # links were moved onto. They are fabric leaves, hence VOSS.
             targets = _targets_from_sheet(args, console)
     _check_mac_args(args, from_snapshot, console)
+    if args.save_snapshot:          # an explicit file name, not the '' sentinel
+        try:
+            snapshot_mod.check_target(Path(args.save_snapshot))
+        except snapshot_mod.SnapshotError as exc:
+            raise ConfigError(str(exc)) from None
     plan = _check_plan_args(args, cfg) if args.plan else None
     if not targets and not from_snapshot and not args.generate_mlt:
         raise ConfigError("no switches given: use -i inventory.yaml and/or "
@@ -800,7 +875,10 @@ def _warn_if_stale(console: Console) -> None:
 # collect / plan / verify: the three things a migration does, as shorthands for
 # the flags that do them (council review, Field Engineer 5)
 VERBS = {
-    "collect": ["--migration-sheets", "--save-snapshot"],
+    # --save-snapshot takes an OPTIONAL value, so it must never be the LAST
+    # flag of an expansion: `collect switches.yaml` would make the inventory
+    # the snapshot's file name and write the collected state over it
+    "collect": ["--save-snapshot", "--migration-sheets"],
     "plan": ["--plan"],
     "verify": ["--verify-migration"],      # takes the sheet as its argument
 }
@@ -819,15 +897,23 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(raw_argv)
     console = Console(stderr=True)
 
+    # the tool runs from anywhere on the server, so every path it was not
+    # given comes from its home directory, not from the working directory
+    _resolve_paths(args)
+    if args.where:
+        return _print_where(args, console)
+
     # The profile can set output_dir, and the log file lives inside it - so it
     # has to be applied BEFORE logging is set up, or the reports go to the
-    # profile's directory and their log to ./output.
+    # profile's directory and their log to the default one.
     if args.profile:
         try:
             _apply_cli_profile(args, console)
         except ConfigError as exc:
             console.print(f"[bold red]Config error:[/bold red] {exc}")
             return 2
+    if args.output_dir is None:
+        args.output_dir = paths.output_root()
     setup_logging(args.output_dir, args.debug)
     _warn_if_stale(console)
 

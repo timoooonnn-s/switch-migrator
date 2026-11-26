@@ -96,6 +96,9 @@ CHECK = ".venv/bin/switch-migrator --version && .venv/bin/migration-check --vers
 NOTES = (
     "Network: the first pip step needs the package index (or pip --proxy ...); the second "
     "none.",
+    "Where:   the files above belong in this folder, or in ~/.config/switch-migrator "
+    "or /etc/switch-migrator - whichever holds a config.yaml wins, and the working "
+    "directory decides nothing. 'switch-migrator --where' prints the one it uses.",
 )
 # ------------------------------------------------------------------------------------------
 

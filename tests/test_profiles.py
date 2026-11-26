@@ -24,8 +24,11 @@ def test_save_then_load_round_trip(tmp_path):
     profiles = P.load_profiles(path)
     assert set(profiles) == {"site-a"}
     prof = profiles["site-a"]
-    assert prof["inventory"] == Path("inventories/site-a.yaml")
-    assert prof["output_dir"] == Path("output/site-a")
+    # the file stores them as written; loading resolves them against the
+    # profiles file, so a profile means the same from any working directory
+    assert prof["inventory"] == tmp_path / "inventories/site-a.yaml"
+    assert prof["output_dir"] == tmp_path / "output/site-a"
+    assert "inventory: inventories/site-a.yaml" in path.read_text()
     assert prof["new_switch"] == "leaf-a-01"
     assert prof["save_raw"] is True
     assert prof["location_groups"] == {"Frankfurt": ["gx-11", "gx-12"]}

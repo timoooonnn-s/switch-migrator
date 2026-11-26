@@ -504,7 +504,10 @@ Two smaller additions that live in this layer:
   `--offline` replay and `--dry-run` all see the same overridden spelling.
   Replacements are validated at config load: anything not starting with
   `show`/`terminal`/`term`/`enable` is rejected, so the read-only claim
-  survives user configuration.
+  survives user configuration. A value holding a newline or `;` is rejected
+  outright - only the FIRST command is checked for being read-only, and
+  netmiko would send the rest of the line to the device unchecked (review
+  2026-11-26).
 * **`quick_auth_check()`** (`connection.py:703`) opens ONE SSH session to one
   device, authenticates, and closes — no channel, no command. The interactive
   menu runs it after credentials are entered and before the parallel

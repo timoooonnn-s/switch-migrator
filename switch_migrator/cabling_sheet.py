@@ -22,6 +22,7 @@ centre at 3am is not pristine:
 from __future__ import annotations
 
 import csv
+import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -271,10 +272,28 @@ def _build_row(mapping: dict[str, object], number: int) -> CablingRow:
     return row
 
 
+def _delimiter(text: str) -> str:
+    """The separator a .csv export used, read off its header line.
+
+    Excel writes the list separator of the machine's locale: a comma in the
+    US/UK, a semicolon across most of Europe, and a tab for "Unicode text".
+    A sheet that came back from a technician's laptop is read with whichever
+    one it has - guessing comma and finding one column used to be reported as
+    a header row "missing the 'Old switch', 'Old port' column(s)", which sent
+    the reader looking in entirely the wrong place.
+    """
+    header = next((line for line in text.splitlines() if line.strip()), "")
+    counts = {d: header.count(d) for d in (",", ";", "\t")}
+    best = max(counts, key=lambda d: counts[d])
+    return best if counts[best] else ","
+
+
 def _rows_from_csv(path: Path) -> list[tuple[str, list[list[object]]]]:
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        rows: list[list[object]] = [[*row] for row in csv.reader(fh)]
-        return [(path.name, rows)]
+    text = path.read_text(encoding="utf-8-sig")
+    reader = csv.reader(io.StringIO(text, newline=""),
+                        delimiter=_delimiter(text))
+    rows: list[list[object]] = [[*row] for row in reader]
+    return [(path.name, rows)]
 
 
 def _looks_like_cabling(rows: list[list[object]]) -> bool:

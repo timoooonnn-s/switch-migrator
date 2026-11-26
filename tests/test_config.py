@@ -70,14 +70,21 @@ def test_config_inventory_key_is_relative_to_the_config_file(tmp_path):
     assert default_inventory(cfg) == cfg_dir / "switches-prod.yaml"
 
 
-def test_default_inventory_falls_back_to_switches_yaml(tmp_path, monkeypatch):
-    cfg_path = tmp_path / "config.yaml"
+def test_default_inventory_falls_back_to_switches_yaml_beside_the_config(tmp_path,
+                                                                          monkeypatch):
+    cfg_dir = tmp_path / "deploy"
+    cfg_dir.mkdir()
+    cfg_path = cfg_dir / "config.yaml"
     cfg_path.write_text("excluded_vlans: [1]\n")
     cfg = load_config(cfg_path, require_fabric=False)
-    monkeypatch.chdir(tmp_path)
     assert default_inventory(cfg) is None          # nothing to find
+    # a switches.yaml in the working directory is NOT it: the tool is run from
+    # anywhere on the server (switch_migrator.paths)
+    monkeypatch.chdir(tmp_path)
     (tmp_path / "switches.yaml").write_text("switches: []\n")
-    assert default_inventory(cfg) == Path("switches.yaml")
+    assert default_inventory(cfg) is None
+    (cfg_dir / "switches.yaml").write_text("switches: []\n")
+    assert default_inventory(cfg) == cfg_dir / "switches.yaml"
 
 
 def test_command_overrides_must_stay_read_only(tmp_path):

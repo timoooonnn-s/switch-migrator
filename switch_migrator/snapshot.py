@@ -86,6 +86,36 @@ def to_dict(audits: list[SwitchAudit], fabric: FabricState,
     }
 
 
+def is_snapshot(path: Path) -> bool:
+    """Does this file hold a switch-migrator snapshot?"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and "switches" in data
+
+
+def check_target(path: Path) -> None:
+    """Raise unless a snapshot may be written to `path`: free, or holding a
+    snapshot of ours that a new one may replace.
+
+    `switch-migrator collect switches.yaml` used to write the collected state
+    over the inventory - --save-snapshot takes an OPTIONAL value, so the next
+    word on the command line became its file name. The verb no longer puts it
+    last, and this is the second line of defence, for a typed
+    `--save-snapshot config.yaml` as well. Checked before anything is
+    collected, so a refusal costs no switch session.
+    """
+    if path.is_dir():
+        raise SnapshotError(f"{path} is a directory, not a snapshot file")
+    if path.exists() and not is_snapshot(path):
+        raise SnapshotError(
+            f"refusing to overwrite {path}: it exists and is not a "
+            f"switch-migrator snapshot. Name a file that does not exist yet "
+            f"(or leave --save-snapshot without a value for "
+            f"<output>/snapshot-<stamp>.json).")
+
+
 def save(path: Path, audits: list[SwitchAudit], fabric: FabricState,
          meta: dict[str, Any] | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)

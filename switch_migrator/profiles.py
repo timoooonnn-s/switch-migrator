@@ -6,8 +6,11 @@ so "scenario A" is one load away instead of six prompts. Loading a profile
 only SETS the session/run values; everything stays changeable on the fly
 afterwards, and nothing in a profile is ever a credential.
 
-Stored as plain YAML (default: ./profiles.yaml) so it can be reviewed,
-diffed and handed around like the rest of the config:
+Stored as plain YAML next to the config, in the tool's home directory
+(`paths.py`; default `profiles.yaml` there), so it can be reviewed, diffed and
+handed around like the rest of the config. Every path in a profile is resolved
+relative to the profiles file itself, so a profile means the same thing from
+any working directory:
 
     profiles:
       site-a:
@@ -30,7 +33,12 @@ from typing import Any
 
 import yaml
 
-DEFAULT_FILE = Path("profiles.yaml")
+from switch_migrator import paths
+
+
+def default_file() -> Path:
+    """`profiles.yaml` in the tool's home directory."""
+    return paths.profiles_file()
 
 # the keys a profile may carry, with their coercions
 _STR_KEYS = ("new_switch",)
@@ -42,8 +50,9 @@ class ProfileError(Exception):
     pass
 
 
-def load_profiles(path: Path = DEFAULT_FILE) -> dict[str, dict[str, Any]]:
+def load_profiles(path: Path | None = None) -> dict[str, dict[str, Any]]:
     """All profiles in the file, name -> settings dict. Missing file = none."""
+    path = default_file() if path is None else path
     if not path.is_file():
         return {}
     try:
@@ -60,11 +69,12 @@ def load_profiles(path: Path = DEFAULT_FILE) -> dict[str, dict[str, Any]]:
     for name, raw in profiles.items():
         if not isinstance(raw, dict):
             raise ProfileError(f"{path}: profile '{name}' must be a mapping")
-        out[str(name)] = _clean(raw, where=f"{path}: profile '{name}'")
+        out[str(name)] = _clean(raw, where=f"{path}: profile '{name}'",
+                                beside=path.parent)
     return out
 
 
-def _clean(raw: dict[str, Any], where: str) -> dict[str, Any]:
+def _clean(raw: dict[str, Any], where: str, beside: Path) -> dict[str, Any]:
     """Keep only known keys, with the right types; unknown keys are reported
     once rather than silently dropped (a typo should not lose a setting)."""
     known = set(_STR_KEYS) | set(_BOOL_KEYS) | set(_PATH_KEYS) | {
@@ -82,7 +92,10 @@ def _clean(raw: dict[str, Any], where: str) -> dict[str, Any]:
             out[key] = bool(raw[key])
     for key in _PATH_KEYS:
         if raw.get(key):
-            out[key] = Path(str(raw[key]))
+            # relative to the profiles file, like the config's `inventory:` -
+            # a profile is read from wherever the tool was started
+            value = Path(str(raw[key])).expanduser()
+            out[key] = value if value.is_absolute() else beside / value
     groups = raw.get("location_groups")
     if groups:
         if not isinstance(groups, dict):
@@ -94,8 +107,10 @@ def _clean(raw: dict[str, Any], where: str) -> dict[str, Any]:
     return out
 
 
-def save_profile(name: str, settings: dict[str, Any], path: Path = DEFAULT_FILE) -> Path:
+def save_profile(name: str, settings: dict[str, Any],
+                 path: Path | None = None) -> Path:
     """Add or replace one profile, keeping every other profile in the file."""
+    path = default_file() if path is None else path
     data: dict[str, Any] = {}
     if path.is_file():
         try:
@@ -114,6 +129,7 @@ def save_profile(name: str, settings: dict[str, Any], path: Path = DEFAULT_FILE)
         else:
             plain[key] = value
     profiles[name] = plain
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False,
                                    default_flow_style=False),
                     encoding="utf-8")
