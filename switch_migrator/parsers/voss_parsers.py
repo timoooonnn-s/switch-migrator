@@ -12,12 +12,53 @@ from typing import TypedDict
 from switch_migrator.models import IstState, MltState, PortIsidRow, PortState, VlanInfo
 from switch_migrator.parsers.common import (
     PORT_RE,
+    cell,
+    column_bounds,
     expand_port_list,
     is_port_list,
     is_vlan_id,
     name_says_ist,
     parse_updown,
 )
+
+_RULE_RE = re.compile(r"\s*-{10,}\s*")
+
+
+def _header_above_rule(lines: list[str]) -> str:
+    """The last header line of a VOSS table: the line above its dashed rule.
+
+    Column LABELS are the only thing in this output that says which release
+    printed it, and 9.x inserts columns (VLAN NAME in `show vlan i-sid`, ISID
+    NAME / AREA in the SPBM tables) that shift everything after them. Reading
+    the label row is what keeps a 9.x column from being mistaken for an 8.x
+    one.
+    """
+    for i, line in enumerate(lines):
+        if _RULE_RE.fullmatch(line) and i:
+            return lines[i - 1]
+    return ""
+
+
+def _phrase_columns(header: str, *phrases: str) -> list[tuple[int, int | None]] | None:
+    """(start, end) of each column of a header whose labels contain spaces.
+
+    Phrases are found left to right, each after the previous one, so 'I-SID
+    NAME' is one column and not two - which `column_bounds`, matching single
+    words, cannot express. None when any phrase is missing, so the caller can
+    try a different column set (the 8.x one) or fall back.
+    """
+    starts: list[int] = []
+    at = 0
+    for phrase in phrases:
+        pattern = (r"(?<!\S)" + r"\s+".join(re.escape(w) for w in phrase.split())
+                   + r"(?!\S)")
+        found = re.compile(pattern, re.IGNORECASE).search(header, at)
+        if found is None:
+            return None
+        starts.append(found.start())
+        at = found.end()
+    return [(start, starts[i + 1] if i + 1 < len(starts) else None)
+            for i, start in enumerate(starts)]
 
 # fields a data row of each table has at least, and the columns read by index
 MEDIA_COLUMN = 2            # Port Interface: PORT NUM | INDEX | DESCRIPTION
@@ -32,6 +73,9 @@ MIN_ISID_ROW_FIELDS = 2     # I-SID id | type
 ISID_VLAN_COLUMN = 2        # ... | VLANID
 MIN_DVR_FIELDS = 5
 MIN_SPBM_ISID_FIELDS = 4
+# `show vlan i-sid`: VLAN_ID | I-SID | VLAN NAME | I-SID NAME on 9.x, and the
+# same without VLAN NAME on 8.x
+VLAN_ISID_COLUMNS_9X = 4
 
 _UPDOWN_TOKEN = re.compile(r"^(up|down|testing)$", re.IGNORECASE)
 
@@ -168,9 +212,8 @@ def parse_mlt(output: str) -> list[MltState]:
             continue
         seen.add(mlt_id)
         # everything after the PORT MEMBERS column is the VLAN IDS list
-        vlans = ([int(t) for t in rest[members_at + 1:]
-                  if t.isdigit() and is_vlan_id(int(t))]
-                 if members_at is not None else [])
+        vlans = [int(t) for t in _vlan_ids_tail(rest, members_at)
+                 if t.isdigit() and is_vlan_id(int(t))]
         mlt = MltState(
             mlt_id=mlt_id,
             name=name,
@@ -185,6 +228,27 @@ def parse_mlt(output: str) -> list[MltState]:
         mlts.append(mlt)
         current = mlt
     return mlts
+
+
+def _vlan_ids_tail(rest: list[str], members_at: int | None) -> list[str]:
+    """The tokens of the VLAN IDS column of one Mlt Info row.
+
+    Normally everything after the PORT MEMBERS column. An MLT whose members
+    are all gone - or an LACP MLT whose ports are configured but not yet up -
+    prints an EMPTY members column, and keying off it dropped the VLAN IDS
+    too: the MLT reached the sheet carrying no VLANs, and `--generate-mlt`
+    would have recreated it empty. With no members column the list is still
+    the trailing run of VLAN-sized numbers; ORIGIN ('CONFIG') sits in front of
+    it and is a word, which is what ends the run.
+    """
+    if members_at is not None:
+        return rest[members_at + 1:]
+    tail: list[str] = []
+    for token in reversed(rest):
+        if not (token.isdigit() and is_vlan_id(int(token))):
+            break
+        tail.insert(0, token)
+    return tail
 
 
 def _is_header_line(line: str) -> bool:
@@ -352,24 +416,63 @@ def parse_virtual_ist(output: str) -> IstState | None:
 def parse_vlan_isid(output: str) -> list[VlanInfo]:
     """`show vlan i-sid`
 
-    Lines: <vlan-id> [<i-sid> [<i-sid name>]]
+    8.x columns: VLAN_ID | I-SID | I-SID NAME
+    9.x columns: VLAN_ID | I-SID | VLAN NAME | I-SID NAME
+
+    9.x inserts the VLAN's OWN name between the two. Read as 8.x, the row
+    `40  20040  servers  ISID-20040` made the I-SID name
+    'servers                          ISID-20040' - two different names glued
+    into one cell, which then travelled into the VLAN name column of every
+    sheet and into the fabric state's I-SID names. So the header decides how
+    many columns there are, and the VLAN name is kept where it belongs - which
+    also means the name no longer depends on `show vlan basic` answering.
     """
+    lines = output.splitlines()
+    columns = _vlan_isid_columns(_header_above_rule(lines))
     vlans: list[VlanInfo] = []
-    for line in output.splitlines():
-        # anchored with \s+ separators so numeric footer lines
-        # ('3 out of 3 Total Num of Vlans displayed') can never match
-        m = re.match(r"^\s*(\d{1,4})(?:\s+(\d{1,9})(?:\s+(\S.*?))?)?\s*$", line)
-        if not m:
-            continue
-        vlan_id = int(m.group(1))
-        if not is_vlan_id(vlan_id):
-            continue
-        isid = int(m.group(2)) if m.group(2) else None
-        # the third column is the I-SID NAME, not the VLAN name - keep them
-        # separate so the report can show both
-        isid_name = (m.group(3) or "").strip()
-        vlans.append(VlanInfo(vlan_id=vlan_id, isid=isid, isid_name=isid_name))
+    for line in lines:
+        info = (_vlan_isid_by_column(line, columns) if columns
+                else _vlan_isid_by_shape(line))
+        if info is not None:
+            vlans.append(info)
     return vlans
+
+
+def _vlan_isid_columns(header: str) -> list[tuple[int, int | None]] | None:
+    """The 9.x four-column header, else the 8.x three-column one, else None."""
+    if "VLAN_ID" not in header.upper():
+        return None
+    return (_phrase_columns(header, "VLAN_ID", "I-SID", "VLAN NAME", "I-SID NAME")
+            or _phrase_columns(header, "VLAN_ID", "I-SID", "I-SID NAME"))
+
+
+def _vlan_isid_by_column(line: str,
+                         columns: list[tuple[int, int | None]]) -> VlanInfo | None:
+    cells = [cell(line, bounds) for bounds in columns]
+    if not cells[0].isdigit() or not is_vlan_id(int(cells[0])):
+        return None
+    if cells[1] and not cells[1].isdigit():
+        return None            # a footer or a legend line, not a VLAN row
+    vlan_name, isid_name = ((cells[2], cells[3]) if len(cells) == VLAN_ISID_COLUMNS_9X
+                            else ("", cells[2]))
+    return VlanInfo(vlan_id=int(cells[0]),
+                    name=vlan_name,
+                    isid=int(cells[1]) if cells[1] else None,
+                    isid_name=isid_name)
+
+
+def _vlan_isid_by_shape(line: str) -> VlanInfo | None:
+    """No header in this output (a hand-made capture): read it as 8.x.
+
+    Anchored with \\s+ separators so numeric footer lines ('3 out of 3 Total
+    Num of Vlans displayed') can never match.
+    """
+    m = re.match(r"^\s*(\d{1,4})(?:\s+(\d{1,9})(?:\s+(\S.*?))?)?\s*$", line)
+    if not m or not is_vlan_id(int(m.group(1))):
+        return None
+    return VlanInfo(vlan_id=int(m.group(1)),
+                    isid=int(m.group(2)) if m.group(2) else None,
+                    isid_name=(m.group(3) or "").strip())
 
 
 def parse_vlan_members(output: str) -> dict[int, list[str]]:
@@ -455,9 +558,17 @@ def parse_isid_local(output: str) -> dict[int, LocalIsid]:
     arbitrary words ('quarantaine', 'cvlan-x') - only structural tokens
     (CONFIG/DISCOVER/-/N/A, ports, numbers, c<vid>: markers) are excluded.
     """
+    lines = output.splitlines()
+    # The NAME column is read by position: it is the only cell of this table
+    # that may contain spaces, and taking the last TOKEN instead turned
+    # 'Onboarding I-SID' into 'I-SID' on every release. 8.x labels the column
+    # 'ISID NAME' on the header line, 9.x splits it over two lines and leaves
+    # 'NAME' on the last one.
+    header = _header_above_rule(lines)
+    name_column = _phrase_columns(header, "ISID NAME") or _phrase_columns(header, "NAME")
     result: dict[int, LocalIsid] = {}
     current: int | None = None
-    for line in output.splitlines():
+    for line in lines:
         tokens = line.split()
         if not tokens:
             continue
@@ -471,17 +582,32 @@ def parse_isid_local(output: str) -> dict[int, LocalIsid]:
             if len(tokens) > ISID_VLAN_COLUMN and tokens[ISID_VLAN_COLUMN].isdigit() \
                     and is_vlan_id(int(tokens[ISID_VLAN_COLUMN])):
                 entry["cvids"].add(int(tokens[ISID_VLAN_COLUMN]))
-            tail = tokens[-1]
-            if len(tokens) > ISID_VLAN_COLUMN \
-                    and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
-                    and not re.match(r"^c\d{1,4}:", tail) \
-                    and not PORT_RE.match(tail) and not tail.isdigit():
-                entry["name"] = tail
+            name = _isid_name(line, tokens, name_column)
+            if name:
+                entry["name"] = name
         if current is None:
             continue
         for m in re.finditer(r"\bc(\d{1,4}):", line):
             result[current]["cvids"].add(int(m.group(1)))
     return result
+
+
+def _isid_name(line: str, tokens: list[str],
+               name_column: list[tuple[int, int | None]] | None) -> str:
+    """The I-SID NAME cell of one `show i-sid` row.
+
+    From the header's column when the output has one; otherwise the old
+    last-token rule, which is all a header-less capture allows.
+    """
+    if name_column is not None:
+        return cell(line, name_column[0])
+    tail = tokens[-1]
+    if len(tokens) > ISID_VLAN_COLUMN \
+            and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
+            and not re.match(r"^c\d{1,4}:", tail) \
+            and not PORT_RE.match(tail) and not tail.isdigit():
+        return tail
+    return ""
 
 
 def parse_dvr_interfaces(output: str) -> list[DvrInterfaceRow]:
@@ -511,18 +637,32 @@ def parse_dvr_interfaces(output: str) -> list[DvrInterfaceRow]:
 def parse_isis_spbm_isid(output: str) -> list[SpbmIsidRow]:
     """`show isis spbm i-sid all`
 
-    Lines: <isid> <source-name> <b-vlan> <sysid> <type> <host_name>
+    8.x columns: ISID | SOURCE NAME | VLAN | SYSID | TYPE | HOST_NAME
+    9.x appends:  ISID NAME | AREA | AREA NAME
+
     Returns [{"isid": int, "type": str, "host": str}, ...]. The VLAN column is
     the B-VLAN, NOT a customer VLAN - intentionally ignored.
+
+    HOST_NAME is read by position. On 9.x it is no longer the last column, and
+    taking the last token made the host of every announced I-SID 'HOME' (the
+    AREA column) - so the fabric report named one area instead of the BEBs
+    that actually advertise each service.
     """
+    lines = output.splitlines()
+    header = _header_above_rule(lines)
+    host_bounds = (column_bounds(header, ("HOST_NAME",))["HOST_NAME"]
+                   if "HOST_NAME" in header.upper() else (-1, None))
     rows: list[SpbmIsidRow] = []
-    for line in output.splitlines():
+    for line in lines:
         tokens = line.split()
         if len(tokens) < MIN_SPBM_ISID_FIELDS or not re.match(r"^\d{1,9}$", tokens[0]):
             continue
         typ = next((t for t in tokens if t.lower() in ("config", "discover")), "")
         if not typ:
             continue
-        host = tokens[-1] if tokens[-1].lower() not in ("config", "discover") else ""
+        if host_bounds[0] >= 0:
+            host = cell(line, host_bounds)
+        else:   # no header in this output: all a token rule can do
+            host = tokens[-1] if tokens[-1].lower() not in ("config", "discover") else ""
         rows.append({"isid": int(tokens[0]), "type": typ.lower(), "host": host})
     return rows

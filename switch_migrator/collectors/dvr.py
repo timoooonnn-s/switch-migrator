@@ -91,8 +91,12 @@ def _merge_vlan_isids(name: str, out: str, fabric: FabricState) -> None:
         rec = fabric.get_or_create(vlan.isid)
         rec.seen_on.add(name)
         rec.cvids.add(vlan.vlan_id)
-        if vlan.name:
-            rec.names.add(vlan.name)
+        # the I-SID's name, not the VLAN's: this read is keyed on the I-SID.
+        # `VlanInfo.name` is the VLAN's own name and `parse_vlan_isid` only
+        # fills it where the release prints a VLAN NAME column, so testing it
+        # here silently collected nothing on 8.x.
+        if vlan.isid_name:
+            rec.names.add(vlan.isid_name)
 
 
 # the one read that makes a controller authoritative: every I-SID fabric-wide

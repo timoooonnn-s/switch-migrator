@@ -1,0 +1,158 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 18:29:51 2026 UTC
+************************************************************************************
+
+General Info :
+
+	SysDescr     : 5520-24T-FabricEngine (9.4.0.0)
+	SysName      : fe-01
+	SysUpTime    : 0 day(s), 00:12:26
+	SysContact   : http://www.extremenetworks.com/contact/
+	SysLocation  : 
+
+Chassis Info:
+
+	Chassis            : 5520-24T-FabricEngine
+	ModelName          : 5520-24T-FabricEngine
+	BrandName          : Extreme Networks.
+	Serial#            : SIMCF92-0000
+	H/W Revision       : 1
+	H/W Config         : 
+	Part Number        : DSGDPM624
+	SysBuildTime       : Thu Apr 9 09:09:50 EDT 2026
+	NumSlots           : 2
+	NumPorts           : 27
+	BaseMacAddr        : 0c:52:cf:92:00:00
+	MacAddrCapacity    : 1024
+	MgmtMacAddr        : 0c:52:cf:92:00:81
+	System MTU         : 1950
+
+Card Info :
+
+	Slot#                CardType          Serial#            Part#             Oper   Admin  Power
+	                                                                          Status  Status Status
+	    1   5520-24T-FabricEngine     SIMCF92-0000        DSGDPM624               up      up     on
+
+Temperature Info : 
+
+                        Sensor                  Warning   Critical
+                   Description   Temperature  Threshold  Threshold
+                                           0        N/A        N/A
+                                           0        N/A        N/A
+                                           0        N/A        N/A
+                                           0        N/A        N/A
+                                           0        N/A        N/A
+                                           0        N/A        N/A
+                                           0        N/A        N/A
+
+
+Power Supply Info :
+
+	Ps#1 Status       : UP
+	Ps#1 Type         : AC
+	Ps#1 Description  : 1100W AC Power Supply
+	Ps#1 Serial Number: 
+	Ps#1 Version      : 02
+	Ps#1 Part Number  : XN-ACPWR-1100W-FB
+
+	Ps#2 Status       : UP
+	Ps#2 Type         : AC
+	Ps#2 Description  : 1100W AC Power Supply
+	Ps#2 Serial Number: 
+	Ps#2 Version      : 02
+	Ps#2 Part Number  : XN-ACPWR-1100W-FB
+
+	Total Power Available : 2200 watts
+	Total Power Usage     : 0 watts
+
+Fan Info :
+
+	    Description   OperStatus       OperSpeed OperSpeed(Rpm)   AirflowDir
+	   Tray 1 Fan 1           up        lowSpeed           0   back-front
+	   Tray 1 Fan 2           up        lowSpeed           0   back-front
+
+LED Info : 
+
+	LED#1 Label  : SYS
+	LED#1 Status : GreenSteady
+
+	LED#2 Label  : SPD
+	LED#2 Status : Off
+
+	LED#3 Label  : STK
+	LED#3 Status : Off
+
+	LED#4 Label  : BT
+	LED#4 Status : Off
+
+	LED#5 Label  : P1
+	LED#5 Status : GreenSteady
+
+	LED#6 Label  : P2
+	LED#6 Status : GreenSteady
+
+	LED#7 Label  : F1
+	LED#7 Status : GreenSteady
+
+	LED#8 Label  : F2
+	LED#8 Status : GreenSteady
+
+	LED#9 Label  : LOC
+	LED#9 Status : GreenSteady
+
+System Error Info : 
+
+	Send Login Success Trap   : false
+	Send Authentication Trap  : false
+	Error Code                : 0
+	Error Severity            : 0
+
+Port Lock Info :
+
+	Status       : off
+	LockedPorts  : 
+
+Message Control Info : 
+
+	Action                 : suppress-msg
+	Control-Interval       : 5
+	Max-msg-num            : 5
+	Status                 : disable
+
+
+Configuration Operation Info Since Boot Up: 
+         Last Change: 0 day(s), 00:11:06   (0 day(s), 00:01:20 ago)
+    Last Vlan Change: 0 day(s), 00:11:06   (0 day(s), 00:01:20 ago)
+Last Statistic Reset: 0 day(s), 00:00:00
+
+U-Boot Info :
+-----------------------------------------------------------------------------------------------------------
+
+	Default Version         : 
+
+	Alternate Version       : 
+
+	Boot Version Used       : Alternate
+
+	Trusted Delivery Status : 
+
+
+
+Advanced Feature Bandwidth Reservation:
+-----------------------------------------------------------------------------------------------------------
+
+	Reservation Mode : vim
+	Port Usage Info  : 2/1, 2/2, 2/3, 2/4 are not available to use
+
+
+Current CPLD Info :
+
+         MODULE                  VERSION
+
+         MAIN CPLD               : 0.0.01
+         uC APP Image            : 0.0.01
+         uC BOOT Image           : 0.0.01
+         PORT1 PLD               : 0.0.01
+         PORT2 PLD               : 0.0.01
+
+

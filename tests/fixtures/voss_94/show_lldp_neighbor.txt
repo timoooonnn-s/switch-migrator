@@ -1,0 +1,79 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 18:29:57 2026 UTC
+************************************************************************************
+
+==========================================================================================
+                                      LLDP Neighbor
+==========================================================================================
+
+Port: 1/1       Index    : 2    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:e7:42:7f:00:00
+                PortId   : IfName             1/1
+                SysName  : fe-02
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/1
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.12
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+
+Port: 1/2       Index    : 3    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:bc:fa:d2:00:00
+                PortId   : IfName             1/1
+                SysName  : fe-03
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/1
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.13
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+
+Port: 1/3       Index    : 1    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:44:58:07:00:00
+                PortId   : IfName             1/1
+                SysName  : fe-04
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/1
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.14
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+
+Port: 1/5       Index    : 6    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:e7:42:7f:00:00
+                PortId   : IfName             1/5
+                SysName  : fe-02
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/5
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.12
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+
+Port: 1/6       Index    : 4    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:e7:42:7f:00:00
+                PortId   : IfName             1/6
+                SysName  : fe-02
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/6
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.12
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+
+Port: 1/7       Index    : 5    
+                Protocol : LLDP
+                ChassisId: MAC Address        0c:e7:42:7f:00:00
+                PortId   : IfName             1/7
+                SysName  : fe-02
+                SysCap   : Br / Br            
+                PortDescr: Extreme Networks 5520-24T-FabricEngine - 1000BaseTX Port 1/7
+                SysDescr : 5520-24T-FabricEngine (9.4.0.0)
+                Address  : 10.99.0.12
+           IPv6 Address  : 0:0:0:0:0:0:0:0
+------------------------------------------------------------------------------------------
+Total Neighbors : 6
+------------------------------------------------------------------------------------------
+Capabilities Legend: (Supported/Enabled)
+B= Bridge,    D= DOCSIS,    O= Other,     R= Repeater,
+S= Station,   T= Telephone, W= WLAN,      r= Router

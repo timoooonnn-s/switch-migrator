@@ -317,8 +317,8 @@ def parse_lldp_neighbors_summary(output: str) -> dict[str, LldpNeighbor]:
     return neighbors
 
 
-def _column_bounds(header: str, names: tuple[str, ...]
-                   ) -> dict[str, tuple[int, int | None]]:
+def column_bounds(header: str, names: tuple[str, ...]
+                  ) -> dict[str, tuple[int, int | None]]:
     """{column: (start, end)} from a fixed-width header line: a column runs from
     its header word to the next header word. (-1, None) for a missing column."""
     words = [(m.group(), m.start()) for m in re.finditer(r"\S+", header)]
@@ -331,11 +331,43 @@ def _column_bounds(header: str, names: tuple[str, ...]
     return bounds
 
 
-def _cell(line: str, bounds: tuple[int, int | None]) -> str:
+# the shift `_start_in` recognises is exactly one character, so the earliest
+# column it can apply to is the third - there has to be a space before the
+# character that moved
+MIN_SHIFTABLE_COLUMN = 2
+
+
+def _start_in(line: str, start: int) -> int:
+    """Where a column really starts on THIS line.
+
+    VOSS 9.x prints some columns one character to the LEFT of their header
+    word - `show lldp neighbor summary` puts a SYSDESCR of '5520-24T-...'
+    one position left, and cutting at the header offset silently ate the
+    leading '5', turning the neighbour's model into '520-24T-...'. A value
+    that begins one character early is recognised by its shape: the cell is
+    padded with spaces, so exactly one non-space sits left of the header
+    offset with a space before it.
+    """
+    if (MIN_SHIFTABLE_COLUMN <= start < len(line) and line[start - 2] == " "
+            and " " not in line[start - 1:start + 1]):
+        return start - 1
+    return start
+
+
+def cell(line: str, bounds: tuple[int, int | None]) -> str:
+    """One fixed-width cell of `line`, tolerating the 9.x one-left shift."""
     start, end = bounds
     if start < 0:
         return ""
-    return (line[start:end] if end is not None else line[start:]).strip()
+    start = _start_in(line, start)
+    if end is None:
+        return line[start:].strip()
+    return line[start:_start_in(line, end)].strip()
+
+
+# kept as private aliases: the LLDP parsers below were written against them
+_column_bounds = column_bounds
+_cell = cell
 
 
 def parse_lldp_neighbors(output: str) -> dict[str, LldpNeighbor]:

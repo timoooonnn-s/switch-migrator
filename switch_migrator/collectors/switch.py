@@ -27,7 +27,11 @@ from switch_migrator.parsers.common import (
     parse_lldp_neighbors_summary,
     parse_mac_table,
 )
-from switch_migrator.usage import classify_audit, parse_uptime_days
+from switch_migrator.usage import (
+    classify_audit,
+    parse_release_and_model,
+    parse_uptime_days,
+)
 
 # fallback cap on learned MACs kept per port; the configured value
 # (Config.mac_cap) is what the collection actually uses
@@ -86,6 +90,13 @@ def collect_switch(target: SwitchTarget, runner: CommandSource, cfg: Config,
             # the tagging columns are empty, and nothing else would say why
             audit.record_source("running-config", False,
                                 "the device returned no running-config")
+    # Who this box is and what it runs. One read-only command on every run,
+    # not only the ones that pull MACs: a report is read months later, and
+    # which release printed the tables behind it is part of what it rests on.
+    # It also carries the uptime, which says how long the interface counters
+    # have been accumulating ('0 packets' proves nothing on a box that
+    # rebooted an hour ago).
+    _read_identity(audit, runner)
     _enrich(audit, runner, cfg, pull_macs=reads.macs)
     if not reads.keep_config:
         # The config was read for the tagging it carries, which is now in the
@@ -95,14 +106,28 @@ def collect_switch(target: SwitchTarget, runner: CommandSource, cfg: Config,
         # exists to produce a neutralized version of it, keeps the original.
         audit.running_config = ""
     if reads.macs:
-        # switch uptime tells us how long the interface counters have been
-        # accumulating - '0 packets' only means something on a long-running box
-        out = _run(audit, runner, "show sys-info", required=False, absent_ok=True)
-        if out:
-            audit.uptime_days = parse_uptime_days(out)
         classify_audit(audit, unused_after_days=cfg.unused_after_days,
                        uptime_days=audit.uptime_days)
     return audit
+
+
+def _read_identity(audit: SwitchAudit, runner: CommandSource) -> None:
+    """Model, release and uptime from `show sys-info`, and a coverage row.
+
+    Recorded as a source either way: a device that does not answer it is a
+    device whose report cannot say which release it describes, and that is
+    exactly the kind of thinness the coverage sheet exists to show.
+    """
+    out = _run(audit, runner, "show sys-info", required=False, absent_ok=True)
+    if not out:
+        audit.record_source("sys-info", False,
+                            "the device did not answer 'show sys-info' - the "
+                            "release and model of this switch are unknown")
+        return
+    audit.uptime_days = parse_uptime_days(out)
+    audit.release, audit.model = parse_release_and_model(out)
+    detail = " ".join(part for part in (audit.model, audit.release) if part)
+    audit.record_source("sys-info", True, detail or "no model or release printed")
 
 
 def _run(audit: SwitchAudit, runner: CommandSource, command: str,

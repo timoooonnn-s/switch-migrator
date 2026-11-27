@@ -44,6 +44,11 @@ def _device_entry(audit: SwitchAudit, commands: list[CommandEntry]) -> dict[str,
         "host": audit.host,
         "platform": audit.platform.value,
         "reachable": audit.reachable,
+        # which release printed the tables this run was read from: the tables
+        # 9.x prints are not the tables 8.x prints, so a report months old has
+        # to be able to say which one it describes
+        "model": audit.model,
+        "release": audit.release,
         "uptime_days": audit.uptime_days,
         "counts": {
             "ports": len(audit.ports),

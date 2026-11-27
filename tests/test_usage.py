@@ -1,10 +1,12 @@
 """Port usage classification: is this port actually in use, or just down?"""
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from switch_migrator import usage as U
 from switch_migrator.models import MltState, Platform, PortState, SwitchAudit
 
+FIXTURES = Path(__file__).parent / "fixtures"
 NOW = datetime(2026, 8, 12, 12, 0, 0)
 
 
@@ -99,6 +101,20 @@ def test_zero_counters_on_freshly_rebooted_box_are_not_trusted():
     assert cls == U.UNUSED
 
 
+def test_zero_counters_with_an_unknown_uptime_are_not_trusted():
+    """An UNKNOWN uptime is not a long one.
+
+    `show sys-info` is read with absent_ok, so a release that does not answer
+    it - or a box up for less than a day - leaves uptime_days None. Trusting
+    the counters then promoted the port to the confident UNUSED on exactly the
+    evidence this module says not to trust, and UNUSED is what makes a planner
+    leave a cable unpatched.
+    """
+    port = _port(last_change_days=120, has_traffic=False)
+    cls, _ = U.classify_port(port, None, unused_after_days=30, uptime_days=None)
+    assert cls == U.LIKELY_UNUSED
+
+
 def test_unknown_age_stays_uncertain():
     cls, why = U.classify_port(_port(last_change_days=None), None)
     assert cls == U.UNCERTAIN
@@ -129,3 +145,32 @@ def test_classify_audit_parses_dates_and_uses_mlts():
     assert by["1/2"].usage == U.DEGRADED          # down member of a live MLT
     assert by["1/9"].usage == U.UNUSED
     assert by["1/9"].last_change_days == OLD_CHANGE_DAYS      # parsed from the DATE column
+
+
+# --------------------------- release and model -----------------------------
+
+def test_release_and_model_from_a_voss_sys_info():
+    """Which release printed the tables is part of a report's evidence: 9.x
+    prints columns 8.x does not, so a six-month-old report has to be able to
+    say which one it describes."""
+    text = (FIXTURES / "voss_94" / "show_sys_info.txt").read_text()
+    assert U.parse_release_and_model(text) == ("9.4.0.0", "5520-24T-FabricEngine")
+    assert U.parse_uptime_days(text) == 0
+
+    text = (FIXTURES / "voss" / "show_sys_info.txt").read_text()
+    assert U.parse_release_and_model(text) == ("8.10.9.0", "VSP-7254XSQ")
+    assert U.parse_uptime_days(text) == 135
+
+
+def test_release_from_a_boss_sys_info_without_a_modelname():
+    """ERS/BOSS prints no ModelName and puts the release in a 'SW:' field, so
+    the box is named by its sysDescr. Shape only - no ERS capture behind it."""
+    text = (FIXTURES / "ers" / "show_sys_info.txt").read_text()
+    release, model = U.parse_release_and_model(text)
+    assert release == "7.6.9.012"
+    assert model.startswith("Ethernet Routing Switch 5952GTS")
+
+
+def test_an_unreadable_sys_info_leaves_both_empty():
+    assert U.parse_release_and_model("") == ("", "")
+    assert U.parse_release_and_model("% Invalid input detected\n") == ("", "")

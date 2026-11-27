@@ -9,6 +9,7 @@ read by switch-migrator itself, which hands the map over; that reader is not cop
 from __future__ import annotations
 
 import csv
+import io
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,9 +38,28 @@ def normalize_port(value: str) -> str:
     return re.sub(r"\s*/\s*", "/", text).strip().strip(",;")
 
 
+def _delimiter(text: str) -> str:
+    """The separator this .csv uses, read off its header line.
+
+    Excel writes the list separator of the machine's locale: a comma in the
+    US/UK, a semicolon across most of Europe, a tab for "Unicode text". A
+    sheet that came back from a technician's laptop has whichever one that
+    machine chose, and assuming a comma turned a semicolon export into a
+    single column - reported as "needs the columns 'Old switch', ...", which
+    sends the reader looking at the header instead of at the delimiter. Same
+    rule as switch-migrator's `cabling_sheet._delimiter`, so both readers
+    accept the same files.
+    """
+    header = next((line for line in text.splitlines() if line.strip()), "")
+    counts = {d: header.count(d) for d in (",", ";", "\t")}
+    best = max(counts, key=lambda d: counts[d])
+    return best if counts[best] else ","
+
+
 def read_port_map(path: Path) -> PortMapFile:
-    with path.open(newline="", encoding="utf-8-sig") as file:
-        rows = [row for row in csv.reader(file) if any(cell.strip() for cell in row)]
+    text = path.read_text(encoding="utf-8-sig")
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=_delimiter(text))
+    rows = [row for row in reader if any(cell.strip() for cell in row)]
     if not rows:
         raise ValueError(f"{path}: empty")
     columns = {_COLUMNS[_key(h)]: i for i, h in enumerate(rows[0]) if _key(h) in _COLUMNS}

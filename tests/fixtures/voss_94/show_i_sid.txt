@@ -1,0 +1,26 @@
+************************************************************************************
+		Command Execution Time: Sun Nov 22 18:29:54 2026 UTC
+************************************************************************************
+
+==================================================================================================================================
+                                                            Isid Info
+==================================================================================================================================
+ISID      ISID              PORT               MLT                ORIGIN                      ISID                            
+ID        TYPE     VLANID   INTERFACES         INTERFACES                                     NAME                            
+----------------------------------------------------------------------------------------------------------------------------------
+20040     CVLAN    40       1/4                -                  C  ---  -  ---  -  -  --    ISID-20040                      
+20060     CVLAN    60       -                  20                 C  ---  -  ---  -  -  --    ISID-20060                      
+30100     ELAN     N/A      c100:1/8           -                  C  ---  -  ---  -  -  --    ISID-30100                      
+                            u:1/9              -                                             
+40000     CVLAN    4000     -                  -                  C  ---  -  ---  -  -  --    ISID-40000                      
+15999999  CVLAN    4048     -                  -                  C  ---  -  ---  -  -  --    Onboarding I-SID                
+16777001  ELAN     N/A      -                  -                  C  ---  -  ---  -  -  --    FAN-ISID                        
+
+c: customer vid    u: untagged-traffic
+
+All 6 out of 6 Total Num of i-sids displayed
+
+ORIGIN Legend:
+C: manually configured; D: discovered by FA or EPT; M: FA management; E: discovered by EAP
+A: auto-sense; R: multi-area redist; RV: radius created vlan; S: static routed multicast
+l: discover by local switch  r: discover by remote VIST switch

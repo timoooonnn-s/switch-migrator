@@ -52,6 +52,38 @@ def parse_last_change_days(raw: str, now: datetime | None = None) -> int | None:
     return None
 
 
+_SYS_DESCR = re.compile(r"^\s*sysDescr\s*:\s*(?P<descr>.+?)\s*$",
+                        re.IGNORECASE | re.MULTILINE)
+_MODEL_NAME = re.compile(r"^\s*ModelName\s*:\s*(?P<model>\S.*?)\s*$",
+                         re.IGNORECASE | re.MULTILINE)
+# VOSS: 'SysDescr : 5520-24T-FabricEngine (9.4.0.0)'
+_VOSS_RELEASE = re.compile(r"\((?P<release>\d+(?:\.\d+)+)\)\s*$")
+# ERS/BOSS: 'sysDescr: Ethernet Routing Switch 5952GTS HW:02 FW:6.6.5.6 SW:v7.6.9.012'
+_BOSS_RELEASE = re.compile(r"\bSW:\s*v?(?P<release>\d+(?:\.\d+)+)", re.IGNORECASE)
+
+
+def parse_release_and_model(sys_info: str) -> tuple[str, str]:
+    """(release, model) from `show sys-info`, '' for whatever is not printed.
+
+    Which release a switch runs is what scopes a parser problem: VOSS 9.x
+    inserts table columns 8.x does not print, so 'which of these 300 boxes
+    produced output this build reads differently' is a question the evidence
+    has to be able to answer. Both shapes are handled - VOSS puts the release
+    in the parentheses of SysDescr, ERS/BOSS in its `SW:` field - but only the
+    VOSS form has a capture behind it (tests/fixtures/voss_94).
+    """
+    descr = _SYS_DESCR.search(sys_info)
+    model = _MODEL_NAME.search(sys_info)
+    text = descr["descr"] if descr else ""
+    found = _VOSS_RELEASE.search(text) or _BOSS_RELEASE.search(text)
+    release = found["release"] if found else ""
+    if model:
+        return release, model["model"]
+    # no ModelName (ERS/BOSS): the descr itself names the box, minus the
+    # release in parentheses that was just read off it
+    return release, _VOSS_RELEASE.sub("", text).strip()
+
+
 def parse_uptime_days(sys_info: str) -> int | None:
     """Days from `SysUpTime : 135 day(s), 07:12:09`. Tells us how long the
     interface counters have been accumulating - '0 packets' on a box that
@@ -118,10 +150,18 @@ def _down(port: PortState, unused_after_days: int, uptime_days: int | None) -> V
     if days < unused_after_days:
         return UNCERTAIN, [f"link down only {days}d (< {unused_after_days}d)"]
     # down long enough to call it. Counters make it certain; without them, or on
-    # a recently-rebooted box, stay at LIKELY.
+    # a box whose uptime we do not know, stay at LIKELY.
+    #
+    # An UNKNOWN uptime is not a long one. '0 packets' only means something
+    # when the counters have been running longer than the port has been down,
+    # and `show sys-info` is read with absent_ok - a release that does not
+    # answer it, or a box up for less than a day, leaves uptime_days None.
+    # Treating that as trustworthy promoted ports from LIKELY UNUSED to
+    # UNUSED on exactly the evidence this module says not to trust, and UNUSED
+    # is what makes the planner leave a cable unpatched.
     counters_trustworthy = (port.has_traffic is False
-                            and (uptime_days is None
-                                 or uptime_days >= unused_after_days))
+                            and uptime_days is not None
+                            and uptime_days >= unused_after_days)
     usage = UNUSED if counters_trustworthy else LIKELY_UNUSED
     if port.admin_up is False:
         return usage, ["admin disabled"]

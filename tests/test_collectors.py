@@ -197,3 +197,49 @@ def test_an_unparsable_running_config_is_reported_once(tmp_path):
 
     assert len(audit.warnings) == 1
     assert sum(1 for s in audit.sources if s.name == "running-config") == 1
+
+
+def test_dvr_vlan_isid_merges_the_isid_name(tmp_path: Path):
+    """`show vlan i-sid` names an I-SID, and that name belongs in the fabric
+    state. The merge tested `VlanInfo.name` - the VLAN's OWN name, which this
+    parser only fills where the release prints a VLAN NAME column - so on 8.x
+    the branch collected nothing at all and said nothing about it."""
+    device = tmp_path / "dvr-01"
+    device.mkdir()
+    shutil.copy(FIXTURES / "voss" / "show_vlan_i_sid.txt",
+                device / "show_vlan_i_sid.txt")
+
+    fabric = FabricState()
+    collect_dvr("dvr-01", OfflineRunner("dvr-01", tmp_path), fabric)
+    assert fabric.isids[10100].names == {"Server-VLAN-100"}
+    assert fabric.isids[10100].cvids == {100}
+
+
+def test_the_release_and_model_are_recorded_on_every_run(tmp_path: Path, cfg: Config):
+    """`show sys-info` is read on a plain audit too, not only when MACs are
+    pulled: a report is read months later and has to be able to say which
+    release printed the tables behind it. 9.x does not print 8.x's tables."""
+    device = tmp_path / "voss"
+    shutil.copytree(FIXTURES / "voss", device)
+    audit = collect_switch(SwitchTarget("voss", "voss", Platform.VOSS),
+                           OfflineRunner("voss", tmp_path), cfg)
+    assert (audit.release, audit.model) == ("8.10.9.0", "VSP-7254XSQ")
+    assert audit.uptime_days == 135
+    sys_info = next(s for s in audit.sources if s.name == "sys-info")
+    assert sys_info.ok
+    assert sys_info.detail == "VSP-7254XSQ 8.10.9.0"
+
+
+def test_a_device_that_will_not_say_what_it_runs_is_reported(tmp_path: Path,
+                                                             cfg: Config):
+    """Not knowing the release is a real thinness in the evidence, so it goes
+    on the coverage sheet rather than nowhere."""
+    device = tmp_path / "voss"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_sys_info.txt").unlink()
+    audit = collect_switch(SwitchTarget("voss", "voss", Platform.VOSS),
+                           OfflineRunner("voss", tmp_path), cfg)
+    assert (audit.release, audit.model, audit.uptime_days) == ("", "", None)
+    sys_info = next(s for s in audit.sources if s.name == "sys-info")
+    assert not sys_info.ok
+    assert "release and model" in sys_info.detail

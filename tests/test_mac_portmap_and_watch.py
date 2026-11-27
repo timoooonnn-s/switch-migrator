@@ -97,6 +97,34 @@ def test_read_port_map_from_a_switch_migrator_csv_export(tmp_path: Path) -> None
     )
 
 
+def test_a_semicolon_separated_export_is_read(tmp_path: Path) -> None:
+    """Excel writes the list separator of the machine's locale, and most of
+    Europe's is a semicolon. Assuming a comma made the whole file one column,
+    which came back as "needs the columns 'Old switch', ..." - an error about
+    the header, for a file whose header is fine. switch-migrator's own reader
+    sniffs the separator; this one has to agree with it."""
+    sheet = tmp_path / "Cabling.csv"
+    sheet.write_text(
+        "Port ID;OLD switch;OLD port;NEW switch;NEW port\n"
+        "P0001;old-1;7;new-1;Port 1/41\n"
+        "P0002;old-1;8;;\n",
+        encoding="utf-8-sig",
+    )
+    port_map = read_port_map(sheet)
+    assert port_map.mapping == {("old-1", "7"): ("new-1", "1/41")}
+    assert port_map.pending == 1
+    assert port_map.problems == ()
+
+
+def test_a_tab_separated_export_is_read(tmp_path: Path) -> None:
+    sheet = tmp_path / "Cabling.csv"
+    sheet.write_text(
+        "OLD switch\tOLD port\tNEW switch\tNEW port\n" "old-1\t7\tnew-1\t1/41\n",
+        encoding="utf-8-sig",
+    )
+    assert read_port_map(sheet).mapping == {("old-1", "7"): ("new-1", "1/41")}
+
+
 def test_a_port_map_without_its_columns_is_refused(tmp_path: Path) -> None:
     sheet = tmp_path / "map.csv"
     sheet.write_text("from,to\nold-1:7,new-1:1/41\n")

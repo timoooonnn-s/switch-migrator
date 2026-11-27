@@ -1135,17 +1135,25 @@ command. Then, per platform:
 | learned MACs † | `show interfaces gigabitEthernet fdb-entry` | `show mac-address-table` |
 | optics † | `show pluggable-optical-modules basic` | — |
 | traffic counters † | `show interfaces gigabitEthernet statistics` | — |
-| uptime † | `show sys-info` | `show sys-info` |
+| model, release, uptime | `show sys-info` | `show sys-info` |
 | config ‡ | `show running-config` | `show running-config` |
 
 † only with `--migration-sheets` or `--verify-migration` (the MAC, optic and
 usage columns need them)  ‡ with `--extract-config` **or**
 `--migration-sheets` — the config is the only source of tagged-vs-untagged
 
+`show sys-info` is read on **every** run, not only the ones that pull MACs.
+The tables 9.x prints are not the tables 8.x prints, so which release produced
+the output is part of what a report rests on — and a report is read months
+after the window. The model and release land in the run manifest and on the
+Coverage sheet; a device that will not answer the command is listed there as a
+source that did not, because then nothing can say which release the rest of
+its columns describe.
+
 On the **DvR controllers**: `show dvr interfaces`, `show isis spbm i-sid all`,
 `show i-sid`, `show vlan i-sid`.
 
-A plain audit run is **11 commands** per VOSS switch and **7** per ERS; with
+A plain audit run is **12 commands** per VOSS switch and **8** per ERS; with
 `--migration-sheets` and `--extract-config` it is **16** and **10**. Each DvR
 controller gets **5**. Two commands separated by `→` are a fallback chain — the
 second is only sent if the device rejects the first.
@@ -1220,6 +1228,18 @@ not failures.
   as `IN_FABRIC_NOT_ATTACHED` — that's the "verify by hand" bucket by
   design. You can add important BEBs to `dvr_controllers`; any VOSS node
   works as an additional state source.
+* **Where the label row decides, not the tokens.** Four tables are the
+  exception to the rule above, because 9.x *inserts* a column instead of
+  moving one: `VLAN NAME` in `show vlan i-sid`, `ISID NAME` / `AREA` /
+  `AREA NAME` after `HOST_NAME` in `show isis spbm i-sid all`, and the
+  flag-slot `ORIGIN` in `show i-sid`. A token rule cannot see an inserted
+  column — it reads the new one as the old one and produces a *wrong* value
+  rather than a missing one, which is the failure this package exists to
+  avoid. So those four read their column offsets off the header's label row
+  and fall back to the token rule only when a capture has no header. Tested
+  against real 9.4 captures in `tests/fixtures/voss_94/`, and against the
+  8.10 production shapes in `tests/fixtures/voss*/` at the same time, since
+  the estate runs both.
 * **Wrapped port lists.** Both platforms break a long member list onto a
   continuation line, either after a comma (`1/1-1/10,1/12,`) or inside a range
   (`1/1-1/16,1/17/1-`). Port lists are validated per element, both wrap marks

@@ -1,0 +1,22 @@
+************************************************************************************
+                Command Execution Time: Thu Jul 16 13:42:30 2026 CEST
+************************************************************************************
+
+General Info :
+
+        SysDescr     : VSP-7254XSQ (8.10.9.0)
+        SysName      : gx-11-s72-p1
+        SysUpTime    : 135 day(s), 07:12:09
+        SysContact   : http://www.extremenetworks.com/contact/
+        SysLocation  :
+
+Chassis Info:
+
+        Chassis            : VSP-7254XSQ
+        ModelName          : VSP-7254XSQ
+        BrandName          : Extreme Networks.
+        NumSlots           : 2
+        NumPorts           : 56
+        BaseMacAddr        : b0:ad:aa:41:b4:00
+        MgmtMacAddr        : b0:ad:aa:41:b4:81
+        System MTU         : 1950

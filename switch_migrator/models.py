@@ -214,6 +214,11 @@ class SwitchAudit:
     vlans: list[VlanInfo] = field(default_factory=list)
     running_config: str = ""      # raw `show running-config`, only if requested
     uptime_days: int | None = None  # how long counters have accumulated
+    # what this box is and what it runs, from `show sys-info`. Which release
+    # produced the output is part of the evidence a report stands on: the
+    # tables 9.x prints are not the tables 8.x prints.
+    release: str = ""             # '9.4.0.0' / '7.6.9.012'
+    model: str = ""               # '5520-24T-FabricEngine'
     # rows from `show interfaces gigabitEthernet i-sid`, kept so the per-port
     # VLAN/I-SID columns need no second call
     port_isid_rows: list[PortIsidRow] = field(default_factory=list)
