@@ -304,16 +304,16 @@ def parse_lldp_neighbors_summary(output: str) -> dict[str, LldpNeighbor]:
     for line in output.splitlines():
         if cols is None:
             if re.search(r"sysname", line, re.IGNORECASE):
-                cols = _column_bounds(line, ("ADDR", "SYSNAME", "SYSDESCR"))
+                cols = column_bounds(line, ("ADDR", "SYSNAME", "SYSDESCR"))
             continue
         tokens = line.split()
         if not tokens or not PORT_RE.match(tokens[0]):
             continue
-        name = _cell(line, cols["SYSNAME"])
+        name = cell(line, cols["SYSNAME"])
         neighbors.setdefault(tokens[0], LldpNeighbor(
             sysname=name.split()[0] if name else "",
-            ip=_clean_ip(_cell(line, cols["ADDR"])),
-            sys_descr=_cell(line, cols["SYSDESCR"])))
+            ip=_clean_ip(cell(line, cols["ADDR"])),
+            sys_descr=cell(line, cols["SYSDESCR"])))
     return neighbors
 
 
@@ -331,9 +331,9 @@ def column_bounds(header: str, names: tuple[str, ...]
     return bounds
 
 
-# the shift `_start_in` recognises is exactly one character, so the earliest
-# column it can apply to is the third - there has to be a space before the
-# character that moved
+# the shift `_start_in` recognises is exactly one character with a space
+# before it, so it needs two characters of line left of the column: no column
+# starting before offset 2 can have moved
 MIN_SHIFTABLE_COLUMN = 2
 
 
@@ -365,9 +365,61 @@ def cell(line: str, bounds: tuple[int, int | None]) -> str:
     return line[start:_start_in(line, end)].strip()
 
 
-# kept as private aliases: the LLDP parsers below were written against them
-_column_bounds = column_bounds
-_cell = cell
+# what a column of a fixed-width table may hold, for `spilled_cells`
+TOKEN = re.compile(r"\S+")    # one word: ports, ids, host names
+TEXT = None                   # free text that may contain spaces: names
+
+
+def spilled_cells(line: str, columns: list[tuple[int, re.Pattern[str] | None]]
+                  ) -> list[str]:
+    """The cells of one row whose values may run past their column.
+
+    `columns` is [(header start, shape)] left to right; the last column runs
+    to the end of the line. VOSS pads each value to its column but never cuts
+    it: a value longer than its column pushes the NEXT value right, and the
+    columns after that snap back to their header offset as soon as there is
+    room (seen in a real 8.x `show i-sid`: a 19-character port list moved the
+    MLT cell one position and left ORIGIN where it was). Cutting at header
+    offsets therefore split a long value in two - half a VLAN name glued to
+    the I-SID name, a host name cut short, ORIGIN read as part of a name.
+
+    So each value starts at its header offset or just after the previous
+    value, whichever is later. A TOKEN or pattern column ends where its match
+    ends; a TEXT column ends at the next header offset, unless its value runs
+    straight across it, in which case it ends at the next space.
+    """
+    values: list[str] = []
+    floor = 0
+    for i, (start, shape) in enumerate(columns):
+        at = max(_start_in(line, start), floor)
+        if i == len(columns) - 1:
+            values.append(line[at:].strip())
+            break
+        nxt = columns[i + 1][0]
+        if shape is TEXT:
+            end = max(nxt, at)
+            if MIN_SHIFTABLE_COLUMN <= end < len(line) \
+                    and " " not in line[end - 2:end + 1]:
+                while end < len(line) and not line[end].isspace():
+                    end += 1
+                floor = end + 1
+            else:
+                floor = 0
+            values.append(line[at:end].strip())
+            continue
+        # the value's first character lies before the next column's (which
+        # may itself sit one left of its header word)
+        limit = max(_start_in(line, nxt), at + 1)
+        first = next((j for j in range(at, min(limit, len(line)))
+                      if not line[j].isspace()), None)
+        found = shape.match(line, first) if first is not None else None
+        if found is None:
+            values.append("")
+            floor = at
+            continue
+        values.append(found.group().strip())
+        floor = found.end() + 1
+    return values
 
 
 def parse_lldp_neighbors(output: str) -> dict[str, LldpNeighbor]:

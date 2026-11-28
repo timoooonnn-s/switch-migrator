@@ -12,13 +12,14 @@ from typing import TypedDict
 from switch_migrator.models import IstState, MltState, PortIsidRow, PortState, VlanInfo
 from switch_migrator.parsers.common import (
     PORT_RE,
-    cell,
-    column_bounds,
+    TEXT,
+    TOKEN,
     expand_port_list,
     is_port_list,
     is_vlan_id,
     name_says_ist,
     parse_updown,
+    spilled_cells,
 )
 
 _RULE_RE = re.compile(r"\s*-{10,}\s*")
@@ -43,7 +44,7 @@ def _phrase_columns(header: str, *phrases: str) -> list[tuple[int, int | None]] 
     """(start, end) of each column of a header whose labels contain spaces.
 
     Phrases are found left to right, each after the previous one, so 'I-SID
-    NAME' is one column and not two - which `column_bounds`, matching single
+    NAME' is one column and not two - which a header split into single
     words, cannot express. None when any phrase is missing, so the caller can
     try a different column set (the 8.x one) or fall back.
     """
@@ -76,6 +77,10 @@ MIN_SPBM_ISID_FIELDS = 4
 # `show vlan i-sid`: VLAN_ID | I-SID | VLAN NAME | I-SID NAME on 9.x, and the
 # same without VLAN NAME on 8.x
 VLAN_ISID_COLUMNS_9X = 4
+# `show isis spbm i-sid all`: HOST_NAME is the sixth column on every release
+SPBM_HOST_COLUMN = 5
+# 9.x `show i-sid` ORIGIN: one flag slot per source, 'C  ---  -  ---  -  -  --'
+_ORIGIN_FLAGS = re.compile(r"(?:[A-Za-z]{1,2}|-{1,3})(?:  (?:[A-Za-z]{1,2}|-{1,3}))*")
 
 _UPDOWN_TOKEN = re.compile(r"^(up|down|testing)$", re.IGNORECASE)
 
@@ -431,6 +436,8 @@ def parse_vlan_isid(output: str) -> list[VlanInfo]:
     columns = _vlan_isid_columns(_header_above_rule(lines))
     vlans: list[VlanInfo] = []
     for line in lines:
+        if re.search(r"\bout of\b", line, re.IGNORECASE):
+            continue    # 'N out of M Total Num of Vlans displayed'
         info = (_vlan_isid_by_column(line, columns) if columns
                 else _vlan_isid_by_shape(line))
         if info is not None:
@@ -438,17 +445,31 @@ def parse_vlan_isid(output: str) -> list[VlanInfo]:
     return vlans
 
 
-def _vlan_isid_columns(header: str) -> list[tuple[int, int | None]] | None:
-    """The 9.x four-column header, else the 8.x three-column one, else None."""
+def _vlan_isid_columns(header: str) -> list[tuple[int, re.Pattern[str] | None]] | None:
+    """The 9.x four-column header, else the 8.x three-column one, else None.
+
+    VLAN NAME is 33 characters wide but a VLAN name may be 64, so it is read
+    as TEXT that can run into I-SID NAME rather than cut at the header.
+    """
     if "VLAN_ID" not in header.upper():
         return None
-    return (_phrase_columns(header, "VLAN_ID", "I-SID", "VLAN NAME", "I-SID NAME")
-            or _phrase_columns(header, "VLAN_ID", "I-SID", "I-SID NAME"))
+    nine = _phrase_columns(header, "VLAN_ID", "I-SID", "VLAN NAME", "I-SID NAME")
+    if nine:
+        return _shaped(nine, TOKEN, TOKEN, TEXT, TEXT)
+    eight = _phrase_columns(header, "VLAN_ID", "I-SID", "I-SID NAME")
+    return _shaped(eight, TOKEN, TOKEN, TEXT) if eight else None
+
+
+def _shaped(columns: list[tuple[int, int | None]],
+            *shapes: re.Pattern[str] | None) -> list[tuple[int, re.Pattern[str] | None]]:
+    """`_phrase_columns` output in the form `spilled_cells` reads."""
+    return [(start, shape) for (start, _), shape in zip(columns, shapes, strict=True)]
 
 
 def _vlan_isid_by_column(line: str,
-                         columns: list[tuple[int, int | None]]) -> VlanInfo | None:
-    cells = [cell(line, bounds) for bounds in columns]
+                         columns: list[tuple[int, re.Pattern[str] | None]]
+                         ) -> VlanInfo | None:
+    cells = spilled_cells(line, columns)
     if not cells[0].isdigit() or not is_vlan_id(int(cells[0])):
         return None
     if cells[1] and not cells[1].isdigit():
@@ -559,13 +580,7 @@ def parse_isid_local(output: str) -> dict[int, LocalIsid]:
     (CONFIG/DISCOVER/-/N/A, ports, numbers, c<vid>: markers) are excluded.
     """
     lines = output.splitlines()
-    # The NAME column is read by position: it is the only cell of this table
-    # that may contain spaces, and taking the last TOKEN instead turned
-    # 'Onboarding I-SID' into 'I-SID' on every release. 8.x labels the column
-    # 'ISID NAME' on the header line, 9.x splits it over two lines and leaves
-    # 'NAME' on the last one.
-    header = _header_above_rule(lines)
-    name_column = _phrase_columns(header, "ISID NAME") or _phrase_columns(header, "NAME")
+    name_column = _isid_columns(lines)
     result: dict[int, LocalIsid] = {}
     current: int | None = None
     for line in lines:
@@ -592,15 +607,44 @@ def parse_isid_local(output: str) -> dict[int, LocalIsid]:
     return result
 
 
+def _isid_columns(lines: list[str]) -> list[tuple[int, re.Pattern[str] | None]] | None:
+    """Every column of the `show i-sid` header, NAME last; None without one.
+
+    The NAME column is read by position: it is the only cell of this table
+    that may contain spaces, and taking the last TOKEN instead turned
+    'Onboarding I-SID' into 'I-SID' on every release. But a long port list
+    runs past its column and pushes ORIGIN along with it, so cutting at the
+    NAME offset alone read 'CONFIG     Server-100' as the name: every column
+    before it is followed (`spilled_cells`). 8.x labels them all on the last
+    header line; 9.x splits the header over two lines and prints ORIGIN only
+    on the first, as a run of flag slots.
+    """
+    header = _header_above_rule(lines)
+    eight = _phrase_columns(header, "ID", "TYPE", "INTERFACES", "INTERFACES",
+                            "ORIGIN", "ISID NAME")
+    if eight:
+        return _shaped(eight, TOKEN, TOKEN, TOKEN, TOKEN, TOKEN, TEXT)
+    nine = _phrase_columns(header, "ID", "TYPE", "VLANID", "INTERFACES",
+                           "INTERFACES", "NAME")
+    above = lines[lines.index(header) - 1] if header and lines.index(header) else ""
+    origin = above.upper().find("ORIGIN")
+    if nine and nine[4][0] < origin < nine[5][0]:
+        return [*_shaped(nine[:5], TOKEN, TOKEN, TOKEN, TOKEN, TOKEN),
+                (origin, _ORIGIN_FLAGS), (nine[5][0], TEXT)]
+    # some other layout: still read NAME where its label is
+    name = _phrase_columns(header, "ISID NAME") or _phrase_columns(header, "NAME")
+    return _shaped(name, TEXT) if name else None
+
+
 def _isid_name(line: str, tokens: list[str],
-               name_column: list[tuple[int, int | None]] | None) -> str:
+               name_column: list[tuple[int, re.Pattern[str] | None]] | None) -> str:
     """The I-SID NAME cell of one `show i-sid` row.
 
-    From the header's column when the output has one; otherwise the old
+    From the header's columns when the output has them; otherwise the old
     last-token rule, which is all a header-less capture allows.
     """
     if name_column is not None:
-        return cell(line, name_column[0])
+        return spilled_cells(line, name_column)[-1]
     tail = tokens[-1]
     if len(tokens) > ISID_VLAN_COLUMN \
             and tail.upper() not in ("CONFIG", "DISCOVER", "-", "N/A") \
@@ -634,6 +678,20 @@ def parse_dvr_interfaces(output: str) -> list[DvrInterfaceRow]:
     return rows
 
 
+def _spbm_isid_columns(header: str) -> list[tuple[int, re.Pattern[str] | None]] | None:
+    """The 9.x header, else the 8.x one. HOST_NAME is a TOKEN that may run
+    past its 31 characters into ISID NAME on 9.x - cut at the header, a long
+    sysname named a BEB that does not exist."""
+    nine = _phrase_columns(header, "ISID", "SOURCE NAME", "VLAN", "SYSID", "TYPE",
+                           "HOST_NAME", "ISID NAME", "AREA", "AREA NAME")
+    if nine:
+        return _shaped(nine, TOKEN, TOKEN, TOKEN, TOKEN, TOKEN, TOKEN, TEXT,
+                       TOKEN, TEXT)
+    eight = _phrase_columns(header, "ISID", "SOURCE NAME", "VLAN", "SYSID", "TYPE",
+                            "HOST_NAME")
+    return _shaped(eight, TOKEN, TOKEN, TOKEN, TOKEN, TOKEN, TEXT) if eight else None
+
+
 def parse_isis_spbm_isid(output: str) -> list[SpbmIsidRow]:
     """`show isis spbm i-sid all`
 
@@ -649,9 +707,7 @@ def parse_isis_spbm_isid(output: str) -> list[SpbmIsidRow]:
     that actually advertise each service.
     """
     lines = output.splitlines()
-    header = _header_above_rule(lines)
-    host_bounds = (column_bounds(header, ("HOST_NAME",))["HOST_NAME"]
-                   if "HOST_NAME" in header.upper() else (-1, None))
+    columns = _spbm_isid_columns(_header_above_rule(lines))
     rows: list[SpbmIsidRow] = []
     for line in lines:
         tokens = line.split()
@@ -660,8 +716,8 @@ def parse_isis_spbm_isid(output: str) -> list[SpbmIsidRow]:
         typ = next((t for t in tokens if t.lower() in ("config", "discover")), "")
         if not typ:
             continue
-        if host_bounds[0] >= 0:
-            host = cell(line, host_bounds)
+        if columns:
+            host = spilled_cells(line, columns)[SPBM_HOST_COLUMN]
         else:   # no header in this output: all a token rule can do
             host = tokens[-1] if tokens[-1].lower() not in ("config", "discover") else ""
         rows.append({"isid": int(tokens[0]), "type": typ.lower(), "host": host})

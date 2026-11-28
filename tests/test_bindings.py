@@ -247,6 +247,15 @@ def test_coverage_is_clean_when_every_port_has_vlans():
     assert row["Ports with tagging"] == len(audit.ports)
 
 
+def test_coverage_names_the_model_and_release_behind_the_tables():
+    """Which release printed a switch's tables is what a report rests on, and
+    the README promises it on this sheet - not only in the JSON manifest."""
+    coverage = build_coverage([_collect("ers")])
+    row = dict(zip(coverage.headers, coverage.rows[0], strict=True))
+    assert row["Model"] == "Ethernet Routing Switch 5952GTS"
+    assert row["Release"] == "7.6.9.012"
+
+
 def test_no_fabric_mode_does_not_claim_a_failed_lookup():
     """--no-fabric is for estates with no fabric by design. Rendering '?' there
     would flag every VLAN on the sheet for a lookup that never happened."""

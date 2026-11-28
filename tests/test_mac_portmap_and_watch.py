@@ -125,6 +125,19 @@ def test_a_tab_separated_export_is_read(tmp_path: Path) -> None:
     assert read_port_map(sheet).mapping == {("old-1", "7"): ("new-1", "1/41")}
 
 
+@pytest.mark.parametrize("encoding", ["utf-16", "cp1252", "utf-8-sig", "utf-8"])
+def test_every_excel_export_encoding_is_read(tmp_path: Path, encoding: str) -> None:
+    """'Unicode text' is UTF-16 with a BOM, plain 'CSV' on a German laptop is
+    Windows-1252: both failed with a UnicodeDecodeError."""
+    sheet = tmp_path / "Cabling.csv"
+    sheet.write_text(
+        "OLD switch;OLD port;NEW switch;NEW port;Notes\n"
+        "old-1;7;new-1;1/41;Prüfung offen\n",
+        encoding=encoding,
+    )
+    assert read_port_map(sheet).mapping == {("old-1", "7"): ("new-1", "1/41")}
+
+
 def test_a_port_map_without_its_columns_is_refused(tmp_path: Path) -> None:
     sheet = tmp_path / "map.csv"
     sheet.write_text("from,to\nold-1:7,new-1:1/41\n")

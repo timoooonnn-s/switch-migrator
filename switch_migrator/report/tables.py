@@ -237,7 +237,8 @@ def build_coverage(audits: list[SwitchAudit]) -> Table:
     behind it, because that is a hole in exactly what the sheet is for.
     """
     t = Table("Coverage", [
-        "Switch", "Reachable", "Ports", "Ports with VLANs", "VLAN coverage",
+        "Switch", "Reachable", "Model", "Release", "Ports", "Ports with VLANs",
+        "VLAN coverage",
         "Up ports missing VLANs", "Ports with I-SIDs", "Ports with tagging",
         "VLANs", "MLTs", "MLTs with VLANs",
         "Sources that answered", "Sources that did not",
@@ -269,7 +270,8 @@ def build_coverage(audits: list[SwitchAudit]) -> Table:
         elif missing or blind_up:
             severity = "warn"
         t.add([
-            audit.name, "yes" if audit.reachable else "NO", total, with_vlans,
+            audit.name, "yes" if audit.reachable else "NO",
+            audit.model or "-", audit.release or "-", total, with_vlans,
             pct, blind_up, with_isids, with_tagging, len(audit.vlans),
             len(audit.mlts), mlts_with_vlans,
             ", ".join(ok) or "-", ", ".join(missing) or "-",

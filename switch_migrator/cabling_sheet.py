@@ -30,6 +30,7 @@ from typing import Any
 
 from openpyxl import load_workbook
 
+from migration_check.portmap import read_csv_text, sniff_delimiter
 from switch_migrator.report.excel import SHEET_SCHEMA, STAMP_SHEET
 
 # a stamp row: key | value
@@ -272,26 +273,11 @@ def _build_row(mapping: dict[str, object], number: int) -> CablingRow:
     return row
 
 
-def _delimiter(text: str) -> str:
-    """The separator a .csv export used, read off its header line.
-
-    Excel writes the list separator of the machine's locale: a comma in the
-    US/UK, a semicolon across most of Europe, and a tab for "Unicode text".
-    A sheet that came back from a technician's laptop is read with whichever
-    one it has - guessing comma and finding one column used to be reported as
-    a header row "missing the 'Old switch', 'Old port' column(s)", which sent
-    the reader looking in entirely the wrong place.
-    """
-    header = next((line for line in text.splitlines() if line.strip()), "")
-    counts = {d: header.count(d) for d in (",", ";", "\t")}
-    best = max(counts, key=lambda d: counts[d])
-    return best if counts[best] else ","
-
-
 def _rows_from_csv(path: Path) -> list[tuple[str, list[list[object]]]]:
-    text = path.read_text(encoding="utf-8-sig")
+    # Excel writes the locale's separator and encoding: see these two
+    text = read_csv_text(path)
     reader = csv.reader(io.StringIO(text, newline=""),
-                        delimiter=_delimiter(text))
+                        delimiter=sniff_delimiter(text))
     rows: list[list[object]] = [[*row] for row in reader]
     return [(path.name, rows)]
 

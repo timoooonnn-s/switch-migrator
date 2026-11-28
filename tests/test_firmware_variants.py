@@ -188,6 +188,53 @@ def test_9x_spbm_isid_host_is_the_bebs_name_not_its_area():
     assert {"isid": 20040, "type": "discover", "host": "fe-02"} in rows
 
 
+def test_a_long_vlan_name_does_not_spill_into_the_isid_name():
+    """VLAN NAME is 33 wide on 9.x but a VLAN name may be 64. Cut at the
+    header, the tail of the VLAN name became the start of the I-SID name."""
+    text = _capture("show_vlan_i_sid.txt").replace(
+        "40         20040                servers                          ISID-20040",
+        "40         20040                dc1-servers-production-backend-vlan ISID-20040")
+    vlans = {v.vlan_id: v for v in voss_parsers.parse_vlan_isid(text)}
+
+    assert vlans[40].name == "dc1-servers-production-backend-vlan"
+    assert vlans[40].isid_name == "ISID-20040"
+    assert vlans[4048].isid_name == "Onboarding I-SID"
+
+
+def test_a_long_host_name_is_not_cut_at_the_isid_name_column():
+    """HOST_NAME leaves 31 characters on 9.x. A longer sysname was cut short,
+    naming a BEB that does not exist."""
+    text = _capture("show_isis_spbm_i_sid_all.txt").replace(
+        "config       fe-01                          ISID-20040",
+        "config       gx-11-s72-p1-core-distribution-01 ISID-20040")
+    rows = voss_parsers.parse_isis_spbm_isid(text)
+
+    assert {"isid": 20040, "type": "config",
+            "host": "gx-11-s72-p1-core-distribution-01"} in rows
+    assert {"isid": 20060, "type": "config", "host": "fe-01"} in rows
+
+
+def test_a_long_port_list_does_not_push_origin_into_the_isid_name():
+    """A port list longer than its column pushes the next values right. Cut at
+    the NAME offset, 8.x read 'CONFIG     Server-100' as the name, and 9.x
+    read the ORIGIN flag slots into it."""
+    eight = (FIXTURES / "voss" / "show_i_sid.txt").read_text().replace(
+        "10100    ELAN       c100:1/10,c100:1/11 c100:2            CONFIG     Server-100",
+        "10100    ELAN       c100:1/10,c100:1/11,c100:1/12,c100:1/13 c100:2 CONFIG Server-100")
+    isids = voss_parsers.parse_isid_local(eight)
+    assert isids[10100]["name"] == "Server-100"
+    assert isids[10200]["name"] == "Server-200"
+
+    nine = _capture("show_i_sid.txt").replace(
+        "20040     CVLAN    40       1/4                -                  "
+        "C  ---  -  ---  -  -  --    ISID-20040",
+        "20040     CVLAN    40       1/4,1/5,1/6,1/7,1/8,1/9,1/10 -           "
+        "C  ---  -  ---  -  -  -- ISID-20040")
+    isids = voss_parsers.parse_isid_local(nine)
+    assert isids[20040]["name"] == "ISID-20040"
+    assert isids[15999999]["name"] == "Onboarding I-SID"
+
+
 def test_isid_names_with_spaces_survive():
     """The name was the last TOKEN of the row, so 'Onboarding I-SID' arrived as
     'I-SID'. True on 8.x as well; 9.x only makes it easier to hit."""

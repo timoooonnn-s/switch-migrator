@@ -118,6 +118,14 @@ def _read_identity(audit: SwitchAudit, runner: CommandSource) -> None:
     device whose report cannot say which release it describes, and that is
     exactly the kind of thinness the coverage sheet exists to show.
     """
+    has_capture = getattr(runner, "has_capture", None)
+    if has_capture is not None and not has_capture("show sys-info"):
+        # replaying a capture taken before every run read sys-info: the
+        # device was never asked, so it is not a source that failed - marking
+        # it as one turned every Coverage row of an old capture to 'warn'
+        log.info("[%s] capture has no 'show sys-info' - release and model "
+                 "unknown", audit.name)
+        return
     out = _run(audit, runner, "show sys-info", required=False, absent_ok=True)
     if not out:
         audit.record_source("sys-info", False,

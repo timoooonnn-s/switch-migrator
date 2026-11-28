@@ -236,10 +236,25 @@ def test_a_device_that_will_not_say_what_it_runs_is_reported(tmp_path: Path,
     on the coverage sheet rather than nowhere."""
     device = tmp_path / "voss"
     shutil.copytree(FIXTURES / "voss", device)
-    (device / "show_sys_info.txt").unlink()
+    (device / "show_sys_info.txt").write_text(
+        "% Invalid input detected at '^' marker.\n")
     audit = collect_switch(SwitchTarget("voss", "voss", Platform.VOSS),
                            OfflineRunner("voss", tmp_path), cfg)
     assert (audit.release, audit.model, audit.uptime_days) == ("", "", None)
     sys_info = next(s for s in audit.sources if s.name == "sys-info")
     assert not sys_info.ok
     assert "release and model" in sys_info.detail
+
+
+def test_replaying_a_capture_older_than_sys_info_is_not_a_failed_source(
+        tmp_path: Path, cfg: Config):
+    """Captures taken before every run read `show sys-info` have no file for
+    it. The device was never asked, so the Coverage sheet must not turn every
+    switch of such a capture to 'warn' over it."""
+    device = tmp_path / "voss"
+    shutil.copytree(FIXTURES / "voss", device)
+    (device / "show_sys_info.txt").unlink()
+    audit = collect_switch(SwitchTarget("voss", "voss", Platform.VOSS),
+                           OfflineRunner("voss", tmp_path), cfg)
+    assert (audit.release, audit.model, audit.uptime_days) == ("", "", None)
+    assert all(s.name != "sys-info" for s in audit.sources)

@@ -712,6 +712,12 @@ class OfflineRunner(BaseRunner):
         if not self.device_dir.is_dir():
             raise ConnectionFailed(f"{name}: no raw capture directory at {self.device_dir}")
 
+    def has_capture(self, command: str) -> bool:
+        """Whether this capture holds `command` at all - a capture made by an
+        older build lacks commands that were added since, which is not the
+        device failing to answer them."""
+        return (self.device_dir / f"{command_slug(self._map(command))}.txt").is_file()
+
     def run(self, command: str) -> str:
         # same remap as live: a capture saved under an overridden spelling
         # replays under that same spelling

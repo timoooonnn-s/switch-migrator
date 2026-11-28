@@ -164,11 +164,24 @@ def test_release_and_model_from_a_voss_sys_info():
 
 def test_release_from_a_boss_sys_info_without_a_modelname():
     """ERS/BOSS prints no ModelName and puts the release in a 'SW:' field, so
-    the box is named by its sysDescr. Shape only - no ERS capture behind it."""
+    the box is named by its sysDescr - without the HW:/FW:/SW: fields, or
+    every firmware level would be a different model."""
     text = (FIXTURES / "ers" / "show_sys_info.txt").read_text()
-    release, model = U.parse_release_and_model(text)
-    assert release == "7.6.9.012"
-    assert model.startswith("Ethernet Routing Switch 5952GTS")
+    assert U.parse_release_and_model(text) == ("7.6.9.012",
+                                               "Ethernet Routing Switch 5952GTS")
+
+
+def test_release_from_an_ers_sys_info_that_wraps_sysdescr():
+    """A real ERS 4548GT-PWR (published `show sys-info`, 5.6.1.053) prints
+    HW:/FW:/SW: on the line BELOW sysDescr. Reading the sysDescr line alone
+    left the release of every such switch empty."""
+    text = ("Operation Mode:         Switch\n"
+            "sysDescr:               Ethernet Routing Switch 4548GT-PWR\n"
+            "                       HW:12       FW:5.3.0.3   SW:v5.6.1.053\n"
+            "                       Mfg Date:20120121    HW Dev: \n"
+            "sysObjectID:            1.3.6.1.4.1.45.3.71.4\n")
+    assert U.parse_release_and_model(text) == ("5.6.1.053",
+                                               "Ethernet Routing Switch 4548GT-PWR")
 
 
 def test_an_unreadable_sys_info_leaves_both_empty():

@@ -38,7 +38,26 @@ def normalize_port(value: str) -> str:
     return re.sub(r"\s*/\s*", "/", text).strip().strip(",;")
 
 
-def _delimiter(text: str) -> str:
+def read_csv_text(path: Path) -> str:
+    """A .csv export as text, in whichever encoding Excel wrote it.
+
+    Excel's "Unicode text" export is UTF-16 with a byte-order mark, "CSV UTF-8"
+    is UTF-8 with one, and plain "CSV" is the machine's ANSI code page -
+    Windows-1252 across Western Europe, so 'Prüfung' in a notes cell is not
+    valid UTF-8. Reading every file as UTF-8 failed on two of the three
+    exports a technician's laptop produces. switch-migrator's cabling-sheet
+    reader uses this too, so both accept the same files.
+    """
+    raw = path.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def sniff_delimiter(text: str) -> str:
     """The separator this .csv uses, read off its header line.
 
     Excel writes the list separator of the machine's locale: a comma in the
@@ -46,9 +65,8 @@ def _delimiter(text: str) -> str:
     sheet that came back from a technician's laptop has whichever one that
     machine chose, and assuming a comma turned a semicolon export into a
     single column - reported as "needs the columns 'Old switch', ...", which
-    sends the reader looking at the header instead of at the delimiter. Same
-    rule as switch-migrator's `cabling_sheet._delimiter`, so both readers
-    accept the same files.
+    sends the reader looking at the header instead of at the delimiter.
+    switch-migrator's cabling-sheet reader uses this too.
     """
     header = next((line for line in text.splitlines() if line.strip()), "")
     counts = {d: header.count(d) for d in (",", ";", "\t")}
@@ -57,8 +75,8 @@ def _delimiter(text: str) -> str:
 
 
 def read_port_map(path: Path) -> PortMapFile:
-    text = path.read_text(encoding="utf-8-sig")
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=_delimiter(text))
+    text = read_csv_text(path)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=sniff_delimiter(text))
     rows = [row for row in reader if any(cell.strip() for cell in row)]
     if not rows:
         raise ValueError(f"{path}: empty")
